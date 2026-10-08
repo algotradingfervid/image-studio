@@ -39,7 +39,7 @@ from runpod_common import (  # noqa: E402
     write_env_value,
 )
 
-VOLUME_NAME = "image-studio-models"
+VOLUME_NAME = "image-studio-models-us"  # US-NE-1 (H100); EU-RO-1 copy was image-studio-models
 ENDPOINT_NAME = "image-studio-worker"
 REGISTRY_NAME = "image-studio-ghcr"
 SECRET_NAMES = {"HF_TOKEN": "image-studio-hf-token", "CIVITAI_API_KEY": "image-studio-civitai-key"}
@@ -49,17 +49,14 @@ DEFAULT_VOLUME_GB = 100
 DEFAULT_CONTAINER_DISK_GB = 20  # the image itself is not counted; worker-comfyui "base" needs ~5 GB
 DEFAULT_TIMEOUT_MS = 600_000  # generation; downloads pass policy.executionTimeout per request
 DEFAULT_MIN_CUDA = "12.8"  # RTX 5090 (Blackwell) needs CUDA >= 12.8
-FALLBACK_DATACENTER = "EU-RO-1"  # image-studio-models volume lives here
+FALLBACK_DATACENTER = "US-NE-1"  # image-studio-models-us volume lives here
 
-# EU-RO-1 (where the volume lives) has serverless stock for these, cheapest first:
-# RTX PRO 4500 Blackwell 32 GB ($1.15/h), RTX 5090 32 GB ($1.58/h), RTX PRO 6000 96 GB ($3.49/h).
+# US-NE-1 (where the volume lives), fastest first, per the user's choice of speed over cost:
+# H100 80 GB ($4.79/h), RTX PRO 6000 96 GB ($3.49/h), RTX PRO 6000 MIG 48 GB slice ($1.75/h).
 # Type ids as in GET /v2/catalog/gpus.
-# RTX 4090 24 GB ($1.10/h) is a last fallback for availability: ComfyUI unloads the
-# text encoder before sampling, so every diffusion model (max 12.3 GB) fits.
-WANTED_GPUS = ["NVIDIA RTX PRO 4500 Blackwell", "NVIDIA GeForce RTX 5090",
-               "NVIDIA RTX PRO 6000 Blackwell Server Edition", "NVIDIA GeForce RTX 4090",
-               # A100 80 GB ($2.72/h): last resort when EU-RO-1's cheaper cards are all busy.
-               "NVIDIA A100 80GB PCIe", "NVIDIA A100-SXM4-80GB"]
+WANTED_GPUS = ["NVIDIA H100 80GB HBM3", "NVIDIA H100 NVL", "NVIDIA H100 PCIe",
+               "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+               "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 2g.48gb"]
 
 # Used only when the catalog cannot be read (offline dry run). Snapshot of
 # GET /v2/catalog/gpus on 2026-10-08: serverless pool -> member GPU type ids.
@@ -68,6 +65,7 @@ FALLBACK_POOLS = {
     "ADA_32_PRO": ["NVIDIA GeForce RTX 5090"],
     "ADA_24": ["NVIDIA GeForce RTX 4090"],
     "AMPERE_80": ["NVIDIA A100 80GB PCIe", "NVIDIA A100-SXM4-80GB"],
+    "ADA_80_PRO": ["NVIDIA H100 80GB HBM3", "NVIDIA H100 NVL", "NVIDIA H100 PCIe"],
     "BLACKWELL_96": ["NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
                      "NVIDIA RTX PRO 6000 Blackwell Server Edition",
                      "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"],

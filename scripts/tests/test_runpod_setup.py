@@ -127,7 +127,7 @@ class PayloadTests(unittest.TestCase):
     def test_fallback_catalog_matches_wanted(self):
         # The real config must resolve against the offline fallback catalog.
         g = rs.select_gpus(rs.fallback_catalog(), rs.WANTED_GPUS)
-        self.assertEqual(g["pools"], ["BLACKWELL_32", "ADA_32_PRO", "BLACKWELL_96", "ADA_24", "AMPERE_80"])
+        self.assertEqual(g["pools"], ["ADA_80_PRO", "BLACKWELL_96", "ADA_48_PRO"])
 
     def test_rank_datacenters(self):
         types = rs.select_gpus(CATALOG_GPUS, FIXTURE_WANTED)["types"]
@@ -332,7 +332,7 @@ class SetupFlowTests(unittest.TestCase):
         self.assertEqual(fake.calls[-1][2], {"image": "ghcr.io/o/w:2"})
 
     def test_existing_volume_pins_datacenter(self):
-        fake = FakeRunpod(volumes=[{"id": "v9", "name": "image-studio-models", "size": 100,
+        fake = FakeRunpod(volumes=[{"id": "v9", "name": rs.VOLUME_NAME, "size": 100,
                                     "dataCenter": "US-TX-3", "type": "STANDARD"},
                                    {"id": "other", "name": "wan-ltx-vol", "size": 75,
                                     "dataCenter": "US-CA-2", "type": "STANDARD"}])
