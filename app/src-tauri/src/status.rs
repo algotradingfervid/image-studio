@@ -125,12 +125,35 @@ pub fn lora_views(core: &Core) -> Result<Vec<LoraView>, String> {
     Ok(rows.iter().map(|l| lora_view(core, l, &present)).collect())
 }
 
+pub const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Volume usage (spec v3 fix): total = the network volume's size from the
+/// RunPod API (GB → bytes, 1 GB = 2^30 to match the UI's units), used = the sum
+/// of the present files, free = total − used. The worker's `disk_usage`
+/// numbers describe the whole shared filesystem and are ignored. `None` until
+/// the volume size is known.
+pub fn volume_usage(snap: &StatusSnapshot, volume_size_gb: Option<u64>) -> Option<Volume> {
+    let total = volume_size_gb.filter(|g| *g > 0)? * GIB;
+    let mut seen = HashSet::new();
+    let used: u64 = snap
+        .files
+        .iter()
+        .filter(|f| seen.insert((f.folder.as_str(), f.filename.as_str())))
+        .filter_map(|f| f.size_bytes)
+        .sum();
+    Some(Volume {
+        total_bytes: total,
+        free_bytes: total.saturating_sub(used),
+    })
+}
+
 /// Current cached status without contacting RunPod.
 pub fn cached_view(core: &Core) -> Result<StatusView, String> {
     let cache = core.db.lock().unwrap().load_status()?;
+    let size = crate::pod::cached_volume_size_gb(core);
     Ok(StatusView {
         models: model_views(core),
-        volume: cache.as_ref().map(|(s, _)| s.volume.clone()),
+        volume: cache.as_ref().and_then(|(s, _)| volume_usage(s, size)),
         checked_at: cache.map(|(_, at)| at),
     })
 }
@@ -175,6 +198,15 @@ pub async fn run_to_completion(
 /// Run the worker `status` action and update the cache. Concurrent callers
 /// share one request: a caller that waited for an in-flight refresh gets its result.
 pub async fn refresh_status(core: &Arc<Core>) -> Result<StatusView, String> {
+    refresh_status_opts(core, true).await
+}
+
+/// `allow_start = false` skips the refresh (returning the cached view) when
+/// the GPU pod is not running, instead of starting it.
+pub async fn refresh_status_opts(core: &Arc<Core>, allow_start: bool) -> Result<StatusView, String> {
+    if !allow_start && crate::worker::ready_client(core).is_none() {
+        return cached_view(core);
+    }
     let requested_at = now_rfc3339();
     let _guard = core.refresh_lock.lock().await;
     if let Some((_, at)) = core.db.lock().unwrap().load_status()? {
@@ -183,7 +215,12 @@ pub async fn refresh_status(core: &Arc<Core>) -> Result<StatusView, String> {
             return cached_view(core);
         }
     }
-    let client = core.runpod()?;
+    let client = crate::worker::client(core, &mut |_| {}, &|| false).await?;
+    if client.is_pod() && crate::pod::cached_volume_size_gb(core).is_none() {
+        if let Ok(rest) = crate::pod::rest(core) {
+            let _ = crate::pod::lookup_volume(core, &rest).await;
+        }
+    }
     let output = run_to_completion(
         core,
         &client,
@@ -213,5 +250,38 @@ mod tests {
         assert!(!is_stale(Some(&recent), now));
         let old = (now - chrono::Duration::hours(25)).to_rfc3339();
         assert!(is_stale(Some(&old), now));
+    }
+
+    #[test]
+    fn volume_usage_from_volume_size() {
+        use crate::db::VolumeFile;
+        let f = |folder: &str, name: &str, size: Option<u64>| VolumeFile {
+            folder: folder.into(),
+            filename: name.into(),
+            size_bytes: size,
+        };
+        let snap = StatusSnapshot {
+            files: vec![
+                f("unet", "a.safetensors", Some(10 * GIB)),
+                f("vae", "ae.safetensors", Some(GIB / 2)),
+                f("vae", "ae.safetensors", Some(GIB / 2)), // duplicate listing
+                f("loras/chroma", "l.safetensors", None),
+            ],
+            // The worker's shared-filesystem numbers must be ignored.
+            volume: Volume {
+                total_bytes: 500_000 * GIB,
+                free_bytes: 1,
+            },
+            comfyui_version: None,
+        };
+        let v = volume_usage(&snap, Some(100)).unwrap();
+        assert_eq!(v.total_bytes, 100 * GIB);
+        assert_eq!(v.free_bytes, 100 * GIB - 10 * GIB - GIB / 2);
+        assert!(volume_usage(&snap, None).is_none());
+        let full = StatusSnapshot {
+            files: vec![f("unet", "x", Some(200 * GIB))],
+            ..Default::default()
+        };
+        assert_eq!(volume_usage(&full, Some(100)).unwrap().free_bytes, 0);
     }
 }

@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
-import { inTauri } from "./api";
+import { inTauri, isConfigured } from "./api";
+import { GpuPill } from "./components/GpuPill";
 import { Icon, type IconName } from "./components/Icon";
 import { radioKeys } from "./components/radio";
 import { CreateScreen } from "./screens/create/CreateScreen";
 import { ModelsScreen } from "./screens/models/ModelsScreen";
 import { SettingsScreen } from "./screens/settings/SettingsScreen";
+import { GpuProvider, useGpu } from "./state/gpu";
 import { LibraryProvider, useLibrary } from "./state/library";
 import { ToastProvider } from "./state/toast";
 
@@ -20,7 +22,11 @@ function Shell() {
   const [tab, setTab] = useState<Tab>("create");
   const lib = useLibrary();
   const s = lib.settings;
-  const needsSetup = !!s && (!s.hasApiKey || !s.endpointId);
+  const needsSetup = !!s && !isConfigured(s);
+  const gpu = useGpu();
+  const [keepPod, setKeepPod] = useState(false);
+  const g = gpu.state;
+  const leftRunning = gpu.podMode && !keepPod && !!g?.leftRunning && (g.status === "running" || g.status === "starting");
   const activeDownloads = lib.models.filter((m) => m.task && (m.task.status === "running" || m.task.status === "queued")).length;
 
   useEffect(() => {
@@ -85,20 +91,40 @@ function Shell() {
             </button>
           ))}
         </nav>
-        <div className="toolbar__end" data-tauri-drag-region />
+        <div className="toolbar__end" data-tauri-drag-region>
+          <GpuPill />
+        </div>
       </header>
 
       {needsSetup && (
         <div className="banner" role="status">
           <Icon name="key" />
           <span>
-            {!s?.hasApiKey ? "Add your RunPod API key" : "Add your RunPod endpoint ID"} to start generating.
+            {!s?.hasApiKey ? "Add your RunPod API key" : "Add your RunPod endpoint ID (serverless backend)"} to start generating.
           </span>
           {tab !== "settings" && (
             <button type="button" className="link-btn" onClick={() => setTab("settings")}>
               Open Settings →
             </button>
           )}
+        </div>
+      )}
+
+      {leftRunning && (
+        <div className="banner banner--warn" role="status">
+          <Icon name="alert" />
+          <span>
+            A GPU pod is still running ({gpu.state?.gpuType ? `${gpu.gpuName}, ` : ""}
+            {gpu.costLabel}).
+          </span>
+          <span className="banner__actions">
+            <button type="button" className="btn btn--sm" onClick={gpu.stop}>
+              <Icon name="stop" size={13} /> Stop it
+            </button>
+            <button type="button" className="btn btn--sm btn--ghost" onClick={() => setKeepPod(true)}>
+              Keep it
+            </button>
+          </span>
         </div>
       )}
 
@@ -124,7 +150,9 @@ export default function App() {
   return (
     <ToastProvider>
       <LibraryProvider>
-        <Shell />
+        <GpuProvider>
+          <Shell />
+        </GpuProvider>
       </LibraryProvider>
     </ToastProvider>
   );

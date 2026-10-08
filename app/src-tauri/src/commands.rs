@@ -5,12 +5,14 @@
 use crate::db::ImageRecord;
 use crate::jobs::{self, GenerateRequest, Job, LoraChoice};
 use crate::links::ResolvedLora;
+use crate::pod::{self, GpuState};
 use crate::references::{self, ImportedReference};
 use crate::runpod::Health;
-use crate::settings::{SaveSettings, SettingsView};
+use crate::settings::{Backend, SavePodSettings, SaveSettings, SettingsView};
 use crate::state::Core;
 use crate::status::{self, LoraView, StatusView};
 use crate::tasks::{self, DeletePreview, DeleteResult, Task};
+use crate::worker::WorkerTarget;
 use base64::Engine;
 use serde::Serialize;
 use serde_json::Value;
@@ -23,27 +25,94 @@ type CoreState<'a> = State<'a, Arc<Core>>;
 
 // ----- settings & status -----
 
-#[tauri::command]
-pub fn get_settings(core: CoreState<'_>) -> SettingsView {
-    core.settings.view()
+/// `SettingsView` plus the v3 pod settings.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsResponse {
+    #[serde(flatten)]
+    pub base: SettingsView,
+    pub idle_minutes: u32,
+    pub backend: Backend,
+    pub gpu_type: String,
+    pub gpu_types: Vec<String>,
+    pub volume_names: Vec<String>,
+    pub pass_api_key_to_pod: bool,
+    pub fallback_cost_per_hr: f64,
+}
+
+fn settings_response(core: &Core) -> SettingsResponse {
+    SettingsResponse {
+        base: core.settings.view(),
+        idle_minutes: core.settings.idle_minutes(),
+        backend: core.settings.backend(),
+        gpu_type: core.settings.gpu_types()[0].clone(),
+        gpu_types: core.settings.gpu_types(),
+        volume_names: core.settings.volume_names(),
+        pass_api_key_to_pod: core.settings.pass_api_key_to_pod(),
+        fallback_cost_per_hr: pod::FALLBACK_COST_PER_HR,
+    }
 }
 
 #[tauri::command]
+pub fn get_settings(core: CoreState<'_>) -> SettingsResponse {
+    settings_response(&core)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn save_settings(
     core: CoreState<'_>,
     api_key: Option<String>,
     endpoint_id: Option<String>,
     civitai_key: Option<String>,
-) -> Res<SettingsView> {
+    idle_minutes: Option<u32>,
+    backend: Option<Backend>,
+    pass_api_key_to_pod: Option<bool>,
+) -> Res<SettingsResponse> {
+    core.settings.save_pod(SavePodSettings {
+        backend,
+        idle_minutes,
+        pass_api_key_to_pod,
+        ..Default::default()
+    })?;
     core.settings.save(SaveSettings {
         api_key,
         endpoint_id,
         civitai_key,
-    })
+    })?;
+    if idle_minutes.is_some() {
+        // Re-emit so the UI's GpuState.idleMinutes is current.
+        let s = pod::state(&core);
+        core.sink.gpu_update(&s);
+    }
+    Ok(settings_response(&core))
+}
+
+// ----- GPU pod -----
+
+#[tauri::command]
+pub fn get_gpu_state(core: CoreState<'_>) -> GpuState {
+    pod::state(&core)
+}
+
+#[tauri::command]
+pub async fn start_gpu(core: CoreState<'_>) -> Res<GpuState> {
+    if core.settings.backend() != Backend::Pod {
+        return Err("The app is set to use the serverless endpoint (Settings)".into());
+    }
+    pod::start(&core)
+}
+
+#[tauri::command]
+pub async fn stop_gpu(core: CoreState<'_>) -> Res<GpuState> {
+    pod::stop(&core, pod::StopReason::User).await
 }
 
 #[tauri::command]
 pub async fn test_connection(core: CoreState<'_>) -> Res<Health> {
+    if core.settings.backend() == Backend::Pod {
+        return Ok(test_pod_connection(&core).await);
+    }
     let client = match core.runpod() {
         Ok(c) => c,
         Err(e) => {
@@ -57,6 +126,44 @@ pub async fn test_connection(core: CoreState<'_>) -> Res<Health> {
         error: Some(e),
         ..Default::default()
     }))
+}
+
+/// Pod running → the pod's `/health`; otherwise verify the API key with
+/// `GET /v2/pods`.
+pub async fn test_pod_connection(core: &Arc<Core>) -> Health {
+    let fail = |target: &str, e: String| Health {
+        target: Some(target.into()),
+        error: Some(e),
+        ..Default::default()
+    };
+    if let WorkerTarget::Pod { pod_id: Some(id) } = WorkerTarget::current(core) {
+        return match pod::pod_client(core, &id) {
+            Ok(c) => match c.health().await {
+                Ok(mut h) => {
+                    h.message = Some(match h.ready {
+                        Some(false) => "GPU pod reachable; ComfyUI is not ready yet".into(),
+                        _ => "GPU pod is running and ready".into(),
+                    });
+                    h
+                }
+                Err(e) => fail("pod", e),
+            },
+            Err(e) => fail("pod", e),
+        };
+    }
+    let rest = match pod::rest(core) {
+        Ok(r) => r,
+        Err(e) => return fail("api", e),
+    };
+    match rest.list_pods().await {
+        Ok(_) => Health {
+            ok: true,
+            target: Some("api".into()),
+            message: Some("API key OK — the GPU is stopped".into()),
+            ..Default::default()
+        },
+        Err(e) => fail("api", e.message),
+    }
 }
 
 #[tauri::command]

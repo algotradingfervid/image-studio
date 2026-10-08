@@ -4,11 +4,13 @@ import { isTaskActive, type Lora, type ResolvedLora } from "../../api";
 import { ProgressBar } from "../../components/Dialog";
 import { Icon } from "../../components/Icon";
 import { formatBytes, pct } from "../../lib/format";
+import { useGpu } from "../../state/gpu";
 import { useLibrary } from "../../state/library";
 import { useToast } from "../../state/toast";
 
 export function LoraLibrary() {
   const lib = useLibrary();
+  const gpu = useGpu();
   const toast = useToast();
   const [url, setUrl] = useState("");
   const [resolving, setResolving] = useState(false);
@@ -43,6 +45,7 @@ export function LoraLibrary() {
 
   const add = async () => {
     if (!preview || !modelId || !name.trim()) return;
+    if (!(await gpu.confirmStart(`download ${name.trim()}`))) return;
     setAdding(true);
     try {
       const l = await api.addLora({ url: preview.link, modelId, name: name.trim(), triggerWords: words });
@@ -202,12 +205,17 @@ export function LoraLibrary() {
 
 function LoraRow({ lora: l, modelName }: { lora: Lora; modelName: string }) {
   const lib = useLibrary();
+  const gpu = useGpu();
   const toast = useToast();
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const task = isTaskActive(l.task) ? l.task : null;
 
   const del = async () => {
+    if (!(await gpu.confirmStart(`delete ${l.name}`))) {
+      setConfirming(false);
+      return;
+    }
     setBusy(true);
     try {
       const task = await api.deleteLora(l.id);

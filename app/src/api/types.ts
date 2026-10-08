@@ -46,16 +46,37 @@ export interface ModelView {
 
 // ---------- Settings ----------
 
+/** "pod" = dedicated GPU pod started/stopped from the app (v3); "serverless" = legacy endpoint. */
+export type BackendKind = "pod" | "serverless";
+
 export interface Settings {
   hasApiKey: boolean;
-  endpointId: string;
+  /** Only needed (and used) for the legacy serverless backend. */
+  endpointId: string | null;
   hasCivitaiKey: boolean;
+  /** App-side auto-stop after this many idle minutes (5–240). */
+  idleMinutes: number;
+  backend: BackendKind;
+  /** First entry of `gpuTypes` (full name). */
+  gpuType: string;
+  /** GPU placement priority list (full names); the pod gets the first one available. */
+  gpuTypes: string[];
+  /** Network volume name(s) the pod mounts. */
+  volumeNames: string[];
+  /** Pass the RunPod API key to the pod so its idle watchdog can terminate itself. */
+  passApiKeyToPod: boolean;
+  /** USD/h used when the pod doesn't report a price. */
+  fallbackCostPerHr: number;
 }
 
 export interface SaveSettingsInput {
   apiKey?: string;
   endpointId?: string;
   civitaiKey?: string;
+  /** 5–240; the backend rejects anything else. */
+  idleMinutes?: number;
+  backend?: BackendKind;
+  passApiKeyToPod?: boolean;
 }
 
 export interface ConnectionTest {
@@ -63,6 +84,35 @@ export interface ConnectionTest {
   workers: { idle: number; running: number };
   jobs: { inQueue: number; inProgress: number };
   error?: string | null;
+  /** What was checked: the running pod's /health, only the API key (GPU stopped), or the legacy endpoint. */
+  target?: "pod" | "api" | "serverless";
+  message?: string | null;
+  ready?: boolean | null;
+  gpu?: string | null;
+}
+
+// ---------- GPU pod ----------
+
+export type GpuStatus = "stopped" | "starting" | "running" | "stopping" | "error";
+
+export interface GpuState {
+  status: GpuStatus;
+  podId?: string | null;
+  /** e.g. "NVIDIA RTX PRO 6000 Blackwell Server Edition" */
+  gpuType?: string | null;
+  /** RFC 3339; drives the live elapsed time. */
+  startedAt?: string | null;
+  /** USD/h (the backend falls back to 2.49). */
+  costPerHr?: number | null;
+  /** While starting: "Creating pod" | "Waiting for machine" | "Pulling image" | "Booting ComfyUI". */
+  phase?: string | null;
+  /** Set when status === "error". */
+  error?: string | null;
+  idleMinutes: number;
+  /** True when an existing pod was found and re-adopted at app launch. */
+  leftRunning: boolean;
+  /** Set on "stopped": user pressed Stop, the app auto-stopped it, or the pod vanished. */
+  stopReason?: "user" | "idle" | "external" | null;
 }
 
 export interface VolumeInfo {
@@ -215,6 +265,7 @@ export interface EventMap {
   "job-update": Job;
   "task-update": Task;
   "status-update": StatusSnapshot;
+  "gpu-update": GpuState;
 }
 
 export const isTaskActive = (t: Task | null | undefined): t is Task =>
@@ -222,3 +273,10 @@ export const isTaskActive = (t: Task | null | undefined): t is Task =>
 
 export const isJobActive = (j: Job): boolean =>
   j.status === "queued" || j.status === "starting" || j.status === "running";
+
+/** Ready to run jobs: an API key, plus an endpoint ID for the legacy serverless backend. */
+export const isConfigured = (s: Settings | null | undefined): boolean =>
+  !!s && s.hasApiKey && (s.backend !== "serverless" || !!s.endpointId);
+
+/** The GPU pod has to be started before work can run. */
+export const gpuIsOff = (g: GpuState | null | undefined): boolean => !!g && (g.status === "stopped" || g.status === "error");

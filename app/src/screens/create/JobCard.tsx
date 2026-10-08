@@ -19,11 +19,14 @@ const PHASE: Record<string, string> = {
 
 export function JobCard({
   job,
+  podMode,
   onCancel,
   onDismiss,
   onOpenImage,
 }: {
   job: JobView;
+  /** Dedicated GPU pod backend (vs legacy serverless): changes what "starting" means. */
+  podMode: boolean;
   onCancel: () => void;
   onDismiss: () => void;
   onOpenImage: (id: string) => void;
@@ -46,8 +49,13 @@ export function JobCard({
       bar = { value: 0, indeterminate: true, tone: "muted" };
       break;
     case "starting":
-      title = "Starting GPU… (cold start can take a minute)";
-      bar = { value: 0, indeterminate: true, tone: "warn" };
+      // Pod backend: progress.phase = the pod's boot phase; no progress = queued on the pod.
+      title = p?.phase
+        ? `Starting GPU · ${p.phase}`
+        : podMode
+          ? "Queued on the GPU…"
+          : "Starting GPU… (cold start can take a minute)";
+      bar = { value: 0, indeterminate: true, tone: p?.phase || !podMode ? "warn" : "muted" };
       break;
     case "running":
       {

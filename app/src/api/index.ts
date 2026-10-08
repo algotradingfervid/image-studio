@@ -14,6 +14,7 @@ import type {
   DeleteResult,
   EventMap,
   GenerateInput,
+  GpuState,
   ImagePage,
   Job,
   ImportedReference,
@@ -60,10 +61,18 @@ export const getSettings = () => call<Settings>("get_settings");
 export const saveSettings = (input: SaveSettingsInput) => callObj<Settings>("save_settings", input);
 export const testConnection = () => call<ConnectionTest>("test_connection");
 export const listModels = () => call<ModelView[]>("list_models");
-/** Starts a GPU worker — only on the user's Refresh click. */
+/** Asks the worker for fresh status — auto-starts the GPU pod when stopped (can take minutes). */
 export const refreshStatus = () => call<StatusSnapshot>("refresh_status");
 /** Cached status from SQLite (no GPU). volume/checkedAt may be null. */
 export const getStatus = () => call<StatusSnapshot>("get_status");
+
+// ---------- GPU pod ----------
+
+export const getGpuState = () => call<GpuState>("get_gpu_state");
+/** Returns at once (usually "starting"); progress continues via `gpu-update`. No-op if already starting/running. */
+export const startGpu = () => call<GpuState>("start_gpu");
+/** Resolves after the pod is gone (emits "stopping" then "stopped"). */
+export const stopGpu = () => call<GpuState>("stop_gpu");
 
 // ---------- Models ----------
 

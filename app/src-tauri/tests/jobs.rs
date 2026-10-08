@@ -46,6 +46,8 @@ fn harness(server: &MockServer) -> Harness {
     store.set(ACCOUNT_RUNPOD, Some("test-key")).unwrap();
     let env: HashMap<String, String> =
         [(ENV_RUNPOD_ENDPOINT.to_string(), "ep1".to_string())].into();
+    // These tests exercise the legacy serverless path (the pod path is in tests/pod.rs).
+    std::fs::write(dir.path().join("settings.json"), r#"{"backend":"serverless"}"#).unwrap();
     let settings = Settings::new(store, env, dir.path().join("settings.json"));
     let sink = Arc::new(Collect::default());
     let cfg = CoreConfig {
@@ -54,6 +56,7 @@ fn harness(server: &MockServer) -> Harness {
         civitai_root: server.uri(),
         hf_root: server.uri(),
         poll_interval: Duration::from_millis(10),
+        ..CoreConfig::production(dir.path().to_path_buf())
     };
     let core = Core::new(
         Registry::embedded(),

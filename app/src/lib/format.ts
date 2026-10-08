@@ -50,3 +50,26 @@ export function pct(part: number, whole: number): number {
   if (!whole) return 0;
   return Math.max(0, Math.min(100, (part / whole) * 100));
 }
+
+/** "NVIDIA RTX PRO 6000 Blackwell Server Edition" -> "RTX PRO 6000", "NVIDIA GeForce RTX 4090" -> "RTX 4090"; falls back to the raw string. */
+export function shortGpuName(gpuType: string | null | undefined): string {
+  if (!gpuType) return "GPU";
+  const short = gpuType
+    .replace(/^NVIDIA\s+/i, "")
+    .replace(/^GeForce\s+/i, "")
+    .replace(/\s+Blackwell(\s+Server Edition)?$/i, "")
+    .trim();
+  return short || gpuType;
+}
+
+/** Elapsed time for the GPU pill: "<1 min", "23 min", "1 h 05 min". */
+export function formatElapsed(ms: number): string {
+  const m = Math.max(0, Math.floor(ms / 60_000));
+  if (m < 1) return "<1 min";
+  if (m < 60) return `${m} min`;
+  return `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, "0")} min`;
+}
+
+export function formatUsd(v: number): string {
+  return `$${v.toFixed(2)}`;
+}

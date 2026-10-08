@@ -4,6 +4,7 @@
 use crate::db::Db;
 use crate::jobs::{Job, JobEntry};
 use crate::links::LinkResolver;
+use crate::pod::{Gpu, GpuState};
 use crate::registry::Registry;
 use crate::runpod::{RunpodClient, DEFAULT_API_ROOT};
 use crate::settings::Settings;
@@ -17,11 +18,20 @@ use std::time::Duration;
 pub const EVENT_JOB: &str = "job-update";
 pub const EVENT_TASK: &str = "task-update";
 pub const EVENT_STATUS: &str = "status-update";
+pub const EVENT_GPU: &str = "gpu-update";
 
 pub trait EventSink: Send + Sync {
     fn job_update(&self, job: &Job);
     fn task_update(&self, task: &Task);
     fn status_update(&self, status: &StatusView);
+    fn gpu_update(&self, _gpu: &GpuState) {}
+}
+
+/// Injectable wall clock (tests drive the idle auto-stop with it).
+pub type Clock = Arc<dyn Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync>;
+
+pub fn system_clock() -> Clock {
+    Arc::new(chrono::Utc::now)
 }
 
 /// Sink that drops events (useful in tests that don't inspect them).
@@ -39,6 +49,14 @@ pub struct CoreConfig {
     pub civitai_root: String,
     pub hf_root: String,
     pub poll_interval: Duration,
+    /// RunPod REST API root (`https://api.runpod.io`, v2 paths).
+    pub rest_root: String,
+    /// Pod server URL; `{podId}` is replaced.
+    pub pod_proxy_template: String,
+    pub pod_poll_interval: Duration,
+    pub pod_start_timeout: Duration,
+    pub pod_stop_timeout: Duration,
+    pub clock: Clock,
 }
 
 impl CoreConfig {
@@ -49,6 +67,12 @@ impl CoreConfig {
             civitai_root: crate::links::CIVITAI_ROOT.into(),
             hf_root: crate::links::HF_ROOT.into(),
             poll_interval: Duration::from_secs(1),
+            rest_root: crate::pod::DEFAULT_REST_ROOT.into(),
+            pod_proxy_template: crate::pod::DEFAULT_PROXY_TEMPLATE.into(),
+            pod_poll_interval: Duration::from_secs(3),
+            pod_start_timeout: Duration::from_secs(15 * 60),
+            pod_stop_timeout: Duration::from_secs(3 * 60),
+            clock: system_clock(),
         }
     }
 }
@@ -62,6 +86,7 @@ pub struct Core {
     pub jobs: Mutex<HashMap<String, JobEntry>>,
     pub tasks: Mutex<HashMap<String, TaskEntry>>,
     pub refresh_lock: tokio::sync::Mutex<()>,
+    pub gpu: Gpu,
 }
 
 impl Core {
@@ -76,7 +101,9 @@ impl Core {
             std::fs::create_dir_all(&d)
                 .map_err(|e| format!("Could not create {}: {e}", d.display()))?;
         }
+        let gpu = Gpu::new(settings.idle_minutes(), (cfg.clock)());
         Ok(Arc::new(Core {
+            gpu,
             registry,
             db: Mutex::new(db),
             settings,

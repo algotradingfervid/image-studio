@@ -6,11 +6,10 @@ use crate::delete_rule::{plan_delete, KeptFile};
 use crate::links::sanitize_filename;
 use crate::registry::ModelFile;
 use crate::runpod::{
-    failure_message, parse_progress, RunStatus, RunpodClient, DOWNLOAD_TIMEOUT_MS,
-    GENERATE_TIMEOUT_MS,
+    failure_message, parse_progress, RunStatus, DOWNLOAD_TIMEOUT_MS, GENERATE_TIMEOUT_MS,
 };
 use crate::state::{now_rfc3339, Core};
-use crate::status::{lora_folder, lora_view, present_set, refresh_status, LoraView};
+use crate::status::{lora_folder, lora_view, present_set, refresh_status_opts, LoraView};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
@@ -140,7 +139,7 @@ fn ensure_idle(core: &Core, kind: TargetType, id: &str) -> Result<(), String> {
 pub fn download_model(core: &Arc<Core>, id: &str) -> Result<Task, String> {
     let model = core.registry.require_model(id)?.clone();
     ensure_idle(core, TargetType::Model, id)?;
-    let client = core.runpod()?;
+    crate::worker::precheck(core)?;
     let present = present_set(core);
     // Send every file: the worker skips files already present with the right size.
     let files: Vec<Value> = model
@@ -164,7 +163,6 @@ pub fn download_model(core: &Arc<Core>, id: &str) -> Result<Task, String> {
         .sum();
     Ok(start_task(
         core,
-        client,
         TaskKind::Download,
         TaskTarget {
             kind: TargetType::Model,
@@ -208,14 +206,13 @@ pub fn delete_model(core: &Arc<Core>, id: &str) -> Result<DeleteResult, String> 
             task: None,
         });
     }
-    let client = core.runpod()?;
+    crate::worker::precheck(core)?;
     let payload: Vec<Value> = files
         .iter()
         .map(|f| json!({"folder": f.folder, "filename": f.filename}))
         .collect();
     let task = start_task(
         core,
-        client,
         TaskKind::Delete,
         TaskTarget {
             kind: TargetType::Model,
@@ -241,7 +238,7 @@ pub async fn add_lora(
     trigger_words: Option<Vec<String>>,
 ) -> Result<LoraView, String> {
     core.registry.require_model(model_id)?;
-    let client = core.runpod()?;
+    crate::worker::precheck(core)?;
     let r = core.resolver().resolve(url, &core.registry).await?;
     let filename = sanitize_filename(&r.filename)?;
     let row = LoraRow {
@@ -272,7 +269,6 @@ pub async fn add_lora(
     );
     start_task(
         core,
-        client,
         TaskKind::Download,
         TaskTarget {
             kind: TargetType::Lora,
@@ -301,10 +297,9 @@ pub fn delete_lora(core: &Arc<Core>, id: &str) -> Result<Option<Task>, String> {
         core.db.lock().unwrap().delete_lora(id)?;
         return Ok(None);
     }
-    let client = core.runpod()?;
+    crate::worker::precheck(core)?;
     Ok(Some(start_task(
         core,
-        client,
         TaskKind::Delete,
         TaskTarget {
             kind: TargetType::Lora,
@@ -329,7 +324,6 @@ pub fn cancel_task(core: &Core, task_id: &str) -> Result<(), String> {
 #[allow(clippy::too_many_arguments)]
 fn start_task(
     core: &Arc<Core>,
-    client: RunpodClient,
     kind: TaskKind,
     target: TaskTarget,
     input: Value,
@@ -357,7 +351,7 @@ fn start_task(
     core.sink.task_update(&task);
     let core2 = core.clone();
     let id = task.task_id.clone();
-    tokio::spawn(async move { run_task(core2, id, client, input, timeout_ms, on_done).await });
+    tokio::spawn(async move { run_task(core2, id, input, timeout_ms, on_done).await });
     task
 }
 
@@ -379,8 +373,10 @@ fn cancel_requested(core: &Core, id: &str) -> bool {
 }
 
 async fn finish(core: &Arc<Core>, id: &str, status: TaskStatus, error: Option<String>) {
-    // Refresh the cache before reporting the end so list_models is current.
-    if let Err(e) = refresh_status(core).await {
+    crate::pod::touch(core);
+    // Refresh the cache before reporting the end so list_models is current
+    // (only if the worker is up — never start the GPU just for this).
+    if let Err(e) = refresh_status_opts(core, false).await {
         eprintln!("[tasks] status refresh after task failed: {e}");
     }
     let done = {
@@ -396,27 +392,40 @@ async fn finish(core: &Arc<Core>, id: &str, status: TaskStatus, error: Option<St
     }
 }
 
+fn fail_now(core: &Core, id: &str, status: TaskStatus, e: Option<String>) {
+    let t = core.tasks.lock().unwrap().remove(id).map(|mut x| {
+        x.task.status = status;
+        x.task.error = e;
+        x.task
+    });
+    if let Some(t) = t {
+        core.sink.task_update(&t);
+    }
+}
+
 async fn run_task(
     core: Arc<Core>,
     id: String,
-    client: RunpodClient,
     input: Value,
     timeout_ms: u64,
     on_done: OnDone,
 ) {
+    // With the pod backend this starts the GPU when stopped (task stays queued).
+    let client = {
+        let (c, i) = (core.clone(), id.clone());
+        let cancelled = move || cancel_requested(&c, &i);
+        crate::worker::client(&core, &mut |_| {}, &cancelled).await
+    };
+    let client = match client {
+        Ok(c) => c,
+        Err(_) if cancel_requested(&core, &id) => {
+            return fail_now(&core, &id, TaskStatus::Cancelled, None)
+        }
+        Err(e) => return fail_now(&core, &id, TaskStatus::Failed, Some(e)),
+    };
     let rp_id = match client.run(input, timeout_ms).await {
         Ok(r) => r,
-        Err(e) => {
-            let t = core.tasks.lock().unwrap().remove(&id).map(|mut x| {
-                x.task.status = TaskStatus::Failed;
-                x.task.error = Some(e);
-                x.task
-            });
-            if let Some(t) = t {
-                core.sink.task_update(&t);
-            }
-            return;
-        }
+        Err(e) => return fail_now(&core, &id, TaskStatus::Failed, Some(e)),
     };
     let mut errors = 0;
     loop {

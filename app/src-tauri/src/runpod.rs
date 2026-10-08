@@ -1,4 +1,6 @@
-//! RunPod Serverless client: /run, /status, /cancel, /health.
+//! Worker client for the RunPod-serverless job API: /run, /status, /cancel,
+//! /health. Used both for the serverless endpoint and for the dedicated GPU
+//! pod, whose server is API-compatible (only the base URL and token differ).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -100,6 +102,16 @@ pub struct Health {
     pub jobs: JobCounts,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Additive (v3): what was checked — "pod", "api" or "serverless".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Pod only: ComfyUI ready flag and GPU name from the pod's /health.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
@@ -121,6 +133,8 @@ pub struct RunpodClient {
     http: reqwest::Client,
     base: String,
     api_key: String,
+    /// True when talking to the dedicated GPU pod (affects error wording).
+    pod: bool,
 }
 
 fn num(v: &Value, k: &str) -> u64 {
@@ -161,7 +175,31 @@ impl RunpodClient {
             http,
             base: format!("{}/v2/{}", api_root.trim_end_matches('/'), endpoint_id),
             api_key: api_key.to_string(),
+            pod: false,
         }
+    }
+
+    /// Client for the dedicated GPU pod's server at `base`
+    /// (`https://<podId>-8000.proxy.runpod.net`), authenticated with the pod token.
+    pub fn for_pod(base: &str, token: &str) -> RunpodClient {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("http client");
+        RunpodClient {
+            http,
+            base: base.trim_end_matches('/').to_string(),
+            api_key: token.to_string(),
+            pod: true,
+        }
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
+    pub fn is_pod(&self) -> bool {
+        self.pod
     }
 
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<Value, String> {
@@ -169,9 +207,31 @@ impl RunpodClient {
             .bearer_auth(&self.api_key)
             .send()
             .await
-            .map_err(|e| format!("Could not reach RunPod: {}", e.without_url()))?;
+            .map_err(|e| {
+                if self.pod {
+                    format!("Could not reach the GPU pod: {}", e.without_url())
+                } else {
+                    format!("Could not reach RunPod: {}", e.without_url())
+                }
+            })?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        if self.pod {
+            if status.as_u16() == 401 || status.as_u16() == 403 {
+                return Err("The GPU pod rejected the app's token (unauthorized). Stop and start the GPU again.".into());
+            }
+            if status.as_u16() == 404 {
+                return Err("GPU pod: job not found (expired?)".into());
+            }
+            if !status.is_success() {
+                let detail = serde_json::from_str::<Value>(&body)
+                    .map(|v| error_text(&v))
+                    .unwrap_or_else(|_| body.chars().take(300).collect());
+                return Err(format!("GPU pod error {}: {}", status.as_u16(), detail));
+            }
+            return serde_json::from_str(&body)
+                .map_err(|_| "The GPU pod returned an unreadable response".into());
+        }
         if status.as_u16() == 401 || status.as_u16() == 403 {
             return Err("RunPod rejected the API key (unauthorized). Check Settings.".into());
         }
@@ -243,6 +303,10 @@ impl RunpodClient {
                 in_progress: num(&j, "inProgress"),
             },
             error: None,
+            target: Some(if self.pod { "pod" } else { "serverless" }.into()),
+            message: None,
+            ready: v.get("ready").and_then(Value::as_bool),
+            gpu: v.get("gpu").and_then(Value::as_str).map(str::to_string),
         })
     }
 }

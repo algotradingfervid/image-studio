@@ -179,7 +179,8 @@ kbd {
 
 .app {
   display: grid;
-  grid-template-rows: auto auto 1fr;
+  /* toolbar, up to two banners (setup, GPU left running), then the screen */
+  grid-template-rows: auto auto auto 1fr;
   height: 100vh;
   min-height: 720px;
 }
@@ -280,6 +281,7 @@ kbd {
 }
 
 .screen {
+  grid-row: 4;
   min-height: 0;
   overflow: hidden;
   display: flex;
@@ -289,6 +291,114 @@ kbd {
 .screen > * {
   flex: 1;
   min-height: 0;
+}
+
+.banner--warn {
+  background: linear-gradient(90deg, rgba(243, 197, 82, 0.16), rgba(243, 197, 82, 0.04));
+  border-bottom-color: rgba(243, 197, 82, 0.35);
+  color: var(--warn);
+}
+
+.banner__actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+}
+
+/* GPU pill (toolbar) */
+
+.toolbar__end {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  min-width: 0;
+}
+
+.gpu-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  min-width: 0;
+  height: 30px;
+  padding: 0 3px 0 11px;
+  border-radius: 999px;
+  border: 1px solid var(--line-2);
+  background: rgba(0, 0, 0, 0.35);
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 550;
+  white-space: nowrap;
+}
+
+.gpu-pill--stopping {
+  padding-right: 12px;
+}
+
+.gpu-pill__text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.gpu-pill__text .mono {
+  font-size: 11.5px;
+}
+
+.gpu-pill__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--text-3);
+}
+
+.gpu-pill__btn {
+  flex: none;
+  border-radius: 999px;
+  height: 24px;
+}
+
+.gpu-pill__msg {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #ffc1ba;
+  font-weight: 450;
+}
+
+.gpu-pill--starting {
+  color: var(--warn);
+  border-color: rgba(243, 197, 82, 0.3);
+  background: var(--warn-soft);
+}
+
+.gpu-pill--running {
+  color: var(--text);
+  border-color: rgba(116, 211, 158, 0.3);
+  background: var(--ok-soft);
+}
+
+.gpu-pill--running .gpu-pill__dot {
+  background: var(--ok);
+  box-shadow: 0 0 8px var(--ok);
+  animation: breathe 2s ease-in-out infinite;
+}
+
+.gpu-pill--stopping {
+  color: var(--text-3);
+}
+
+.gpu-pill--error {
+  color: var(--danger);
+  border-color: rgba(255, 111, 97, 0.3);
+  background: var(--danger-soft);
+}
+
+.gpu-dialog__lede {
+  margin: 0 0 10px;
+  font-size: 14px;
+  line-height: 1.5;
 }
 
 /* -------------------------------------------------------------- controls */
@@ -2445,6 +2555,32 @@ input[type="range"]:focus-visible {
   border-radius: 50%;
   background: var(--accent);
   opacity: 0.7;
+}
+
+.hint--error {
+  color: #ffc1ba;
+}
+
+.input-suffix {
+  position: relative;
+}
+
+.input-suffix > .input {
+  padding-right: 42px;
+}
+
+.input-suffix__unit {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  translate: 0 -50%;
+  color: var(--text-3);
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.settings .switch + .hint {
+  margin-top: 2px;
 }
 
 /* ----------------------------------------------------------------- toasts */

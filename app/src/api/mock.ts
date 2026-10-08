@@ -2,7 +2,10 @@
 // Loaded only via dynamic import from backend.ts when `__TAURI_INTERNALS__` is absent,
 // so it is completely inert inside the Tauri app.
 //
-// URL flags: ?unconfigured (no API key / endpoint), ?empty (empty gallery).
+// URL flags: ?unconfigured (no API key / endpoint), ?empty (empty gallery),
+// ?gpuRunning (a re-adopted pod is already running, shows the launch banner),
+// ?fastIdle (an auto-stop "minute" lasts 2 s), ?gpuFail (starting the GPU ends in an error),
+// ?serverless (legacy serverless backend selected).
 
 import registry from "../../../shared/models.json";
 import type { Backend, Unlisten } from "./backend";
@@ -13,6 +16,7 @@ import type {
   DeletePreview,
   EventMap,
   GenerateInput,
+  GpuState,
   ImageRecord,
   ImagePage,
   Job,
@@ -36,9 +40,21 @@ const params = new URLSearchParams(window.location.search);
 
 // ---------- state ----------
 
-const settings: Settings = params.has("unconfigured")
-  ? { hasApiKey: false, endpointId: "", hasCivitaiKey: false }
-  : { hasApiKey: true, endpointId: "abc123mockendpoint", hasCivitaiKey: true };
+const GPU_TYPE = "NVIDIA RTX PRO 6000 Blackwell Server Edition";
+const GPU_COST = 2.49;
+
+const settings: Settings = {
+  ...(params.has("unconfigured")
+    ? { hasApiKey: false, endpointId: null, hasCivitaiKey: false }
+    : { hasApiKey: true, endpointId: "abc123mockendpoint", hasCivitaiKey: true }),
+  idleMinutes: 30,
+  backend: params.has("serverless") ? "serverless" : "pod",
+  gpuType: GPU_TYPE,
+  gpuTypes: [GPU_TYPE, "NVIDIA RTX PRO 4500 Blackwell", "NVIDIA GeForce RTX 4090", "NVIDIA RTX PRO 4000 Blackwell"],
+  volumeNames: ["image-studio-models"],
+  passApiKeyToPod: true,
+  fallbackCostPerHr: GPU_COST,
+};
 
 const models: RegistryModel[] = registry.models;
 const aspect = registry.aspectRatios as Record<string, number[]>;
@@ -55,6 +71,15 @@ const loraTasks = new Map<string, Task>();
 const taskCancel = new Set<string>();
 const jobCancel = new Set<string>();
 const activeJobs = new Map<string, Job>();
+
+// App-side auto-stop: idleMinutes with no jobs or tasks while the GPU runs.
+window.setInterval(() => {
+  if (!podMode() || gpu.status !== "running") return;
+  const busy =
+    activeJobs.size > 0 || [...modelTasks.values(), ...loraTasks.values()].some((t) => t.status === "queued" || t.status === "running");
+  if (busy) lastActivity = Date.now();
+  else if (Date.now() - lastActivity >= gpu.idleMinutes * MINUTE_MS) void stopGpuInternal("idle");
+}, 1000);
 
 let checkedAt = Date.now() - 1000 * 60 * 60 * 5;
 let warmUntil = 0;
@@ -92,6 +117,112 @@ const listeners = new Map<string, Set<(p: unknown) => void>>();
 function emit<K extends keyof EventMap>(event: K, payload: EventMap[K]) {
   const copy = structuredClone(payload);
   listeners.get(event)?.forEach((fn) => fn(copy));
+}
+
+// ---------- GPU pod ----------
+
+/** One auto-stop "minute" (?fastIdle makes it 2 s so the auto-stop can be watched). */
+const MINUTE_MS = params.has("fastIdle") ? 2000 : 60_000;
+const START_PHASES = ["Creating pod", "Waiting for machine", "Pulling image", "Booting ComfyUI"];
+const PHASE_MS = 1250; // ~5 s from Start to running
+
+let gpu: GpuState = params.has("gpuRunning")
+  ? {
+      status: "running",
+      podId: "mockpod_leftover",
+      gpuType: GPU_TYPE,
+      startedAt: new Date(Date.now() - 23 * 60_000).toISOString(),
+      costPerHr: GPU_COST,
+      phase: null,
+      error: null,
+      idleMinutes: settings.idleMinutes,
+      leftRunning: true,
+      stopReason: null,
+    }
+  : {
+      status: "stopped",
+      podId: null,
+      gpuType: null,
+      startedAt: null,
+      costPerHr: null,
+      phase: null,
+      error: null,
+      idleMinutes: settings.idleMinutes,
+      leftRunning: false,
+      stopReason: null,
+    };
+let gpuRun = 0; // bumped on every start/stop so a stale start sequence gives up
+let lastActivity = Date.now();
+
+const podMode = () => settings.backend === "pod";
+
+function setGpu(patch: Partial<GpuState>) {
+  gpu = { ...gpu, ...patch };
+  emit("gpu-update", gpu);
+}
+
+function startGpuInternal() {
+  if (gpu.status === "starting" || gpu.status === "running" || gpu.status === "stopping") return;
+  const run = ++gpuRun;
+  setGpu({
+    status: "starting",
+    podId: uid("pod"),
+    gpuType: GPU_TYPE,
+    costPerHr: GPU_COST,
+    startedAt: null,
+    phase: START_PHASES[0],
+    error: null,
+    leftRunning: false,
+    stopReason: null,
+  });
+  void (async () => {
+    for (let i = 1; i <= START_PHASES.length; i++) {
+      await sleep(PHASE_MS);
+      if (run !== gpuRun || gpu.status !== "starting") return;
+      if (i < START_PHASES.length) {
+        setGpu({ phase: START_PHASES[i] });
+      } else if (params.has("gpuFail")) {
+        setGpu({ status: "error", phase: null, error: "ComfyUI didn't become healthy within 10 minutes (simulated by ?gpuFail). The pod is still there." });
+      } else {
+        lastActivity = Date.now();
+        setGpu({ status: "running", phase: null, startedAt: new Date().toISOString() });
+      }
+    }
+  })();
+}
+
+async function stopGpuInternal(reason: "user" | "idle" | "external") {
+  if (gpu.status === "stopped") return;
+  if (gpu.status === "stopping") {
+    while (gpu.status === "stopping") await sleep(100);
+    return;
+  }
+  gpuRun++;
+  setGpu({ status: "stopping", phase: null });
+  await sleep(1500);
+  // Terminating the pod ends whatever was running on it.
+  activeJobs.forEach((j) => jobCancel.add(j.jobId));
+  for (const t of [...modelTasks.values(), ...loraTasks.values()]) if (t.status === "queued" || t.status === "running") taskCancel.add(t.taskId);
+  setGpu({ status: "stopped", podId: null, gpuType: null, costPerHr: null, startedAt: null, phase: null, error: null, leftRunning: false, stopReason: reason });
+}
+
+/**
+ * Pod backend: make sure the GPU is running, auto-starting it when stopped (like the Rust core).
+ * `onPhase` sees each boot phase; resolves once running, throws if it ends stopped/in error.
+ */
+async function ensureGpuReady(onPhase?: (phase: string) => void, aborted?: () => boolean) {
+  // Read through a function: `gpu` changes behind the awaits, so don't let TS narrow it.
+  const status = () => gpu.status;
+  if (!podMode() || status() === "running") return;
+  while (status() === "stopping") await sleep(100);
+  startGpuInternal();
+  let last: string | null = null;
+  while (status() === "starting" && !aborted?.()) {
+    if (gpu.phase && gpu.phase !== last) onPhase?.((last = gpu.phase));
+    await sleep(100);
+  }
+  if (aborted?.()) return;
+  if (status() !== "running") throw new Error(gpu.error ?? "The GPU pod stopped before it was ready.");
 }
 
 // ---------- helpers ----------
@@ -177,13 +308,19 @@ function computeDelete(id: string): DeletePreview {
 }
 
 function requireConfigured() {
-  if (!settings.hasApiKey || !settings.endpointId)
-    throw new Error("RunPod API key or endpoint ID is not set. Add them in Settings.");
+  if (!settings.hasApiKey) throw new Error("RunPod API key is not set. Add it in Settings.");
+  if (settings.backend === "serverless" && !settings.endpointId)
+    throw new Error("RunPod endpoint ID is not set. Add it in Settings (needed for the serverless backend).");
 }
 
 async function runDownloadTask(task: Task, files: { filename: string; sizeBytes: number }[], done: (f: string) => void) {
   const total = files.reduce((a, f) => a + f.sizeBytes, 0);
   task.totalBytes = total;
+  try {
+    await ensureGpuReady(undefined, () => taskCancel.has(task.taskId)); // stays "queued" while the GPU starts
+  } catch (e) {
+    return finishTask(task, "failed", e instanceof Error ? e.message : String(e));
+  }
   await sleep(600);
   if (taskCancel.has(task.taskId)) return finishTask(task, "cancelled");
   task.status = "running";
@@ -313,11 +450,26 @@ async function runJob(jobId: string, input: GenerateInput) {
   };
   activeJobs.set(jobId, job);
   emit("job-update", job);
+  if (podMode() && gpu.status !== "running") {
+    // GPU boot: status "starting" + progress.phase = the pod phase.
+    job.status = "starting";
+    try {
+      await ensureGpuReady((phase) => {
+        job.progress = { phase, step: null, totalSteps: null };
+        emit("job-update", job);
+      }, cancelled);
+    } catch (e) {
+      return stop("failed", e instanceof Error ? e.message : String(e));
+    }
+    if (cancelled()) return stop("cancelled");
+    job.progress = null;
+  }
   await sleep(300);
 
   for (let k = 0; k < input.count; k++) {
     if (cancelled()) return stop("cancelled");
-    const cold = Date.now() > warmUntil;
+    // Serverless only: a cold worker. A running pod is always warm.
+    const cold = !podMode() && Date.now() > warmUntil;
     const startedAt = Date.now();
     if (cold) {
       job.status = "starting";
@@ -377,21 +529,57 @@ const commands: Record<string, Handler> = {
   save_settings: async (a) => {
     const i = a as SaveSettingsInput;
     await sleep(250);
+    if (i.idleMinutes !== undefined && (!Number.isInteger(i.idleMinutes) || i.idleMinutes < 5 || i.idleMinutes > 240))
+      throw new Error("Auto-stop must be between 5 and 240 minutes.");
     if (i.apiKey !== undefined) settings.hasApiKey = i.apiKey.length > 0;
-    if (i.endpointId !== undefined) settings.endpointId = i.endpointId.trim();
+    if (i.endpointId !== undefined) settings.endpointId = i.endpointId.trim() || null;
     if (i.civitaiKey !== undefined) settings.hasCivitaiKey = i.civitaiKey.length > 0;
+    if (i.backend !== undefined) settings.backend = i.backend;
+    if (i.passApiKeyToPod !== undefined) settings.passApiKeyToPod = i.passApiKeyToPod;
+    if (i.idleMinutes !== undefined) {
+      settings.idleMinutes = i.idleMinutes;
+      setGpu({ idleMinutes: i.idleMinutes });
+    }
     return { ...settings };
   },
   test_connection: async (): Promise<ConnectionTest> => {
     await sleep(900);
-    if (!settings.hasApiKey || !settings.endpointId)
-      return { ok: false, workers: { idle: 0, running: 0 }, jobs: { inQueue: 0, inProgress: 0 }, error: "Missing API key or endpoint ID" };
-    const busy = Date.now() < warmUntil;
-    return { ok: true, workers: { idle: busy ? 1 : 0, running: busy ? 1 : 0 }, jobs: { inQueue: 0, inProgress: 0 } };
+    const none = { workers: { idle: 0, running: 0 }, jobs: { inQueue: 0, inProgress: 0 } };
+    if (settings.backend === "serverless") {
+      if (!settings.hasApiKey || !settings.endpointId) return { ok: false, ...none, target: "serverless", error: "Missing API key or endpoint ID" };
+      const busy = Date.now() < warmUntil;
+      return { ok: true, workers: { idle: busy ? 1 : 0, running: busy ? 1 : 0 }, jobs: { inQueue: 0, inProgress: 0 }, target: "serverless" };
+    }
+    if (!settings.hasApiKey) return { ok: false, ...none, target: "api", error: "Missing RunPod API key" };
+    if (gpu.status === "running") {
+      const n = activeJobs.size;
+      return {
+        ok: true,
+        workers: { idle: n ? 0 : 1, running: n ? 1 : 0 },
+        jobs: { inQueue: Math.max(0, n - 1), inProgress: Math.min(n, 1) },
+        target: "pod",
+        ready: true,
+        gpu: GPU_TYPE,
+        message: "GPU pod is up and ComfyUI is ready",
+      };
+    }
+    return { ok: true, ...none, target: "api", message: "API key OK — GPU is stopped" };
+  },
+  get_gpu_state: () => ({ ...gpu }),
+  start_gpu: async () => {
+    if (!settings.hasApiKey) throw new Error("RunPod API key is not set. Add it in Settings.");
+    await sleep(200);
+    startGpuInternal();
+    return { ...gpu };
+  },
+  stop_gpu: async () => {
+    await stopGpuInternal("user");
+    return { ...gpu };
   },
   list_models: () => models.map(modelView),
   refresh_status: async () => {
     requireConfigured();
+    await ensureGpuReady();
     await sleep(2200);
     checkedAt = Date.now();
     emitStatus();
@@ -428,6 +616,11 @@ const commands: Record<string, Handler> = {
     const task: Task = { taskId: uid("task"), kind: "delete", target: { type: "model", id }, status: "queued", bytes: 0, totalBytes: plan.freedBytes, file: plan.deleteFiles.join(", "), error: null };
     modelTasks.set(id, task);
     void (async () => {
+      try {
+        await ensureGpuReady(undefined, () => taskCancel.has(task.taskId));
+      } catch (e) {
+        return finishTask(task, "failed", e instanceof Error ? e.message : String(e));
+      }
       await sleep(500);
       task.status = "running";
       emit("task-update", task);
@@ -510,11 +703,14 @@ const commands: Record<string, Handler> = {
   },
   list_loras: () => loras.map(loraView),
   delete_lora: async (a) => {
+    requireConfigured();
+    if (!loras.some((l) => l.id === a.id)) throw new Error("LoRA not found");
+    const t = loraTasks.get(String(a.id));
+    if (t) taskCancel.add(t.taskId);
+    await ensureGpuReady();
+    await sleep(500);
     const idx = loras.findIndex((l) => l.id === a.id);
     if (idx < 0) throw new Error("LoRA not found");
-    const t = loraTasks.get(loras[idx].id);
-    if (t) taskCancel.add(t.taskId);
-    await sleep(500);
     loraFiles.delete(loras[idx].filename);
     loras.splice(idx, 1);
     return null; // removed immediately

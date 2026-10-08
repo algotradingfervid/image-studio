@@ -230,7 +230,7 @@ fn build_plan(core: &Core, req: &GenerateRequest) -> Result<Plan, String> {
 
 pub fn generate(core: &Arc<Core>, req: GenerateRequest) -> Result<String, String> {
     let plan = build_plan(core, &req)?;
-    let client = core.runpod()?;
+    crate::worker::precheck(core)?;
     let job = Job {
         job_id: uuid::Uuid::new_v4().to_string(),
         status: JobState::Queued,
@@ -251,7 +251,33 @@ pub fn generate(core: &Arc<Core>, req: GenerateRequest) -> Result<String, String
     core.sink.job_update(&job);
     let core2 = core.clone();
     let id2 = id.clone();
-    tokio::spawn(async move { run_job(core2, id2, client, plan).await });
+    tokio::spawn(async move {
+        // With the pod backend this starts the GPU when stopped; the job shows
+        // "starting" with the pod phase as progress.phase meanwhile.
+        let client = {
+            let (c, i) = (core2.clone(), id2.clone());
+            let mut on_phase = move |phase: &str| {
+                update(&c, &i, |j| {
+                    j.status = JobState::Starting;
+                    j.progress = Some(JobProgress {
+                        phase: Some(phase.to_string()),
+                        step: None,
+                        total_steps: None,
+                    });
+                })
+            };
+            let (c, i) = (core2.clone(), id2.clone());
+            let cancelled = move || cancel_requested(&c, &i);
+            crate::worker::client(&core2, &mut on_phase, &cancelled).await
+        };
+        match client {
+            Ok(client) => run_job(core2, id2, client, plan).await,
+            Err(_) if cancel_requested(&core2, &id2) => {
+                finish(&core2, &id2, JobState::Cancelled, None)
+            }
+            Err(e) => finish(&core2, &id2, JobState::Failed, Some(e)),
+        }
+    });
     Ok(id)
 }
 
@@ -297,6 +323,7 @@ fn update(core: &Core, id: &str, f: impl FnOnce(&mut Job)) {
 }
 
 fn finish(core: &Core, id: &str, status: JobState, error: Option<String>) {
+    crate::pod::touch(core);
     let done = core.jobs.lock().unwrap().remove(id).map(|mut e| {
         e.job.status = status;
         e.job.error = error;

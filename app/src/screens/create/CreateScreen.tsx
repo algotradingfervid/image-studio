@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import * as api from "../../api";
-import { isJobActive, type GenerateInput, type ImageRecord, type Job } from "../../api";
+import { gpuIsOff, isConfigured, isJobActive, type GenerateInput, type ImageRecord, type Job } from "../../api";
 import { Icon } from "../../components/Icon";
+import { useGpu } from "../../state/gpu";
 import { useLibrary } from "../../state/library";
 import { useToast } from "../../state/toast";
 import type { Tab } from "../../App";
@@ -39,7 +40,10 @@ const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
 export function CreateScreen({ active, onNavigate }: { active: boolean; onNavigate: (t: Tab) => void }) {
   const lib = useLibrary();
   const toast = useToast();
-  const configured = !!lib.settings?.hasApiKey && !!lib.settings?.endpointId;
+  const configured = isConfigured(lib.settings);
+  const gpu = useGpu();
+  // Pod backend with the GPU off: Generate auto-starts it first.
+  const startsGpu = gpu.podMode && gpuIsOff(gpu.state);
 
   // ---------- form state ----------
   const [modelId, setModelId] = useState<string>(readLastModel);
@@ -519,14 +523,24 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         <div className="panel__foot">
           <button type="submit" className="btn btn--generate" disabled={submitting || (!!blocker && blocker !== "Write a prompt")} aria-describedby="gen-hint">
             <Icon name="spark" size={18} />
-            <span>{submitting ? "Queuing…" : count > 1 ? `Generate ${count}` : "Generate"}</span>
+            <span>
+              {submitting
+                ? "Queuing…"
+                : `${startsGpu ? "Start GPU & Generate" : "Generate"}${count > 1 ? ` ${count}` : ""}`}
+            </span>
             <span className="kbd-group" aria-hidden>
               <kbd>⌘</kbd>
               <kbd>↵</kbd>
             </span>
           </button>
           <p id="gen-hint" className="hint panel__hint">
-            {blocker && blocker !== "Write a prompt" ? blocker : activeJobs ? `${plural(activeJobs, "job")} running` : "Each image is one RunPod job."}
+            {blocker && blocker !== "Write a prompt" ? blocker : activeJobs
+                ? `${plural(activeJobs, "job")} running`
+                : startsGpu
+                  ? `Starts the GPU pod first (${gpu.startTarget}, ${gpu.costLabel}; a few minutes). It auto-stops after ${gpu.idleMinutes} idle min.`
+                  : gpu.podMode
+                    ? "Runs on your GPU pod."
+                    : "Each image is one RunPod job."}
           </p>
         </div>
       </form>
@@ -538,6 +552,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
               <JobCard
                 key={j.jobId}
                 job={j}
+                podMode={gpu.podMode}
                 onCancel={() => cancelJob(j.jobId)}
                 onDismiss={() => setJobs((js) => js.filter((x) => x.jobId !== j.jobId))}
                 onOpenImage={(id) => {

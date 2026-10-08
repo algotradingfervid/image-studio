@@ -3,6 +3,7 @@ pub mod db;
 pub mod delete_rule;
 pub mod jobs;
 pub mod links;
+pub mod pod;
 pub mod references;
 pub mod registry;
 pub mod runpod;
@@ -10,6 +11,7 @@ pub mod settings;
 pub mod state;
 pub mod status;
 pub mod tasks;
+pub mod worker;
 
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
@@ -26,6 +28,9 @@ impl state::EventSink for TauriSink {
     }
     fn status_update(&self, s: &status::StatusView) {
         let _ = self.0.emit(state::EVENT_STATUS, s);
+    }
+    fn gpu_update(&self, s: &pod::GpuState) {
+        let _ = self.0.emit(state::EVENT_GPU, s);
     }
 }
 
@@ -59,8 +64,35 @@ pub fn run() {
         .setup(|app| {
             let core = build_core(app)?;
             app.manage(core.clone());
-            // Refresh the status cache on start only if it is older than 24 h.
+            // GPU pod: re-adopt a pod left running, cache the volume size,
+            // and run the idle auto-stop / liveness monitor.
+            let pod_core = core.clone();
             tauri::async_runtime::spawn(async move {
+                pod::run_monitor(pod_core, std::time::Duration::from_secs(30)).await
+            });
+            tauri::async_runtime::spawn(async move {
+                if core.settings.backend() == settings::Backend::Pod {
+                    if let Ok(rest) = pod::rest(&core) {
+                        if let Err(e) = pod::lookup_volume(&core, &rest).await {
+                            eprintln!("[startup] volume lookup failed: {e}");
+                        }
+                        if let Err(e) = pod::adopt(&core).await {
+                            eprintln!("[startup] pod adopt failed: {e}");
+                        }
+                        // Let an adopted pod finish its readiness check.
+                        let mut rx = pod::subscribe(&core);
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                            while pod::state(&core).status == pod::GpuStatus::Starting {
+                                if rx.changed().await.is_err() {
+                                    break;
+                                }
+                            }
+                        })
+                        .await;
+                    }
+                }
+                // Refresh the status cache on start only if it is older than
+                // 24 h — and never start the GPU just for that.
                 let checked = core
                     .db
                     .lock()
@@ -69,9 +101,10 @@ pub fn run() {
                     .ok()
                     .flatten()
                     .map(|(_, at)| at);
-                if core.runpod().is_ok() && status::is_stale(checked.as_deref(), chrono::Utc::now())
+                if worker::ready_client(&core).is_some_and(|c| c.is_ok())
+                    && status::is_stale(checked.as_deref(), chrono::Utc::now())
                 {
-                    if let Err(e) = status::refresh_status(&core).await {
+                    if let Err(e) = status::refresh_status_opts(&core, false).await {
                         eprintln!("[startup] status refresh failed: {e}");
                     }
                 }
@@ -82,6 +115,9 @@ pub fn run() {
             commands::get_settings,
             commands::save_settings,
             commands::test_connection,
+            commands::get_gpu_state,
+            commands::start_gpu,
+            commands::stop_gpu,
             commands::list_models,
             commands::refresh_status,
             commands::get_status,

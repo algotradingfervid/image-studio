@@ -1,7 +1,8 @@
 import { useEffect, useState, type FormEvent } from "react";
 import * as api from "../../api";
-import type { ConnectionTest } from "../../api";
+import type { BackendKind, ConnectionTest } from "../../api";
 import { Icon } from "../../components/Icon";
+import { shortGpuName } from "../../lib/format";
 import { useLibrary } from "../../state/library";
 import { useToast } from "../../state/toast";
 
@@ -64,6 +65,61 @@ function SecretField({
   );
 }
 
+const IDLE_MIN = 5;
+const IDLE_MAX = 240;
+
+function parseIdle(v: string): number | null {
+  if (!/^\d+$/.test(v.trim())) return null;
+  const n = Number(v.trim());
+  return n >= IDLE_MIN && n <= IDLE_MAX ? n : null;
+}
+
+function TestResult({ result }: { result: ConnectionTest }) {
+  if (!result.ok)
+    return (
+      <div className="test-result is-error" role="status">
+        <Icon name="alert" />
+        <div>
+          <strong>{result.target === "pod" ? "Couldn't reach the GPU pod." : "Couldn't connect."}</strong> {result.error ?? result.message ?? "Unknown error"}
+        </div>
+      </div>
+    );
+  let body;
+  if (result.target === "pod")
+    body = (
+      <>
+        <strong>GPU pod {result.ready === false ? "reachable, still booting." : "is ready."}</strong>
+        {result.message ? ` ${result.message}.` : ""}
+        {result.gpu ? (
+          <>
+            {" "}
+            <span className="mono">{result.gpu}</span> ·
+          </>
+        ) : null}{" "}
+        Jobs: {result.jobs.inQueue} in queue, {result.jobs.inProgress} in progress.
+      </>
+    );
+  else if (result.target === "api")
+    body = (
+      <>
+        <strong>Connected.</strong> {result.message ?? "API key OK — GPU is stopped"}
+      </>
+    );
+  else
+    body = (
+      <>
+        <strong>Connected.</strong> {result.message ? `${result.message} · ` : ""}Workers: {result.workers.idle} idle, {result.workers.running} running · Jobs:{" "}
+        {result.jobs.inQueue} in queue, {result.jobs.inProgress} in progress.
+      </>
+    );
+  return (
+    <div className="test-result is-ok" role="status">
+      <Icon name="check" />
+      <div>{body}</div>
+    </div>
+  );
+}
+
 export function SettingsScreen() {
   const lib = useLibrary();
   const toast = useToast();
@@ -71,25 +127,44 @@ export function SettingsScreen() {
   const [apiKey, setApiKey] = useState("");
   const [endpointId, setEndpointId] = useState("");
   const [civitaiKey, setCivitaiKey] = useState("");
+  const [backend, setBackend] = useState<BackendKind>("pod");
+  const [idle, setIdle] = useState("30");
+  const [passKey, setPassKey] = useState(true);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [result, setResult] = useState<ConnectionTest | null>(null);
 
   useEffect(() => {
-    if (s) setEndpointId(s.endpointId ?? "");
+    if (!s) return;
+    setEndpointId(s.endpointId ?? "");
+    setBackend(s.backend);
+    setIdle(String(s.idleMinutes));
+    setPassKey(s.passApiKeyToPod);
   }, [s]);
 
-  const dirty = !!apiKey || !!civitaiKey || (s ? endpointId.trim() !== (s.endpointId ?? "") : false);
+  const idleN = parseIdle(idle);
+  const idleInvalid = idleN == null;
+  const changed = {
+    endpointId: !!s && endpointId.trim() !== (s.endpointId ?? ""),
+    backend: !!s && backend !== s.backend,
+    idle: !!s && (idleN == null ? idle.trim() !== String(s.idleMinutes) : idleN !== s.idleMinutes),
+    passKey: !!s && passKey !== s.passApiKeyToPod,
+  };
+  const dirty = !!apiKey || !!civitaiKey || changed.endpointId || changed.backend || changed.idle || changed.passKey;
+  const pod = backend === "pod";
 
   const save = async (e: FormEvent) => {
     e.preventDefault();
-    if (!dirty) return;
+    if (!dirty || idleInvalid) return;
     setSaving(true);
     try {
       const input: api.SaveSettingsInput = {};
       if (apiKey) input.apiKey = apiKey;
       if (civitaiKey) input.civitaiKey = civitaiKey;
-      if (s && endpointId.trim() !== (s.endpointId ?? "")) input.endpointId = endpointId.trim();
+      if (changed.endpointId) input.endpointId = endpointId.trim();
+      if (changed.backend) input.backend = backend;
+      if (changed.idle && idleN != null) input.idleMinutes = idleN;
+      if (changed.passKey) input.passApiKeyToPod = passKey;
       await api.saveSettings(input); // returns the new view; reload keeps one source of truth
       setApiKey("");
       setCivitaiKey("");
@@ -115,6 +190,9 @@ export function SettingsScreen() {
     }
   };
 
+  const cost = s?.fallbackCostPerHr ?? 2.49;
+  const idleShown = idleN ?? s?.idleMinutes ?? 30;
+
   return (
     <div className="page">
       <div className="page__inner page__inner--narrow">
@@ -127,7 +205,7 @@ export function SettingsScreen() {
 
         <form className="card settings" onSubmit={save} aria-labelledby="runpod-title">
           <h2 id="runpod-title" className="card__title">
-            <Icon name="cloud" /> RunPod Serverless
+            <Icon name="cloud" /> RunPod
           </h2>
           <SecretField
             id="runpod-key"
@@ -135,26 +213,101 @@ export function SettingsScreen() {
             saved={!!s?.hasApiKey}
             value={apiKey}
             onChange={setApiKey}
-            help="RunPod → Settings → API Keys. A key with access to Serverless is enough."
+            help="RunPod → Settings → API Keys. The app uses it to start and stop your GPU pod (and for the legacy serverless endpoint)."
           />
           <div className="field">
-            <label className="field__label" htmlFor="endpoint-id">
-              Endpoint ID
+            <label className="field__label" htmlFor="backend">
+              Run generations on
             </label>
-            <input
-              id="endpoint-id"
-              className="input mono"
-              autoComplete="off"
-              spellCheck={false}
-              placeholder="e.g. a1b2c3d4e5f6g7"
-              value={endpointId}
-              onChange={(e) => setEndpointId(e.target.value)}
-              aria-describedby="endpoint-help"
-            />
-            <p id="endpoint-help" className="hint">
-              Shown on the endpoint's page in the RunPod console (scripts/runpod_setup.py also writes it to .env).
+            <select id="backend" className="input select" value={backend} onChange={(e) => setBackend(e.target.value as BackendKind)} aria-describedby="backend-help">
+              <option value="pod">Dedicated GPU pod (recommended)</option>
+              <option value="serverless">Serverless (legacy)</option>
+            </select>
+            <p id="backend-help" className="hint">
+              {pod
+                ? "You start and stop one GPU pod from the header. No waiting for a free serverless worker."
+                : "Jobs go to your serverless endpoint. Workers can queue for a long time when GPUs are scarce."}
             </p>
           </div>
+
+          {pod ? (
+            <>
+              <div className="field-row">
+                <div className="field">
+                  <label className="field__label" htmlFor="idle-minutes">
+                    Auto-stop after N idle minutes
+                  </label>
+                  <div className="input-suffix">
+                    <input
+                      id="idle-minutes"
+                      className="input mono"
+                      type="number"
+                      inputMode="numeric"
+                      min={IDLE_MIN}
+                      max={IDLE_MAX}
+                      step={1}
+                      value={idle}
+                      onChange={(e) => setIdle(e.target.value)}
+                      aria-invalid={idleInvalid}
+                      aria-describedby="idle-help"
+                    />
+                    <span className="input-suffix__unit">min</span>
+                  </div>
+                  <p id="idle-help" className={`hint ${idleInvalid ? "hint--error" : ""}`}>
+                    {idleInvalid ? `Enter a whole number from ${IDLE_MIN} to ${IDLE_MAX}.` : "With no jobs or downloads for this long, the app stops the GPU. Default 30."}
+                  </p>
+                </div>
+                <div className="field">
+                  <label className="field__label" htmlFor="gpu-type">
+                    GPU priority
+                  </label>
+                  <input
+                    id="gpu-type"
+                    className="input"
+                    value={(s?.gpuTypes?.length ? s.gpuTypes : s?.gpuType ? [s.gpuType] : []).map(shortGpuName).join(" → ")}
+                    title={(s?.gpuTypes ?? []).join("\n")}
+                    readOnly
+                    aria-describedby="gpu-type-help"
+                  />
+                  <p id="gpu-type-help" className="hint">
+                    Fixed for now · the pod gets the first one available · up to ${cost.toFixed(2)}/h while running.
+                  </p>
+                </div>
+              </div>
+              <div className="field">
+                <label className="switch">
+                  <input type="checkbox" checked={passKey} onChange={(e) => setPassKey(e.target.checked)} aria-describedby="pass-key-help" />
+                  <span className="switch__track" aria-hidden />
+                  <span>Let the pod stop itself when idle</span>
+                </label>
+                <p id="pass-key-help" className="hint">
+                  Passes your RunPod API key to the pod so its own watchdog can terminate it after {idleShown} idle minutes, even when this app is closed.
+                </p>
+              </div>
+            </>
+          ) : (
+            <>
+              <h3 className="card__title card__title--sub">Legacy serverless</h3>
+              <div className="field">
+                <label className="field__label" htmlFor="endpoint-id">
+                  Endpoint ID
+                </label>
+                <input
+                  id="endpoint-id"
+                  className="input mono"
+                  autoComplete="off"
+                  spellCheck={false}
+                  placeholder="e.g. a1b2c3d4e5f6g7"
+                  value={endpointId}
+                  onChange={(e) => setEndpointId(e.target.value)}
+                  aria-describedby="endpoint-help"
+                />
+                <p id="endpoint-help" className="hint">
+                  Only needed for the serverless backend. Shown on the endpoint's page in the RunPod console (scripts/runpod_setup.py also writes it to .env).
+                </p>
+              </div>
+            </>
+          )}
 
           <h2 className="card__title card__title--sub">
             <Icon name="layers" /> Civitai
@@ -172,39 +325,43 @@ export function SettingsScreen() {
             <button type="button" className="btn" onClick={test} disabled={testing || dirty}>
               <Icon name="bolt" className={testing ? "pulse-icon" : ""} /> {testing ? "Testing…" : "Test connection"}
             </button>
-            <button type="submit" className="btn btn--primary" disabled={!dirty || saving}>
+            <button type="submit" className="btn btn--primary" disabled={!dirty || idleInvalid || saving}>
               {saving ? "Saving…" : "Save"}
             </button>
           </div>
           {dirty && <p className="hint settings__dirty">Save your changes before testing the connection.</p>}
-
-          {result && (
-            <div className={`test-result ${result.ok ? "is-ok" : "is-error"}`} role="status">
-              <Icon name={result.ok ? "check" : "alert"} />
-              {result.ok ? (
-                <div>
-                  <strong>Connected.</strong> Workers: {result.workers.idle} idle, {result.workers.running} running · Jobs: {result.jobs.inQueue} in queue,{" "}
-                  {result.jobs.inProgress} in progress.
-                </div>
-              ) : (
-                <div>
-                  <strong>Couldn't connect.</strong> {result.error ?? "Unknown error"}
-                </div>
-              )}
-            </div>
+          {!dirty && s?.backend === "pod" && (
+            <p className="hint settings__dirty">Checks the GPU pod when it's running; otherwise only the API key (it doesn't start the GPU).</p>
           )}
+
+          {result && <TestResult result={result} />}
         </form>
 
         <section className="card note" aria-labelledby="cost-title">
           <h2 id="cost-title" className="card__title">
-            <Icon name="info" /> Costs and cold starts
+            <Icon name="info" /> Costs
           </h2>
-          <ul className="plain note__list">
-            <li>You pay per second while a GPU worker runs — nothing while idle (min workers 0, idle timeout 5 s).</li>
-            <li>The first image after a pause waits for a cold start: usually 20–60 s while a worker boots and loads the model.</li>
-            <li>Images right after that are fast — a warm worker skips the cold start.</li>
-            <li>Downloads, deletes and Refresh on the Models tab also start a worker briefly. Storage on the 100 GB network volume is billed monthly.</li>
-          </ul>
+          {s?.backend === "serverless" ? (
+            <ul className="plain note__list">
+              <li>You pay per second while a GPU worker runs — nothing while idle (min workers 0, idle timeout 5 s).</li>
+              <li>The first image after a pause waits for a cold start: usually 20–60 s while a worker boots and loads the model.</li>
+              <li>Downloads, deletes and Refresh on the Models tab also start a worker briefly.</li>
+              <li>Storage on the network volume is billed monthly.</li>
+            </ul>
+          ) : (
+            <ul className="plain note__list">
+              <li>
+                The GPU pod is billed ~${cost.toFixed(2)}/h or less (depends on which GPU it gets) while it runs — from Start until you press Stop or it auto-stops. The header shows the running time and
+                cost so far.
+              </li>
+              <li>
+                The app stops it after {s?.idleMinutes ?? 30} idle minutes (no jobs, downloads or deletes) while it's open. The pod also stops itself when idle, even if
+                the app is closed.
+              </li>
+              <li>Generating, Refresh, downloads and deletes start the GPU when it's stopped. Starting takes a few minutes.</li>
+              <li>Storage on the network volume is billed monthly, whether the GPU runs or not.</li>
+            </ul>
+          )}
         </section>
       </div>
     </div>

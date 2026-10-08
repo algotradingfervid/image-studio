@@ -11,6 +11,23 @@ use std::sync::{Arc, Mutex};
 pub const KEYCHAIN_SERVICE: &str = "ImageStudio";
 pub const ACCOUNT_RUNPOD: &str = "runpod_api_key";
 pub const ACCOUNT_CIVITAI: &str = "civitai_api_key";
+/// Random 32-byte hex token the app generates once and passes to the pod as
+/// `API_TOKEN`; the pod server requires it as a Bearer token.
+pub const ACCOUNT_POD_TOKEN: &str = "pod_api_token";
+
+pub const DEFAULT_IDLE_MINUTES: u32 = 30;
+/// Network volumes in priority order; the first that exists wins and the pod
+/// is placed in its data center.
+pub const DEFAULT_VOLUME_NAMES: &[&str] = &["image-studio-models"];
+/// GPU types in priority order; tried one by one on capacity errors.
+pub const DEFAULT_GPU_TYPES: &[&str] = &[
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "NVIDIA RTX PRO 4500 Blackwell",
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA RTX PRO 4000 Blackwell",
+];
+pub const MIN_IDLE_MINUTES: u32 = 5;
+pub const MAX_IDLE_MINUTES: u32 = 240;
 
 pub const ENV_RUNPOD_KEY: &str = "RUNPOD_API_KEY";
 pub const ENV_RUNPOD_ENDPOINT: &str = "RUNPOD_ENDPOINT_ID";
@@ -121,11 +138,60 @@ pub fn resolve(primary: Option<String>, fallback: Option<&String>) -> Option<Str
         .map(|s| s.trim().to_string())
 }
 
+/// Where worker jobs run: the dedicated GPU pod (default since v3) or the
+/// legacy serverless endpoint.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    #[default]
+    Pod,
+    Serverless,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
     #[serde(default)]
     pub endpoint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<Backend>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_minutes: Option<u32>,
+    /// Pass the user's RunPod API key to the pod as `RUNPOD_API_KEY` so its
+    /// idle watchdog can terminate it (default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_api_key_to_pod: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_names: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_types: Option<Vec<String>>,
+}
+
+fn list_or(v: Option<&Vec<String>>, default: &[&str]) -> Vec<String> {
+    let l: Vec<String> = v
+        .map(|x| {
+            x.iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if l.is_empty() {
+        default.iter().map(|s| s.to_string()).collect()
+    } else {
+        l
+    }
+}
+
+/// Pod-related settings (v3); additive to `SettingsView` in `get_settings`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavePodSettings {
+    pub backend: Option<Backend>,
+    pub idle_minutes: Option<u32>,
+    pub pass_api_key_to_pod: Option<bool>,
+    pub volume_names: Option<Vec<String>>,
+    pub gpu_types: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -190,6 +256,91 @@ impl Settings {
         )
     }
 
+    pub fn backend(&self) -> Backend {
+        self.config.lock().unwrap().backend.unwrap_or_default()
+    }
+
+    pub fn idle_minutes(&self) -> u32 {
+        self.config
+            .lock()
+            .unwrap()
+            .idle_minutes
+            .unwrap_or(DEFAULT_IDLE_MINUTES)
+            .clamp(MIN_IDLE_MINUTES, MAX_IDLE_MINUTES)
+    }
+
+    pub fn pass_api_key_to_pod(&self) -> bool {
+        self.config.lock().unwrap().pass_api_key_to_pod.unwrap_or(true)
+    }
+
+    pub fn volume_names(&self) -> Vec<String> {
+        list_or(self.config.lock().unwrap().volume_names.as_ref(), DEFAULT_VOLUME_NAMES)
+    }
+
+    pub fn gpu_types(&self) -> Vec<String> {
+        list_or(self.config.lock().unwrap().gpu_types.as_ref(), DEFAULT_GPU_TYPES)
+    }
+
+    /// The pod token, generated (32 random bytes, hex) and stored on first use.
+    pub fn pod_token(&self) -> Result<String, String> {
+        if let Some(t) = self
+            .secrets
+            .get(ACCOUNT_POD_TOKEN)?
+            .filter(|t| !t.trim().is_empty())
+        {
+            return Ok(t);
+        }
+        let bytes: [u8; 32] = rand::random();
+        let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        self.secrets.set(ACCOUNT_POD_TOKEN, Some(&token))?;
+        Ok(token)
+    }
+
+    fn write_config(&self, cfg: &AppConfig) -> Result<(), String> {
+        if let Some(dir) = self.config_path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("Could not save settings: {e}"))?;
+        }
+        let body = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+        std::fs::write(&self.config_path, body)
+            .map_err(|e| format!("Could not save settings: {e}"))
+    }
+
+    /// Missing fields are left unchanged.
+    pub fn save_pod(&self, s: SavePodSettings) -> Result<(), String> {
+        if let Some(m) = s.idle_minutes {
+            if !(MIN_IDLE_MINUTES..=MAX_IDLE_MINUTES).contains(&m) {
+                return Err(format!(
+                    "Auto-stop must be between {MIN_IDLE_MINUTES} and {MAX_IDLE_MINUTES} minutes"
+                ));
+            }
+        }
+        if s.backend.is_none()
+            && s.idle_minutes.is_none()
+            && s.pass_api_key_to_pod.is_none()
+            && s.volume_names.is_none()
+            && s.gpu_types.is_none()
+        {
+            return Ok(());
+        }
+        let mut cfg = self.config.lock().unwrap();
+        if let Some(b) = s.backend {
+            cfg.backend = Some(b);
+        }
+        if let Some(m) = s.idle_minutes {
+            cfg.idle_minutes = Some(m);
+        }
+        if let Some(p) = s.pass_api_key_to_pod {
+            cfg.pass_api_key_to_pod = Some(p);
+        }
+        if let Some(v) = s.volume_names {
+            cfg.volume_names = Some(v);
+        }
+        if let Some(g) = s.gpu_types {
+            cfg.gpu_types = Some(g);
+        }
+        self.write_config(&cfg)
+    }
+
     pub fn view(&self) -> SettingsView {
         SettingsView {
             has_api_key: self.runpod_api_key().is_some(),
@@ -226,13 +377,7 @@ impl Settings {
             }
             let mut cfg = self.config.lock().unwrap();
             cfg.endpoint_id = e;
-            if let Some(dir) = self.config_path.parent() {
-                std::fs::create_dir_all(dir)
-                    .map_err(|e| format!("Could not save settings: {e}"))?;
-            }
-            let body = serde_json::to_string_pretty(&*cfg).map_err(|e| e.to_string())?;
-            std::fs::write(&self.config_path, body)
-                .map_err(|e| format!("Could not save settings: {e}"))?;
+            self.write_config(&cfg)?;
         }
         Ok(self.view())
     }
@@ -331,5 +476,41 @@ mod tests {
                 ..Default::default()
             })
             .is_err());
+    }
+
+    #[test]
+    fn pod_settings_and_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::default());
+        let path = dir.path().join("c.json");
+        let s = Settings::new(store.clone(), HashMap::new(), path.clone());
+        assert_eq!(s.backend(), Backend::Pod);
+        assert_eq!(s.idle_minutes(), DEFAULT_IDLE_MINUTES);
+        assert!(s.pass_api_key_to_pod());
+        assert!(s
+            .save_pod(SavePodSettings {
+                idle_minutes: Some(4),
+                ..Default::default()
+            })
+            .is_err());
+        s.save_pod(SavePodSettings {
+            idle_minutes: Some(45),
+            backend: Some(Backend::Serverless),
+            pass_api_key_to_pod: Some(false),
+            gpu_types: Some(vec!["G1".into(), " ".into()]),
+            volume_names: Some(vec![]),
+        })
+        .unwrap();
+        let r = Settings::new(store.clone(), HashMap::new(), path);
+        assert_eq!(r.idle_minutes(), 45);
+        assert_eq!(r.backend(), Backend::Serverless);
+        assert!(!r.pass_api_key_to_pod());
+        assert_eq!(r.gpu_types(), vec!["G1".to_string()]);
+        assert_eq!(r.volume_names().len(), DEFAULT_VOLUME_NAMES.len(), "empty list → defaults");
+        assert_eq!(s.gpu_types(), vec!["G1".to_string()]);
+        let t = s.pod_token().unwrap();
+        assert_eq!(t.len(), 64);
+        assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(r.pod_token().unwrap(), t, "generated once, then reused");
     }
 }

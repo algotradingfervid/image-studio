@@ -1,16 +1,21 @@
 import { useEffect, useState } from "react";
 import * as api from "../../api";
-import { isTaskActive, type DeletePreview, type ModelView } from "../../api";
+import { gpuIsOff, isTaskActive, type DeletePreview, type ModelView } from "../../api";
 import { Dialog, ProgressBar } from "../../components/Dialog";
 import { Icon } from "../../components/Icon";
 import { formatBytes, formatRelative, pct, toDate } from "../../lib/format";
+import { useGpu } from "../../state/gpu";
 import { useLibrary } from "../../state/library";
 import { useToast } from "../../state/toast";
 import { LoraLibrary } from "./LoraLibrary";
 
 export function ModelsScreen({ active }: { active: boolean }) {
   const lib = useLibrary();
+  const gpu = useGpu();
   const { reloadStatus } = lib;
+  const refresh = async () => {
+    if (await gpu.confirmStart("refresh the volume status")) void lib.refreshStatus();
+  };
   // Cached status only (no GPU) each time the tab opens.
   useEffect(() => {
     if (active) void reloadStatus();
@@ -55,7 +60,7 @@ export function ModelsScreen({ active }: { active: boolean }) {
               <span className="hint" title={checked ? checked.toLocaleString() : undefined}>
                 Last checked {formatRelative(lib.status?.checkedAt)}
               </span>
-              <button type="button" className="btn" onClick={() => void lib.refreshStatus()} disabled={lib.refreshing} aria-describedby="refresh-note">
+              <button type="button" className="btn" onClick={() => void refresh()} disabled={lib.refreshing} aria-describedby="refresh-note">
                 <Icon name="refresh" className={lib.refreshing ? "spin" : ""} />
                 {lib.refreshing ? "Checking…" : "Refresh"}
               </button>
@@ -63,7 +68,10 @@ export function ModelsScreen({ active }: { active: boolean }) {
           </div>
           <ProgressBar label="Volume usage" value={vol ? pct(used, vol.totalBytes) : 0} tone={vol && vol.freeBytes < 10 * 1024 ** 3 ? "warn" : undefined} />
           <p id="refresh-note" className="hint">
-            <Icon name="bolt" size={12} /> Refresh briefly starts a GPU worker to list the volume (a few cents). It also runs after every download or delete.
+            <Icon name="bolt" size={12} />{" "}
+            {gpu.podMode
+              ? "Refresh lists the volume on the GPU pod — it starts the pod first if it's stopped. It also runs after every download or delete."
+              : "Refresh briefly starts a GPU worker to list the volume (a few cents). It also runs after every download or delete."}
           </p>
         </section>
 
@@ -82,6 +90,7 @@ export function ModelsScreen({ active }: { active: boolean }) {
 
 function ModelCard({ model: m, all }: { model: ModelView; all: ModelView[] }) {
   const lib = useLibrary();
+  const gpu = useGpu();
   const toast = useToast();
   const task = isTaskActive(m.task) ? m.task : null;
   const [starting, setStarting] = useState(false);
@@ -94,6 +103,7 @@ function ModelCard({ model: m, all }: { model: ModelView; all: ModelView[] }) {
   const nameOf = (id: string) => all.find((o) => o.id === id)?.name ?? id;
 
   const download = async () => {
+    if (!(await gpu.confirmStart(`download ${m.name}`))) return;
     setStarting(true);
     try {
       const t = await api.downloadModel(m.id);
@@ -176,7 +186,15 @@ function ModelCard({ model: m, all }: { model: ModelView; all: ModelView[] }) {
         <div className="task-progress" aria-live="polite">
           <div className="task-progress__label">
             <span>
-              {task.kind === "delete" ? "Deleting" : task.status === "queued" ? "Queued — waiting for a worker" : "Downloading"}
+              {task.kind === "delete"
+                ? task.status === "queued"
+                  ? "Queued to delete"
+                  : "Deleting"
+                : task.status === "queued"
+                  ? gpu.podMode && gpu.state?.status === "starting"
+                    ? `Queued — starting the GPU${gpu.state.phase ? ` · ${gpu.state.phase}` : ""}`
+                    : "Queued — waiting for a worker"
+                  : "Downloading"}
               {task.file ? <span className="mono hint"> · {task.file}</span> : null}
             </span>
             <span className="mono">
@@ -215,6 +233,9 @@ function ModelCard({ model: m, all }: { model: ModelView; all: ModelView[] }) {
 
 function DeleteDialog({ model: m, open, onClose }: { model: ModelView; open: boolean; onClose: () => void }) {
   const lib = useLibrary();
+  const gpu = useGpu();
+  // This dialog is already a confirmation, so the GPU-start notice lives inside it.
+  const startsGpu = gpu.podMode && gpuIsOff(gpu.state);
   const toast = useToast();
   const [preview, setPreview] = useState<DeletePreview | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -267,11 +288,19 @@ function DeleteDialog({ model: m, open, onClose }: { model: ModelView; open: boo
             Cancel
           </button>
           <button type="button" className="btn btn--danger" onClick={confirm} disabled={!preview || !!nothing || busy}>
-            <Icon name="trash" /> {busy ? "Deleting…" : preview ? `Delete ${preview.deleteFiles.length} file${preview.deleteFiles.length === 1 ? "" : "s"}` : "Delete"}
+            <Icon name="trash" />{" "}
+            {busy
+              ? "Deleting…"
+              : `${startsGpu ? "Start GPU & delete" : "Delete"}${preview ? ` ${preview.deleteFiles.length} file${preview.deleteFiles.length === 1 ? "" : "s"}` : ""}`}
           </button>
         </>
       }
     >
+      {startsGpu && preview && !nothing && (
+        <p className="notice notice--warn">
+          <Icon name="bolt" /> This starts the GPU pod ({gpu.startTarget}, {gpu.costLabel}). It auto-stops after {gpu.idleMinutes} idle minutes.
+        </p>
+      )}
       {error && <p className="notice notice--error">{error}</p>}
       {!preview && !error && (
         <p className="hint">
