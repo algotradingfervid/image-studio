@@ -80,7 +80,7 @@ Every route also answers under `/v2/<anything>/…`, so the serverless URL shape
 | `POST /run {input, policy?}` | `{id, status: "IN_QUEUE"}`. Ids look like `pod-<uuid>`. The body can be up to 32 MB. |
 | `GET /status/{id}` | `{id, status, delayTime, executionTime, output?, error?}` |
 | `POST /cancel/{id}` | `{id, status}` |
-| `GET /health` | `{jobs: {inQueue, inProgress, completed, failed}, workers: {idle, running}, ready, gpu, comfyui}` |
+| `GET /health` | `{jobs: {inQueue, inProgress, completed, failed}, workers: {idle, running}, ready, gpu, comfyui, watchdog: {armed, check, idleMinutes, idleForS, lastError}}` (see [Idle watchdog](#idle-watchdog)) |
 | `GET /ping` | `{status: "ok"}`. No auth. |
 
 **Auth:** `Authorization: Bearer $API_TOKEN`, compared in constant time. A missing or wrong header gets 401 `{"error": "unauthorized"}`. An unknown or expired job id gets 404.
@@ -116,11 +116,29 @@ Every 30 s the server checks whether there has been no authenticated request
 (`/ping` and 401s don't count), and no job has finished, for `IDLE_MINUTES`,
 with no job queued or running. When all of that holds, it terminates the pod:
 
-1. It sends `DELETE https://api.runpod.io/v2/pods/$RUNPOD_POD_ID`, which returns 204 on success, then `DELETE https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID`. It tries each with `RUNPOD_TERMINATE_API_KEY`, then with `RUNPOD_API_KEY`.
+1. It sends `DELETE https://api.runpod.io/v2/pods/$RUNPOD_POD_ID`, which returns 204 on success, then `DELETE https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID`. It tries each with `RUNPOD_TERMINATE_API_KEY`, then with `RUNPOD_API_KEY` (a key the arm check confirmed goes first). Any 2xx counts as success: RunPod then stops the pod.
 2. If both fail, it runs `runpodctl pod delete $RUNPOD_POD_ID`, then `runpodctl remove pod …`, if `runpodctl` is on `PATH`.
-3. If nothing worked, or no key is set, it logs a warning and the server exits. The pod keeps billing until the app-side auto-stop (or the user) terminates it.
+3. If nothing worked, or no key is set, it logs a warning that the pod is still billing and **stays up**, retrying every 5 minutes (`RETRY_S` = 300 s) while the pod is still idle. Any authenticated request or a job starting resets the attempt state and the idle timer.
 
-Every step is logged without the key.
+It never exits the server. An exit would make RunPod restart the container, which
+resets the idle timer, so the pod would bill indefinitely. The app-side auto-stop
+remains the backstop when the pod cannot terminate itself.
+
+**Arm check:** at startup a background thread sends an authenticated
+`GET https://api.runpod.io/v2/pods/$RUNPOD_POD_ID` with each key, in the order above.
+The first key that gets a 2xx is recorded and preferred for terminate. A successful
+GET proves only that the key can read the pod, not that it may delete it, so the check
+is reported as `"read"`.
+
+`GET /health` reports it as `watchdog`:
+
+| Field | Meaning |
+|---|---|
+| `armed` | `true` if some key could read this pod. |
+| `check` | `pending` (not run yet), `read` (GET succeeded), `failed`, or `disabled` (`IDLE_MINUTES=0`). |
+| `idleMinutes` | `IDLE_MINUTES`. |
+| `idleForS` | Seconds since the last authenticated request or finished job. |
+| `lastError` | The last terminate failure, else the arm-check error, else `null`. It names key variables, never key values. |
 
 Terminating releases the GPU and detaches the network volume without deleting it.
 
@@ -250,5 +268,5 @@ uv run pytest -q
   - generate jobs running FIFO, one at a time, with downloads running alongside
   - cancelling queued jobs, running generate (interrupt), running downloads, and the real handler's cooperative download cancel
   - `executionTimeout`, the failure shape, and 30-minute expiry
-  - the idle watchdog and the terminate call, with mocked HTTP and `runpodctl`
+  - the idle watchdog and the terminate call, with mocked HTTP and `runpodctl`: retrying every `RETRY_S` without ever exiting, reset on requests and jobs, the startup arm check and its `/health` report, and keys never reaching the logs
 - **Handler actions**, with a fake ComfyUI built from message and response shapes captured from a real v0.39.0 run. This includes parallel downloads with aggregate progress.

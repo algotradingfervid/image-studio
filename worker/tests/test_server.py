@@ -467,33 +467,46 @@ class Resp:
         self.status_code = code
 
 
-def make_watchdog(clock, mgr, idle_s=1800, terminate=None):
-    exits = []
+def make_watchdog(clock, mgr, idle_s=1800, terminate=None, **kw):
     calls = []
 
     def term():
         calls.append(clock())
         return True
 
-    wd = server.IdleWatchdog(mgr, idle_s, terminate or term, exit_fn=exits.append, clock=clock)
-    return wd, calls, exits
+    wd = server.IdleWatchdog(mgr, idle_s, terminate or term, clock=clock, **kw)
+    return wd, calls
+
+
+@pytest.fixture
+def no_exit(monkeypatch):
+    """Records any attempt to exit the process; the watchdog must never exit."""
+    exits = []
+
+    def fake_exit(code=0):
+        exits.append(code)
+        raise AssertionError(f"process exit({code}) called")
+
+    monkeypatch.setattr(server.os, "_exit", fake_exit)
+    monkeypatch.setattr(server.sys, "exit", fake_exit)
+    return exits
 
 
 def test_watchdog_fires_after_idle_minutes():
     clock = FakeClock()
     mgr = server.JobManager(run_job=lambda j: {}, clock=clock)
-    wd, calls, exits = make_watchdog(clock, mgr)
+    wd, calls = make_watchdog(clock, mgr)
     clock.advance(1799)
     assert not wd.check() and calls == []
     clock.advance(1)
-    assert wd.check() and len(calls) == 1 and exits == []
+    assert wd.check() and len(calls) == 1
     assert not wd.check() and len(calls) == 1  # fires once
     mgr.shutdown()
 
 
 def test_watchdog_reset_by_authenticated_requests_only(env):
     srv, mgr, actions, clock = env
-    wd, calls, exits = make_watchdog(clock, mgr)
+    wd, calls = make_watchdog(clock, mgr)
     app_srv = Running(server.build_app(TOKEN, mgr, server.Health(
         mgr, comfy_up=lambda: True, gpu=lambda: "", comfy_version=lambda: ""), wd))
     try:
@@ -502,9 +515,9 @@ def test_watchdog_reset_by_authenticated_requests_only(env):
         app_srv.get("/health", auth=False)        # 401 doesn't count
         clock.advance(100)
         assert wd.check() is True
-        wd.fired = False
         calls.clear()
         app_srv.get("/health")                    # authenticated: resets the timer
+        assert wd.fired is False
         clock.advance(1799)
         assert wd.check() is False and calls == []
     finally:
@@ -513,7 +526,7 @@ def test_watchdog_reset_by_authenticated_requests_only(env):
 
 def test_watchdog_not_while_job_active(env):
     srv, mgr, actions, clock = env
-    wd, calls, exits = make_watchdog(clock, mgr)
+    wd, calls = make_watchdog(clock, mgr)
     jid = run(srv, {"action": "download", "tag": "dl"})
     wait_for(lambda: "dl" in actions.started)
     clock.advance(3 * 3600)
@@ -526,13 +539,213 @@ def test_watchdog_not_while_job_active(env):
     assert wd.check() is True and len(calls) == 1
 
 
-def test_watchdog_exits_when_terminate_fails():
+class FlakyTerminate:
+    """terminate() that fails `fails` times, then succeeds."""
+
+    def __init__(self, clock, fails):
+        self.clock, self.fails, self.calls = clock, fails, []
+
+    def __call__(self):
+        self.calls.append(self.clock())
+        return len(self.calls) > self.fails
+
+
+def test_watchdog_never_exits_and_retries_after_retry_s(no_exit, caplog):
     clock = FakeClock()
     mgr = server.JobManager(run_job=lambda j: {}, clock=clock)
-    wd, calls, exits = make_watchdog(clock, mgr, terminate=lambda: False)
+    term = FlakyTerminate(clock, fails=10**9)
+    wd, _ = make_watchdog(clock, mgr, terminate=term, retry_s=300)
     clock.advance(1800)
-    assert wd.check() and exits == [0]
+    with caplog.at_level("WARNING"):
+        assert wd.check() is True               # attempt 1 fails, no exit
+    assert len(term.calls) == 1 and wd.fired is False
+    assert "STILL BILLING" in caplog.text and "retrying in 300 s" in caplog.text
+    assert wd.status()["lastError"].startswith("terminate failed (1 attempt(s))")
+    clock.advance(299)
+    assert wd.check() is False and len(term.calls) == 1   # waits RETRY_S
+    clock.advance(1)
+    assert wd.check() is True and len(term.calls) == 2    # retried
+    for _ in range(5):
+        clock.advance(300)
+        assert wd.check() is True
+    assert len(term.calls) == 7 and wd.attempts == 7
+    assert no_exit == []
     mgr.shutdown()
+
+
+def test_watchdog_default_retry_is_300s():
+    assert server.RETRY_S == 300
+    mgr = server.JobManager(run_job=lambda j: {})
+    assert server.IdleWatchdog(mgr, 60, lambda: False).retry_s == 300
+    mgr.shutdown()
+
+
+def test_watchdog_succeeds_on_a_later_retry(no_exit, caplog):
+    clock = FakeClock()
+    mgr = server.JobManager(run_job=lambda j: {}, clock=clock)
+    term = FlakyTerminate(clock, fails=2)
+    wd, _ = make_watchdog(clock, mgr, terminate=term, retry_s=300)
+    clock.advance(1800)
+    assert wd.check() and not wd.fired
+    clock.advance(300)
+    assert wd.check() and not wd.fired
+    clock.advance(300)
+    with caplog.at_level("WARNING"):
+        assert wd.check() and wd.fired
+    assert "terminate accepted" in caplog.text
+    assert wd.status()["lastError"] is None
+    clock.advance(3600)
+    assert wd.check() is False and len(term.calls) == 3  # no more calls once accepted
+    assert no_exit == []
+    mgr.shutdown()
+
+
+def test_watchdog_touch_resets_retry_state(no_exit):
+    clock = FakeClock()
+    mgr = server.JobManager(run_job=lambda j: {}, clock=clock)
+    term = FlakyTerminate(clock, fails=10**9)
+    wd, _ = make_watchdog(clock, mgr, terminate=term, retry_s=300)
+    clock.advance(1800)
+    assert wd.check() and wd.attempts == 1 and wd.next_attempt is not None
+    wd.touch()                                   # pod in use again
+    assert wd.attempts == 0 and wd.next_attempt is None and wd.status()["lastError"] is None
+    clock.advance(300)
+    assert wd.check() is False and len(term.calls) == 1  # idle timer restarted
+    clock.advance(1500)
+    assert wd.check() is True and len(term.calls) == 2 and wd.attempts == 1
+    assert no_exit == []
+    mgr.shutdown()
+
+
+def test_watchdog_job_start_resets_retry_state(env, no_exit):
+    srv, mgr, actions, clock = env
+    term = FlakyTerminate(clock, fails=10**9)
+    wd, _ = make_watchdog(clock, mgr, terminate=term, retry_s=300)
+    clock.advance(1800)
+    assert wd.check() and wd.attempts == 1
+    mgr.submit({"action": "download", "tag": "dl"})  # direct submit: no touch()
+    wait_for(lambda: "dl" in actions.started)
+    clock.advance(600)
+    assert wd.check() is False and wd.attempts == 0 and len(term.calls) == 1
+    assert no_exit == []
+
+
+def test_watchdog_request_during_attempt_discards_its_failure(no_exit):
+    clock = FakeClock()
+    mgr = server.JobManager(run_job=lambda j: {}, clock=clock)
+    holder = {}
+
+    def term():
+        holder["wd"].touch()  # a request lands while DELETE is in flight
+        return False
+
+    wd, _ = make_watchdog(clock, mgr, terminate=term)
+    holder["wd"] = wd
+    clock.advance(1800)
+    assert wd.check() is True
+    assert wd.attempts == 0 and wd.next_attempt is None and wd.status()["lastError"] is None
+    mgr.shutdown()
+
+
+def test_watchdog_has_no_exit_parameter():
+    import inspect
+    assert "exit_fn" not in inspect.signature(server.IdleWatchdog).parameters
+
+
+# ---- arm check -----------------------------------------------------------
+def test_verify_armed_with_second_key_and_preferred_for_terminate(caplog):
+    seen = []
+
+    def get(url, headers, timeout):
+        seen.append((url, headers["Authorization"]))
+        return Resp(401 if headers["Authorization"] == "Bearer app-key" else 200)
+
+    deletes = []
+
+    def delete(url, headers, timeout):
+        deletes.append(headers["Authorization"])
+        return Resp(204)
+
+    env = {"RUNPOD_POD_ID": "p1", "RUNPOD_TERMINATE_API_KEY": "app-key",
+           "RUNPOD_API_KEY": "pod-key"}
+    t = server.Terminator(env=env, get=get, delete=delete, which=lambda n: None)
+    clock = FakeClock()
+    mgr = server.JobManager(run_job=lambda j: {}, clock=clock)
+    wd = server.IdleWatchdog(mgr, 1800, t.terminate, verify=t.verify, clock=clock)
+    assert wd.status()["check"] == "pending" and wd.status()["armed"] is False
+    with caplog.at_level("INFO"):
+        wd.verify()
+    assert seen == [("https://api.runpod.io/v2/pods/p1", "Bearer app-key"),
+                    ("https://api.runpod.io/v2/pods/p1", "Bearer pod-key")]
+    assert wd.armed is True and wd.armed_key == "RUNPOD_API_KEY" and wd.armed_error is None
+    assert wd.status()["check"] == "read"
+    assert t.terminate() and deletes == ["Bearer pod-key"]  # verified key tried first
+    assert "app-key" not in caplog.text and "pod-key" not in caplog.text
+    mgr.shutdown()
+
+
+def test_verify_not_armed(caplog):
+    def get(url, headers, timeout):
+        if headers["Authorization"] == "Bearer app-key":
+            raise requests.ConnectionError("Bearer app-key leaked?")
+        return Resp(403)
+
+    env = {"RUNPOD_POD_ID": "p1", "RUNPOD_TERMINATE_API_KEY": "app-key",
+           "RUNPOD_API_KEY": "pod-key"}
+    t = server.Terminator(env=env, get=get, which=lambda n: None)
+    mgr = server.JobManager(run_job=lambda j: {})
+    wd = server.IdleWatchdog(mgr, 1800, t.terminate, verify=t.verify)
+    with caplog.at_level("INFO"):
+        wd.verify()
+    assert wd.armed is False and wd.armed_key is None and t.preferred is None
+    assert wd.status()["check"] == "failed"
+    err = wd.status()["lastError"]
+    assert "RUNPOD_TERMINATE_API_KEY: ConnectionError" in err
+    assert "RUNPOD_API_KEY: HTTP 403" in err
+    assert "NOT armed" in caplog.text
+    for secret in ("app-key", "pod-key"):
+        assert secret not in caplog.text and secret not in err
+    mgr.shutdown()
+
+
+def test_verify_without_pod_id_or_keys():
+    assert server.Terminator(env={"RUNPOD_API_KEY": "k"}).verify() == \
+        server.ArmCheck(False, error="RUNPOD_POD_ID is not set")
+    r = server.Terminator(env={"RUNPOD_POD_ID": "p"}, get=lambda *a, **k: 1 / 0).verify()
+    assert r.armed is False and "no RunPod API key" in r.error
+
+
+def test_verify_exception_does_not_propagate_and_disabled_skips():
+    mgr = server.JobManager(run_job=lambda j: {})
+    wd = server.IdleWatchdog(mgr, 1800, lambda: True, verify=lambda: 1 / 0)
+    wd.verify()
+    assert wd.armed is False and wd.status()["check"] == "failed"
+    off = server.IdleWatchdog(mgr, 0, lambda: True, verify=lambda: 1 / 0)
+    off.verify()
+    assert off.status()["check"] == "disabled"
+    mgr.shutdown()
+
+
+def test_health_exposes_watchdog(env):
+    srv, mgr, actions, clock = env
+    t = server.Terminator(env={"RUNPOD_POD_ID": "p1", "RUNPOD_API_KEY": "pod-key"},
+                          get=lambda *a, **k: Resp(200), which=lambda n: None)
+    wd = server.IdleWatchdog(mgr, 1800, t.terminate, verify=t.verify, clock=clock)
+    app_srv = Running(server.build_app(TOKEN, mgr, server.Health(
+        mgr, comfy_up=lambda: True, gpu=lambda: "", comfy_version=lambda: ""), wd))
+    try:
+        assert app_srv.get("/health").json()["watchdog"] == {
+            "armed": False, "check": "pending", "idleMinutes": 30, "idleForS": 0,
+            "lastError": None}
+        wd.verify()
+        clock.advance(42)
+        h = app_srv.get("/v2/x/health").json()["watchdog"]
+        # the request itself touched the watchdog, so idle time is 0 again
+        assert h == {"armed": True, "check": "read", "idleMinutes": 30, "idleForS": 0,
+                     "lastError": None}
+        assert "pod-key" not in app_srv.get("/health").text
+    finally:
+        app_srv.close()
 
 
 def test_terminator_calls_runpod_delete_with_bearer_key():

@@ -6,7 +6,7 @@ serverless, so the app only swaps its base URL and token:
   POST /run              {input, policy?}  -> {id, status: "IN_QUEUE"}
   GET  /status/{id}      -> {id, status, output?, delayTime, executionTime, error?}
   POST /cancel/{id}      -> {id, status}
-  GET  /health           -> {jobs, workers, ready, gpu, comfyui}
+  GET  /health           -> {jobs, workers, ready, gpu, comfyui, watchdog}
   GET  /ping             -> {status: "ok"}  (no auth; liveness)
 
 Every route is also served under /v2/{anything}/..., the serverless URL shape.
@@ -19,7 +19,8 @@ record through the job's "_progress" hook, and cancellation through "_cancel".
 
 Idle watchdog: when no authenticated request has arrived for IDLE_MINUTES
 (and no job is active or recently finished), the pod terminates itself through
-the RunPod API (see Terminator).
+the RunPod API (see Terminator). It never exits the process; a failed
+terminate is retried every RETRY_S while the pod stays idle.
 """
 
 from __future__ import annotations
@@ -257,6 +258,15 @@ class JobManager:
 REST_V2 = "https://api.runpod.io/v2/pods/{id}"   # docs.runpod.io/api-reference-v2/pods/terminate-a-pod
 REST_V1 = "https://rest.runpod.io/v1/pods/{id}"
 KEY_ENVS = ("RUNPOD_TERMINATE_API_KEY", "RUNPOD_API_KEY")
+RETRY_S = 300.0  # wait between terminate attempts while the pod stays idle
+
+
+@dataclass
+class ArmCheck:
+    """Result of Terminator.verify(). Never holds a key value, only env names."""
+    armed: bool
+    key: str | None = None
+    error: str | None = None
 
 
 class Terminator:
@@ -264,25 +274,62 @@ class Terminator:
 
     Keys, in order: RUNPOD_TERMINATE_API_KEY (optional, passed by the app),
     then RUNPOD_API_KEY (the pod-scoped key RunPod injects into every pod;
-    its permissions are undocumented). Calls DELETE /v2/pods/{id} (204), then
-    REST v1, then `runpodctl` if installed. Keys are never logged.
+    its permissions are undocumented). A key that verify() found able to read
+    this pod is tried first. Calls DELETE /v2/pods/{id} (204), then REST v1,
+    then `runpodctl` if installed. Keys are never logged.
     """
 
     def __init__(self, env: dict | None = None,
                  delete: Callable[..., Any] = requests.delete,
                  which: Callable[[str], str | None] = shutil.which,
-                 run: Callable[..., Any] = subprocess.run):
+                 run: Callable[..., Any] = subprocess.run,
+                 get: Callable[..., Any] = requests.get):
         self.env = os.environ if env is None else env
         self.delete = delete
+        self.get = get
         self.which = which
         self.run = run
+        self.preferred: str | None = None  # env name of the key verify() confirmed
+
+    def _keys(self) -> list[tuple[str, str]]:
+        keys = [(name, self.env[name]) for name in KEY_ENVS if self.env.get(name)]
+        if self.preferred:
+            keys.sort(key=lambda nk: nk[0] != self.preferred)  # stable: preferred first
+        return keys
+
+    def verify(self) -> ArmCheck:
+        """Checks that some key can see this pod (GET /v2/pods/{id}).
+
+        A 2xx proves the key can read the pod, not that it may DELETE it;
+        callers report this as armed with check "read". The first key that
+        works becomes the preferred key for terminate()."""
+        pod_id = self.env.get("RUNPOD_POD_ID")
+        if not pod_id:
+            return ArmCheck(False, error="RUNPOD_POD_ID is not set")
+        keys = self._keys()
+        if not keys:
+            return ArmCheck(False, error=f"no RunPod API key ({' / '.join(KEY_ENVS)}) in env")
+        url = REST_V2.format(id=pod_id)
+        errors = []
+        for name, key in keys:
+            try:
+                r = self.get(url, headers={"Authorization": f"Bearer {key}"}, timeout=30)
+                code = r.status_code
+            except requests.RequestException as exc:
+                errors.append(f"{name}: {type(exc).__name__}")
+                continue
+            if 200 <= code < 300:
+                self.preferred = name
+                return ArmCheck(True, key=name)
+            errors.append(f"{name}: HTTP {code}")
+        return ArmCheck(False, error=f"GET {url} failed for every key ({'; '.join(errors)})")
 
     def terminate(self) -> bool:
         pod_id = self.env.get("RUNPOD_POD_ID")
         if not pod_id:
             log.warning("idle shutdown: RUNPOD_POD_ID is not set; cannot terminate the pod")
             return False
-        keys = [(name, self.env[name]) for name in KEY_ENVS if self.env.get(name)]
+        keys = self._keys()
         if not keys:
             log.warning("idle shutdown: no RunPod API key (%s) in env", " / ".join(KEY_ENVS))
         for name, key in keys:
@@ -296,6 +343,8 @@ class Terminator:
                                 url, name, type(exc).__name__)
                     continue
                 if 200 <= code < 300:
+                    # A 2xx DELETE is RunPod accepting the termination; the
+                    # platform kills this container shortly after.
                     log.warning("idle shutdown: pod %s terminated via %s (key from %s, HTTP %d)",
                                 pod_id, url, name, code)
                     return True
@@ -316,19 +365,78 @@ class Terminator:
 
 
 class IdleWatchdog:
+    """Terminates the pod after idle_s without requests or jobs.
+
+    It never exits the process: if a container exit made RunPod restart it,
+    the idle timer would reset and the pod would bill forever. On a failed
+    terminate it stays up, logs, and retries every retry_s while still idle.
+    Any authenticated request or active job resets the attempt state."""
+
     def __init__(self, manager: JobManager, idle_s: float,
-                 terminate: Callable[[], bool], exit_fn: Callable[[int], Any] = os._exit,
+                 terminate: Callable[[], bool],
+                 verify: Callable[[], ArmCheck] | None = None,
+                 retry_s: float = RETRY_S,
                  clock: Callable[[], float] = time.monotonic):
         self.manager = manager
         self.idle_s = idle_s
         self.terminate = terminate
-        self.exit_fn = exit_fn
+        self._verify = verify
+        self.retry_s = retry_s
         self.clock = clock
+        self.lock = threading.Lock()
         self.last_request = clock()
+        self.generation = 0                    # bumped on every reset
+        self.fired = False                     # a terminate call succeeded
+        self.attempts = 0                      # failed attempts in this idle period
+        self.next_attempt: float | None = None
+        self.last_error: str | None = None
+        self.armed = False
+        self.armed_key: str | None = None      # env var name, never the value
+        self.armed_error: str | None = None
+        self.armed_check = "pending"           # pending | read | failed | disabled
+
+    # ---- arm check -------------------------------------------------------
+    def verify(self) -> None:
+        """Run once at startup (background thread): can a key see this pod?"""
+        if self.idle_s <= 0:
+            self.armed_check = "disabled"
+            return
+        if self._verify is None:
+            return
+        try:
+            res = self._verify()
+        except Exception as exc:  # never let the arm check kill the server
+            res = ArmCheck(False, error=f"verify raised {type(exc).__name__}")
+        self.armed, self.armed_key, self.armed_error = res.armed, res.key, res.error
+        self.armed_check = "read" if res.armed else "failed"
+        if res.armed:
+            log.info("idle watchdog armed: %s can read this pod (DELETE permission unverified)",
+                     res.key)
+        else:
+            log.warning("idle watchdog NOT armed: %s. The pod cannot terminate itself; "
+                        "it bills until the app or the user terminates it.", res.error)
+
+    def status(self) -> dict:
+        return {"armed": self.armed, "check": self.armed_check,
+                "idleMinutes": self.idle_s / 60, "idleForS": int(self.idle_for()),
+                "lastError": self.last_error or self.armed_error}
+
+    # ---- idle tracking ---------------------------------------------------
+    def _reset(self) -> None:
+        self.generation += 1  # invalidates the outcome of an in-flight attempt
         self.fired = False
+        self.attempts = 0
+        self.next_attempt = None
+        self.last_error = None
 
     def touch(self) -> None:
-        self.last_request = self.clock()
+        # Called on the event loop: only takes the lock, which check() never
+        # holds across the (slow) terminate call.
+        with self.lock:
+            self.last_request = self.clock()
+            if self.attempts or self.fired:
+                log.info("idle shutdown: request received; pod in use again, retry state reset")
+            self._reset()
 
     def idle_for(self) -> float:
         last = self.last_request
@@ -337,20 +445,45 @@ class IdleWatchdog:
         return self.clock() - last
 
     def check(self) -> bool:
-        """Returns True if it fired (terminated or exited)."""
-        if self.fired or self.idle_s <= 0:
+        """Returns True if it attempted to terminate the pod on this call."""
+        if self.idle_s <= 0:
             return False
-        if self.manager.active() or self.idle_for() < self.idle_s:
-            return False
-        self.fired = True
-        log.warning("idle shutdown: no requests for %.0f min and no active jobs; terminating pod",
-                    self.idle_for() / 60)
-        if self.terminate():
-            return True
-        log.warning("idle shutdown: could not terminate the pod through the RunPod API; "
-                    "exiting the server instead (the app-side auto-stop still applies, "
-                    "and the pod keeps billing until it is terminated)")
-        self.exit_fn(0)
+        with self.lock:
+            if self.manager.active() or self.idle_for() < self.idle_s:
+                if self.attempts or self.fired:
+                    self._reset()  # a job started: the pod is in use again
+                return False
+            if self.fired:
+                return False
+            now = self.clock()
+            if self.next_attempt is not None and now < self.next_attempt:
+                return False
+            self.attempts += 1
+            attempt, gen = self.attempts, self.generation
+            # Block concurrent attempts until this one is recorded.
+            self.next_attempt = now + self.retry_s
+            idle_min = self.idle_for() / 60
+        log.warning("idle shutdown: no requests for %.0f min and no active jobs; "
+                    "terminating pod (attempt %d)", idle_min, attempt)
+        ok = self.terminate()
+        with self.lock:
+            if gen != self.generation:  # a request arrived meanwhile; state was reset
+                return True
+            if ok:
+                self.fired = True
+                self.next_attempt = None
+                self.last_error = None
+            else:
+                self.last_error = (f"terminate failed ({attempt} attempt(s)); "
+                                   f"retrying every {self.retry_s:g} s while idle")
+        if ok:
+            log.warning("idle shutdown: terminate accepted by RunPod; waiting for the "
+                        "platform to stop this pod")
+        else:
+            log.warning("idle shutdown: attempt %d could not terminate the pod through the "
+                        "RunPod API. The pod is STILL BILLING. Staying up and retrying in "
+                        "%g s while idle (the app-side auto-stop still applies).",
+                        attempt, self.retry_s)
         return True
 
 
@@ -434,7 +567,10 @@ def build_app(token: str, manager: JobManager, health: Health,
 
     async def health_route(request: web.Request):
         manager.sweep()
-        return _json(await asyncio.get_running_loop().run_in_executor(None, health.payload))
+        payload = await asyncio.get_running_loop().run_in_executor(None, health.payload)
+        if watchdog is not None:
+            payload["watchdog"] = watchdog.status()
+        return _json(payload)
 
     async def ping(request: web.Request):
         return _json({"status": "ok"})
@@ -471,8 +607,11 @@ def main() -> None:
     except ValueError:
         idle_minutes = 30.0
     manager = JobManager()
-    watchdog = IdleWatchdog(manager, idle_minutes * 60, Terminator().terminate)
+    terminator = Terminator()
+    watchdog = IdleWatchdog(manager, idle_minutes * 60, terminator.terminate,
+                            verify=terminator.verify)
     app = build_app(token, manager, Health(manager), watchdog)
+    threading.Thread(target=watchdog.verify, name="watchdog-verify", daemon=True).start()
     threading.Thread(target=_background, args=(manager, watchdog), name="watchdog",
                      daemon=True).start()
     log.info("pod server on 0.0.0.0:%d (idle shutdown after %g min; pod %s; keys: %s)",
