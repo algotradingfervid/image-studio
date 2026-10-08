@@ -251,3 +251,11 @@ Reason: in testing, serverless flex workers waited 16.5 min for a free GPU (ever
 **Fix:** the volume total/free in the Models screen = the volume's `size` (GB, from `GET /v2/network-volumes`) minus the sum of present file sizes. The worker's `shutil.disk_usage` reports the whole shared filesystem.
 
 **Serverless:** the endpoint stays configured but unused. The Settings "Test connection" now checks the pod when it's running, and otherwise the RunPod API key.
+
+**v3 update (2026-10-09): region and GPU fallback.** Pod stock was "Low" everywhere and flipped within minutes, so the pod uses **EU-RO-1** (volume `image-studio-models`, which already holds all the models) and a **GPU fallback list**, in order:
+1. RTX PRO 6000 Blackwell Server Edition 96 GB
+2. RTX PRO 4500 Blackwell 32 GB
+3. RTX 4090 24 GB
+4. RTX PRO 4000 Blackwell 24 GB
+
+Both the volume list and the GPU list are configurable. The serverless endpoint is stopped (max workers 0) and detached from all volumes. The US-NE-1 volume `image-studio-models-us` is a temporary backup, pending deletion once EU-RO-1 has produced its first image.
