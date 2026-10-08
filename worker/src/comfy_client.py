@@ -140,6 +140,14 @@ class ComfyClient:
             raise ComfyError(f"COMFYUI_VIEW_FAILED: {filename}: HTTP {r.status_code}")
         return r.content
 
+    def interrupt(self) -> bool:
+        """Interrupts the running prompt (POST /interrupt). Best effort."""
+        try:
+            r = self.http.post(f"{self.base}/interrupt", json={}, timeout=10)
+            return r.status_code == 200
+        except requests.RequestException:
+            return False
+
     def free(self) -> bool:
         try:
             r = self.http.post(f"{self.base}/free",

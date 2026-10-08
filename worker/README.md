@@ -1,7 +1,9 @@
-# Image Studio worker (RunPod Serverless + ComfyUI)
+# Image Studio worker (RunPod Serverless or dedicated pod + ComfyUI)
 
-Custom RunPod Serverless worker for Image Studio. It runs ComfyUI v0.39.0 and
-implements the job protocol in `docs/spec.md` ("Worker job protocol").
+Custom worker for Image Studio. It runs ComfyUI v0.39.0 and implements the job
+protocol in `docs/spec.md` ("Worker job protocol"). The same image runs as a
+RunPod Serverless worker (default) or, with `MODE=pod`, as an HTTP server on a
+dedicated GPU pod ("v3 change"; see [Pod mode](#pod-mode-modepod)).
 
 ## Build
 
@@ -29,7 +31,7 @@ Docker Hub. The published image config shows:
 2. Installs ComfyUI's requirements into `/opt/venv`. torch, torchvision and torchaudio are frozen with a constraints file, so ComfyUI's bare `torch` requirement cannot pull PyPI's CUDA 13 wheels. The build also asserts that torch is still `2.11.0+cu128`.
 3. Asserts the ComfyUI version, then runs upstream's CPU smoke test (`main.py --quick-test-for-ci --cpu`).
 4. Copies `src/extra_model_paths.yaml` to `/comfyui/extra_model_paths.yaml`. ComfyUI auto-loads this file.
-5. Copies `src/*.py` to `/image_studio/` (`PYTHONPATH`) and `src/handler.py` to `/handler.py`. That replaces the upstream handler. The base `/start.sh` starts ComfyUI in the background, then runs `python -u /handler.py`.
+5. Copies `src/*.py` to `/image_studio/` (`PYTHONPATH`) and `src/handler.py` to `/handler.py`. That replaces the upstream handler. The base `/start.sh` starts ComfyUI in the background, then runs `python -u /handler.py`. `handler.py` calls `runpod.serverless.start`, or with `MODE=pod` starts `server.py`. The image `EXPOSE`s 8000.
 
 ## Endpoint environment
 
@@ -46,6 +48,81 @@ Set these by the Dockerfile; you normally don't change them: `REGISTRY_PATH`, `V
 Tokens are never forwarded across hosts. Redirects are followed manually, and the
 `Authorization` header is dropped as soon as a redirect leaves the original host,
 for example HF → CDN or Civitai → a presigned S3/R2 URL.
+
+## Pod mode (`MODE=pod`)
+
+The entrypoint is unchanged: `/start.sh` starts ComfyUI (on 127.0.0.1:8188,
+not exposed) and runs `/handler.py`, whose `main()` sees `MODE=pod` and starts
+`server.py` (aiohttp, already in the image as a `runpod` dependency) on
+`0.0.0.0:8000` instead of `runpod.serverless.start`.
+
+### Pod environment
+
+| Variable | Purpose |
+|---|---|
+| `MODE=pod` | Selects the HTTP server. Anything else means serverless. |
+| `API_TOKEN` | Required. Bearer token for every route except `/ping`. The server exits with code 2 if it is empty. |
+| `IDLE_MINUTES` | Idle watchdog, default 30. `0` disables it. |
+| `RUNPOD_POD_ID` | Injected by RunPod. Used by the watchdog. |
+| `RUNPOD_API_KEY` | Injected by RunPod into every pod as a "Pod-scoped API key". Its permissions are not documented. The watchdog tries it second. |
+| `RUNPOD_TERMINATE_API_KEY` | Optional key from the app (the user's RunPod key). The watchdog tries it first. A separate name avoids clashing with RunPod's injected `RUNPOD_API_KEY`. |
+| `PORT` | Default 8000. |
+| `HF_TOKEN`, `CIVITAI_API_KEY`, … | As in serverless mode. |
+
+Secrets are never logged. The startup line names only the key variables that are set.
+
+### API (compatible with RunPod serverless)
+
+Every route also answers under `/v2/<anything>/…`, so the serverless URL shape works too.
+
+| Route | Response |
+|---|---|
+| `POST /run {input, policy?}` | `{id, status: "IN_QUEUE"}`. Ids look like `pod-<uuid>`. The body can be up to 32 MB. |
+| `GET /status/{id}` | `{id, status, delayTime, executionTime, output?, error?}` |
+| `POST /cancel/{id}` | `{id, status}` |
+| `GET /health` | `{jobs: {inQueue, inProgress, completed, failed}, workers: {idle, running}, ready, gpu, comfyui}` |
+| `GET /ping` | `{status: "ok"}`. No auth. |
+
+**Auth:** `Authorization: Bearer $API_TOKEN`, compared in constant time. A missing or wrong header gets 401 `{"error": "unauthorized"}`. An unknown or expired job id gets 404.
+
+**Status semantics:**
+
+- Statuses are `IN_QUEUE`, `IN_PROGRESS`, `COMPLETED`, `FAILED`, `CANCELLED` and `TIMED_OUT`.
+- `delayTime` is the time queued, in ms. `executionTime` is the time running, in ms. Both are always present, and both are live while the job is unfinished.
+- While `IN_PROGRESS`, `output` is the latest progress payload (the same objects serverless sends through `progress_update`, at most 2 per second).
+- `COMPLETED`: `output` is the action's result.
+- `FAILED`: this is runpod-python's `run_job` mapping. The handler's `{"error": "<CODE>: …"}` becomes the top-level `error` string, and an empty `output` is dropped, so there is no `output` key.
+- `CANCELLED` and `TIMED_OUT` have no `output`.
+
+**Execution:**
+
+- `generate` jobs run one at a time in FIFO order on a dedicated thread.
+- `status`, `download` and `delete` jobs, and any unknown action, run on a separate pool of 4 threads, concurrently with generation.
+- Both paths call `handler.handler(job)` unchanged. The server passes a progress hook (`job["_progress"]`) and a cancel event (`job["_cancel"]`) in the job dict. In serverless mode these keys are absent, so `progress_update` is used as before.
+- `policy.executionTimeout` (ms) is honoured. A job running longer than that is cancelled and reported as `TIMED_OUT`.
+- Finished jobs are kept for 30 minutes, then `/status` returns 404.
+
+**Cancel:**
+
+- A queued job becomes `CANCELLED` and never runs.
+- A running `generate` is marked `CANCELLED` and ComfyUI gets `POST /interrupt`. The generate loop also interrupts if the cancel raced the prompt being queued. The next generate starts once ComfyUI has stopped.
+- A running `download` stops at its next chunk, and its `.part` file is kept for resume.
+- `delete` and `status` jobs are short. They are marked `CANCELLED` and their result is discarded.
+- Cancelling a finished job returns its status unchanged.
+
+### Idle watchdog
+
+Every 30 s the server checks whether there has been no authenticated request
+(`/ping` and 401s don't count), and no job has finished, for `IDLE_MINUTES`,
+with no job queued or running. When all of that holds, it terminates the pod:
+
+1. It sends `DELETE https://api.runpod.io/v2/pods/$RUNPOD_POD_ID`, which returns 204 on success, then `DELETE https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID`. It tries each with `RUNPOD_TERMINATE_API_KEY`, then with `RUNPOD_API_KEY`.
+2. If both fail, it runs `runpodctl pod delete $RUNPOD_POD_ID`, then `runpodctl remove pod …`, if `runpodctl` is on `PATH`.
+3. If nothing worked, or no key is set, it logs a warning and the server exits. The pod keeps billing until the app-side auto-stop (or the user) terminates it.
+
+Every step is logged without the key.
+
+Terminating releases the GPU and detaches the network volume without deleting it.
 
 ## Volume layout
 
@@ -167,4 +244,11 @@ uv run pytest -q
 - **Graphs:** every model with and without references and LoRAs. Node input names, link types and output indexes are checked against `tests/fixtures/object_info_v0.39.0.json`, a trimmed `GET /object_info` from ComfyUI v0.39.0.
 - **Path sanitising.**
 - **Download manager**, against a local HTTP server: resume, Range ignored, sha and size mismatch, total stall and trickle stall, retry cap and backoff, auth per host, auth dropped on a cross-host redirect, redirect loops.
+- **Pod server** (`tests/test_server.py`), a real aiohttp server on a random port with a fake action and an injected clock. It covers:
+  - auth: 401s, open `/ping`, and refusing to start without `API_TOKEN`
+  - the run → status lifecycle, with progress `output` and `delayTime`/`executionTime`
+  - generate jobs running FIFO, one at a time, with downloads running alongside
+  - cancelling queued jobs, running generate (interrupt), running downloads, and the real handler's cooperative download cancel
+  - `executionTimeout`, the failure shape, and 30-minute expiry
+  - the idle watchdog and the terminate call, with mocked HTTP and `runpodctl`
 - **Handler actions**, with a fake ComfyUI built from message and response shapes captured from a real v0.39.0 run. This includes parallel downloads with aggregate progress.

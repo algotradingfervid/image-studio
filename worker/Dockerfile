@@ -67,7 +67,12 @@ ENV PYTHONPATH=/image_studio \
     VOLUME_ROOT=/runpod-volume \
     COMFYUI_PATH=/comfyui
 
-RUN cd / && python -c "import handler, workflows, downloader; print('handler import ok')"
+RUN cd / && python -c "import handler, workflows, downloader, server, aiohttp; print('handler/server import ok')"
+
+# Pod mode (MODE=pod) serves the RunPod-serverless-compatible API on :8000.
+EXPOSE 8000
 
 # /start.sh (from the base image) starts ComfyUI, then runs /handler.py.
+# handler.py runs runpod.serverless.start, or with MODE=pod the HTTP server
+# in /image_studio/server.py (it refuses to start without API_TOKEN).
 CMD ["/start.sh"]

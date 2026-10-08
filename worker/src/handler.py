@@ -17,6 +17,13 @@ Actions (docs/spec.md, "Worker job protocol"):
 
 Failures are returned as {"error": "<CODE>: <detail>"}; the RunPod SDK then
 marks the job FAILED with that message.
+
+Pod mode (MODE=pod, docs/spec.md "v3 change"): the same /start.sh runs this
+file, which then starts server.py instead of runpod.serverless.start. The pod
+server passes two private keys in the job dict:
+  "_progress": callable(payload)  receives progress instead of progress_update
+  "_cancel":   threading.Event    set when the job is cancelled
+Serverless jobs never carry these keys, so serverless behaviour is unchanged.
 """
 
 from __future__ import annotations
@@ -59,14 +66,37 @@ MIN_SIDE, MAX_SIDE = 64, 4096
 MAX_STEPS = 200
 LISTED_FOLDERS = ("unet", "clip", "vae")
 
+PROGRESS_HOOK = "_progress"
+CANCEL_EVENT = "_cancel"
+
+
+def _send_progress(job: dict, payload: dict) -> None:
+    """Pod mode: the job's progress hook; serverless: runpod's progress_update."""
+    hook = job.get(PROGRESS_HOOK)
+    if callable(hook):
+        hook(payload)
+    else:
+        runpod.serverless.progress_update(job, payload)
+
+
 # Indirection points for tests.
 make_client: Callable[[], ComfyClient] = ComfyClient
-send_progress: Callable[[dict, dict], None] = runpod.serverless.progress_update
+send_progress: Callable[[dict, dict], None] = _send_progress
 clock: Callable[[], float] = time.monotonic
 
 
 class InputError(ValueError):
     pass
+
+
+class JobCancelled(RuntimeError):
+    pass
+
+
+def cancelled(job: dict) -> bool:
+    """True once the pod server cancelled this job (never in serverless mode)."""
+    ev = job.get(CANCEL_EVENT)
+    return ev is not None and ev.is_set()
 
 
 # ---------------------------------------------------------------------------
@@ -222,8 +252,13 @@ def _watch(client: ComfyClient, ws, prompt_id: str, samplers: set[str], total_st
     """
     deadline = t_queued + GENERATE_TIMEOUT_S
     sample_start = sample_end = None
+    interrupted = False
     for msg in client.iter_messages(ws):
         now = clock()
+        if not interrupted and cancelled(progress.job):
+            # Pod mode: covers a cancel that raced queue_prompt.
+            interrupted = True
+            client.interrupt()
         if msg is None:
             if now > deadline:
                 return {"error": f"COMFYUI_TIMEOUT: no result after {GENERATE_TIMEOUT_S:.0f}s"}
@@ -301,6 +336,8 @@ def do_generate(job: dict, inp: dict) -> dict:
     graph, out_node = build_workflow({**params, "references": ref_names}, registry)
     samplers = sampler_node_ids(graph)
 
+    if cancelled(job):
+        return {"error": "CANCELLED: cancelled before the prompt was queued"}
     ws = client.connect_ws()
     try:
         t_queued = clock()
@@ -458,10 +495,14 @@ def _run_downloads(job: dict, plan: list[tuple[Path, str, int | None, str | None
         name, key = dest.name, str(dest)
         part = dest.with_name(name + ".part")
         before = part.stat().st_size if part.exists() else 0
+        if cancelled(job):
+            raise JobCancelled(f"CANCELLED: {name}")
         with lock:
             state[key]["status"] = "downloading"
 
         def on_progress(b: int, total: int | None) -> None:
+            if cancelled(job):  # pod mode: stop at the next chunk; .part is kept
+                raise JobCancelled(f"CANCELLED: {name}")
             with lock:
                 state[key]["bytes"] = b
                 if total is not None:
@@ -492,7 +533,7 @@ def _run_downloads(job: dict, plan: list[tuple[Path, str, int | None, str | None
             try:
                 (downloaded if fut.result() else skipped).append(name)
             except Exception as exc:
-                errors.append(str(exc) if isinstance(exc, (DownloadError, OSError))
+                errors.append(str(exc) if isinstance(exc, (DownloadError, OSError, JobCancelled))
                               else f"{name}: {type(exc).__name__}: {exc}")
     elapsed = max(clock() - t0, 1e-6)
     snapshot(force=True)
@@ -545,12 +586,20 @@ def handler(job: dict) -> dict:
         return {"error": f"UNKNOWN_ACTION: {action!r} (expected one of {sorted(ACTIONS)})"}
     try:
         return fn(job, inp)
-    except (InputError, PathError, WorkflowError, ComfyError, DownloadError) as exc:
+    except (InputError, PathError, WorkflowError, ComfyError, DownloadError, JobCancelled) as exc:
         return {"error": str(exc)}
     except Exception as exc:  # never leak a raw traceback blob to the app
         traceback.print_exc()
         return {"error": f"INTERNAL_ERROR: {type(exc).__name__}: {exc}"}
 
 
+def main() -> None:
+    if os.environ.get("MODE", "").strip().lower() == "pod":
+        import server  # the /image_studio copy; imports `handler` from PYTHONPATH
+        server.main()
+    else:
+        runpod.serverless.start({"handler": handler})
+
+
 if __name__ == "__main__":
-    runpod.serverless.start({"handler": handler})
+    main()
