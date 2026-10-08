@@ -48,7 +48,7 @@ fn build_core(app: &tauri::App) -> Result<Arc<state::Core>, String> {
     std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
     let db = db::Db::open(&data_dir.join("studio.db"))?;
     let settings = settings::Settings::new(
-        Arc::new(settings::KeychainStore),
+        Arc::new(settings::CachedStore::new(settings::KeychainStore)),
         settings::load_env_fallback(),
         data_dir.join("settings.json"),
     );
