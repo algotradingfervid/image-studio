@@ -275,27 +275,30 @@ export function LoraPicker({
               <span className="lora-pick__name" title={l.filename}>
                 {l.name}
               </span>
-              <label className="lora-pick__strength">
-                <span className="visually-hidden">Strength for {l.name}</span>
-                <input
-                  type="range"
-                  min={0}
-                  max={2}
-                  step={0.05}
-                  value={p.strength}
-                  onChange={(e) => onChange(picks.map((x) => (x.loraId === p.loraId ? { ...x, strength: Number(e.target.value) } : x)))}
-                />
-                <output className="mono">{p.strength.toFixed(2)}</output>
-              </label>
               <button
                 type="button"
-                className="icon-btn icon-btn--sm"
+                className="lora-pick__remove"
                 aria-label={`Remove ${l.name}`}
+                title={`Remove ${l.name}`}
                 onClick={() => onChange(picks.filter((x) => x.loraId !== p.loraId))}
               >
-                <Icon name="x" />
+                <Icon name="x" size={12} />
+                Remove
               </button>
             </div>
+            <label className="lora-pick__strength">
+              <span className="lora-pick__label">Strength</span>
+              <input
+                type="range"
+                min={0}
+                max={2}
+                step={0.05}
+                value={p.strength}
+                aria-label={`Strength for ${l.name}`}
+                onChange={(e) => onChange(picks.map((x) => (x.loraId === p.loraId ? { ...x, strength: Number(e.target.value) } : x)))}
+              />
+              <output className="mono">{p.strength.toFixed(2)}</output>
+            </label>
             {l.triggerWords.length > 0 && (
               <div className="chips chips--words" aria-label={`Trigger words for ${l.name}`}>
                 {l.triggerWords.map((w) => (
