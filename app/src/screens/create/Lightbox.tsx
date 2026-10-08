@@ -123,7 +123,7 @@ export function Lightbox({
               <div>
                 <dt>Size</dt>
                 <dd className="mono">
-                  {im.aspectRatio} · {im.width}×{im.height}
+                  {im.initImage ? "start image" : im.aspectRatio} · {im.width}×{im.height}
                 </dd>
               </div>
               <div>
@@ -155,6 +155,18 @@ export function Lightbox({
                         </li>
                       ))}
                     </ul>
+                  </dd>
+                </div>
+              )}
+              {im.initImage && (
+                <div className="specs__wide">
+                  <dt>Start image</dt>
+                  <dd className="start-spec">
+                    <img src={fileSrc(im.initImage)} alt="Start image" />
+                    <span>
+                      <span className="start-spec__label">How much to change</span>
+                      <span className="mono start-spec__value">{im.denoise != null ? im.denoise.toFixed(2) : "—"}</span>
+                    </span>
                   </dd>
                 </div>
               )}

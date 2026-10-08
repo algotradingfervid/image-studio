@@ -1,6 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import * as api from "../../api";
-import { gpuIsOff, isConfigured, isJobActive, type GenerateInput, type ImageRecord, type Job } from "../../api";
+import {
+  DENOISE_DEFAULT,
+  DENOISE_MAX,
+  DENOISE_MIN,
+  gpuIsOff,
+  isConfigured,
+  isJobActive,
+  type GenerateInput,
+  type ImageRecord,
+  type Job,
+} from "../../api";
 import { Icon } from "../../components/Icon";
 import { useGpu } from "../../state/gpu";
 import { useLibrary } from "../../state/library";
@@ -15,6 +25,7 @@ import {
   MAX_LORAS,
   ModelPicker,
   References,
+  StartImage,
   type AdvancedValues,
   type LoraPick,
   type RefItem,
@@ -52,6 +63,10 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   const [refBusy, setRefBusy] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [loraPicks, setLoraPicks] = useState<LoraPick[]>([]);
+  // img2img start image (models with supportsImg2Img) and its strength.
+  const [startImage, setStartImage] = useState<RefItem | null>(null);
+  const [startBusy, setStartBusy] = useState(false);
+  const [denoise, setDenoise] = useState(DENOISE_DEFAULT);
   const [aspect, setAspect] = useState("1:1");
   const [count, setCount] = useState(1);
   const [adv, setAdv] = useState<AdvancedValues>(() => advancedDefaults(undefined));
@@ -59,9 +74,12 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   const [submitting, setSubmitting] = useState(false);
   const promptRef = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+  const startFileInput = useRef<HTMLInputElement>(null);
 
   const model = lib.models.find((m) => m.id === modelId);
   const maxRefs = model?.maxReferences ?? 0;
+  const img2img = !!model?.supportsImg2Img;
+  const startActive = img2img && !!startImage;
   const modelNames = useMemo(() => Object.fromEntries(lib.models.map((m) => [m.id, m.name])), [lib.models]);
 
   // Pick an initial model once the registry arrives.
@@ -97,13 +115,21 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     const droppedRefs = Math.max(0, refs.length - next.maxReferences);
     const keptLoras = loraPicks.filter((p) => lib.loras.find((l) => l.id === p.loraId)?.modelId === id);
     const droppedLoras = loraPicks.length - keptLoras.length;
+    const droppedStart = !!startImage && !next.supportsImg2Img;
     setModelId(id);
     setAdv(advancedDefaults(next));
     if (droppedRefs) setRefs((r) => r.slice(0, next.maxReferences));
     if (droppedLoras) setLoraPicks(keptLoras);
+    if (droppedStart) setStartImage(null);
     if (droppedRefs || droppedLoras) {
-      const parts = [droppedRefs && plural(droppedRefs, "reference"), droppedLoras && plural(droppedLoras, "LoRA")].filter(Boolean);
+      const parts = [
+        droppedRefs && plural(droppedRefs, "reference"),
+        droppedLoras && plural(droppedLoras, "LoRA"),
+        droppedStart && "the start image",
+      ].filter(Boolean);
       toast.info(`Removed ${parts.join(" and ")}`, `${next.name} doesn't support ${droppedRefs && !next.maxReferences ? "reference images" : "them"}.`);
+    } else if (droppedStart) {
+      toast.info("Removed the start image", `${next.name} doesn't support start images (img2img).`);
     }
   };
 
@@ -156,10 +182,51 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     }
   };
 
-  // Latest handlers for long-lived listeners.
-  const handlers = useRef({ addFiles, addPaths });
-  handlers.current = { addFiles, addPaths };
-  const refsEnabled = active && maxRefs > 0;
+  // ---------- start image (img2img) ----------
+  // Same import pipeline as references (downscaled to ≤1 MP); one image, replaced on re-add.
+  const setStartFrom = async (load: () => Promise<RefItem>) => {
+    setStartBusy(true);
+    try {
+      setStartImage(await load());
+    } catch (e) {
+      toast.error("Couldn't add the start image", e);
+    } finally {
+      setStartBusy(false);
+    }
+  };
+
+  const addStartFiles = async (files: File[]) => {
+    const f = files[0];
+    if (!f) return;
+    if (files.length > 1) toast.info("Only one start image is used", "The first image was added.");
+    await setStartFrom(async () => api.importReferenceBytes(await api.blobToBase64(f), f.type || "image/png"));
+  };
+
+  const addStartPaths = async (paths: string[]) => {
+    const imgs = paths.filter((p) => IMAGE_EXT.test(p));
+    if (!imgs.length) return toast.info("That isn't an image file", "The start image must be a PNG, JPEG, WebP or similar.");
+    if (imgs.length > 1) toast.info("Only one start image is used", "The first image was added.");
+    await setStartFrom(() => api.importReference(imgs[0]));
+  };
+
+  const pickStart = async () => {
+    try {
+      const paths = await api.pickImagePaths();
+      if (paths === null) startFileInput.current?.click();
+      else if (paths.length) await addStartPaths(paths.slice(0, 1));
+    } catch (e) {
+      toast.error("Couldn't open the file picker", e);
+    }
+  };
+
+  // Latest handlers for long-lived listeners. Pasted/dropped images go to the
+  // references when the model takes them, else to the start image.
+  const toStart = maxRefs === 0 && img2img;
+  const onPastedFiles = toStart ? addStartFiles : addFiles;
+  const onDroppedPaths = toStart ? addStartPaths : addPaths;
+  const handlers = useRef({ onPastedFiles, onDroppedPaths });
+  handlers.current = { onPastedFiles, onDroppedPaths };
+  const refsEnabled = active && (maxRefs > 0 || img2img);
 
   useEffect(() => {
     if (!refsEnabled) return;
@@ -167,7 +234,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
       const files = Array.from(e.clipboardData?.files ?? []).filter((f) => f.type.startsWith("image/"));
       if (!files.length) return;
       e.preventDefault();
-      void handlers.current.addFiles(files);
+      void handlers.current.onPastedFiles(files);
     };
     document.addEventListener("paste", onPaste);
     let un: (() => void) | undefined;
@@ -178,7 +245,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         else if (e.type === "leave") setDragActive(false);
         else {
           setDragActive(false);
-          void handlers.current.addPaths(e.paths);
+          void handlers.current.onDroppedPaths(e.paths);
         }
       })
       .then((f) => (dead ? f() : (un = f)));
@@ -311,7 +378,9 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
           ? "Write a prompt"
           : refBusy
             ? "Adding references…"
-            : null;
+            : startBusy
+              ? "Adding the start image…"
+              : null;
 
   const doGenerate = async () => {
     if (submitting) return;
@@ -333,6 +402,10 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     if (!adv.randomSeed && adv.seed !== "") input.seed = Number(adv.seed);
     if (adv.steps !== "" && Number(adv.steps) > 0) input.steps = Math.round(Number(adv.steps));
     if (adv.cfg !== "" && !isNaN(Number(adv.cfg))) input.cfg = Number(adv.cfg);
+    if (startActive && startImage) {
+      input.initImageId = startImage.refId;
+      input.denoise = denoise;
+    }
 
     setSubmitting(true);
     try {
@@ -384,6 +457,22 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     }
     setLoraPicks(picks);
 
+    // img2img: re-import the stored start image (the original file may be gone).
+    setStartImage(null);
+    setDenoise(DENOISE_DEFAULT);
+    let startFailed = false;
+    if (im.initImage && m.supportsImg2Img) {
+      setDenoise(Math.min(DENOISE_MAX, Math.max(DENOISE_MIN, im.denoise ?? DENOISE_DEFAULT)));
+      setStartBusy(true);
+      try {
+        setStartImage(await api.importReference(im.initImage));
+      } catch {
+        startFailed = true;
+      } finally {
+        setStartBusy(false);
+      }
+    }
+
     setRefs([]);
     let refFails = 0;
     if (m.maxReferences > 0 && im.references.length) {
@@ -399,7 +488,11 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
       setRefs(restored);
       setRefBusy(false);
     }
-    const problems = [missing.length && `LoRA not in library: ${missing.join(", ")}`, refFails && plural(refFails, "reference") + " couldn't be restored"].filter(Boolean);
+    const problems = [
+      missing.length && `LoRA not in library: ${missing.join(", ")}`,
+      refFails && plural(refFails, "reference") + " couldn't be restored",
+      startFailed && "The start image couldn't be restored",
+    ].filter(Boolean);
     if (problems.length) toast.info("Settings restored, with gaps", problems.join(". "));
     else toast.success("Settings restored", `${m.name} · seed ${im.seed}`);
     requestAnimationFrame(() => promptRef.current?.focus());
@@ -495,6 +588,26 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
             </section>
           )}
 
+          {img2img && (
+            <section className="section" aria-labelledby="start-image-title">
+              <div className="section__head">
+                <h2 className="section__title" id="start-image-title">
+                  Start image <span className="section__aside">(optional) — the model redraws this image</span>
+                </h2>
+              </div>
+              <StartImage
+                image={startImage}
+                denoise={denoise}
+                busy={startBusy}
+                dragActive={dragActive && toStart}
+                onDenoise={setDenoise}
+                onRemove={() => setStartImage(null)}
+                onFiles={addStartFiles}
+                onPick={pickStart}
+              />
+            </section>
+          )}
+
           <section className="section">
             <h2 className="section__title">LoRAs</h2>
             <LoraPicker
@@ -509,7 +622,12 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
 
           <section className="section">
             <h2 className="section__title">Aspect ratio</h2>
-            <AspectPicker value={aspect} onChange={setAspect} />
+            <AspectPicker value={aspect} onChange={setAspect} disabled={startActive} describedBy={startActive ? "aspect-note" : undefined} />
+            {startActive && (
+              <p className="hint section__note" id="aspect-note">
+                <Icon name="info" size={12} /> Size follows the start image
+              </p>
+            )}
           </section>
 
           <section className="section section--row">
@@ -588,6 +706,17 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         modelNames={modelNames}
       />
 
+      <input
+        ref={startFileInput}
+        type="file"
+        accept="image/*"
+        hidden
+        onChange={(e) => {
+          const files = Array.from(e.target.files ?? []);
+          e.target.value = "";
+          if (files.length) void addStartFiles(files);
+        }}
+      />
       <input
         ref={fileInput}
         type="file"

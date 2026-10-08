@@ -6,8 +6,12 @@ runs `python -u /handler.py`.
 
 Actions (docs/spec.md, "Worker job protocol"):
   generate  {model, prompt, negativePrompt, width, height, seed, steps, cfg,
-             references: [{name, base64}], loras: [{filename, strength}]}
+             references: [{name, base64}], loras: [{filename, strength}],
+             initImage?: {name, base64}, denoise?: 0.05-1.0 (default 0.6)}
             -> {image: {base64, seed, width, height}, timings: {loadMs, sampleMs, totalMs}}
+            initImage (img2img, models with supportsImg2Img only): the output
+            size follows the start image (1 MP, multiples of 16); width and
+            height are then optional and ignored.
   status    -> {files: [{folder, filename, sizeBytes}], volume: {totalBytes, freeBytes},
                 comfyuiVersion}
   download  {files: [{folder, filename, url, sizeBytes?, sha256?}]}
@@ -50,8 +54,9 @@ from comfy_client import ComfyClient, ComfyError
 from downloader import DownloadConfig, DownloadError, download_file
 from registry import get_model, load_registry, model_ids
 from safe_paths import PathError, resolve, validate_filename, validate_folder
-from workflows import (LOADER_STAGES, STAGE_PHASE, WorkflowError, build_workflow,
-                       graph_node_stages, graph_stages, sampler_node_ids)
+from workflows import (DEFAULT_DENOISE, LOADER_STAGES, MAX_DENOISE, MIN_DENOISE, STAGE_PHASE,
+                       WorkflowError, build_workflow, graph_node_stages, graph_stages,
+                       init_image_size, sampler_node_ids)
 
 VOLUME_ROOT = Path(os.environ.get("VOLUME_ROOT", "/runpod-volume"))
 MODELS_ROOT = Path(os.environ.get("MODELS_ROOT", str(VOLUME_ROOT / "models")))
@@ -146,20 +151,105 @@ _IMAGE_MAGIC = (
 )
 
 
-def _decode_reference(ref: Any, index: int) -> tuple[bytes, str, str]:
+def _decode_image(ref: Any, code: str, what: str) -> tuple[bytes, str, str]:
     if not isinstance(ref, dict) or not isinstance(ref.get("base64"), str):
-        raise InputError(f"INVALID_REFERENCE: reference {index} needs {{name, base64}}")
+        raise InputError(f"{code}: {what} needs {{name, base64}}")
     b64 = ref["base64"]
     if b64.startswith("data:"):
         b64 = b64.split(",", 1)[-1]
     try:
         data = base64.b64decode(b64, validate=True)
     except (binascii.Error, ValueError):
-        raise InputError(f"INVALID_REFERENCE: reference {index} is not valid base64") from None
+        raise InputError(f"{code}: {what} is not valid base64") from None
     for magic, ext, mime in _IMAGE_MAGIC:
         if data.startswith(magic) and (ext != "webp" or data[8:12] == b"WEBP"):
             return data, ext, mime
-    raise InputError(f"INVALID_REFERENCE: reference {index} is not a PNG, JPEG or WebP image")
+    raise InputError(f"{code}: {what} is not a PNG, JPEG or WebP image")
+
+
+def _decode_reference(ref: Any, index: int) -> tuple[bytes, str, str]:
+    return _decode_image(ref, "INVALID_REFERENCE", f"reference {index}")
+
+
+def _jpeg_exif_transposed(seg: bytes) -> bool:
+    """True if an APP1 Exif segment has an orientation that swaps the sides (5-8)."""
+    if not seg.startswith(b"Exif\x00\x00") or len(seg) < 14:
+        return False
+    tiff = seg[6:]
+    bo = {b"II": "<", b"MM": ">"}.get(tiff[:2])
+    if bo is None:
+        return False
+    try:
+        (ifd,) = struct.unpack(bo + "I", tiff[4:8])
+        (count,) = struct.unpack(bo + "H", tiff[ifd:ifd + 2])
+        for i in range(count):
+            e = ifd + 2 + 12 * i
+            tag, _typ, _n = struct.unpack(bo + "HHI", tiff[e:e + 8])
+            if tag == 0x0112:
+                (value,) = struct.unpack(bo + "H", tiff[e + 8:e + 10])
+                return value in (5, 6, 7, 8)
+    except struct.error:
+        return False
+    return False
+
+
+def image_size(data: bytes, ext: str) -> tuple[int, int] | None:
+    """Pixel size of a PNG / JPEG / WebP as ComfyUI's LoadImage sees it
+    (JPEG EXIF orientation applied). None if the header can't be read."""
+    try:
+        if ext == "png":
+            return png_size(data)
+        if ext == "webp":
+            chunk = data[12:16]
+            if chunk == b"VP8 ":
+                w, h = struct.unpack("<HH", data[26:30])
+                return w & 0x3FFF, h & 0x3FFF
+            if chunk == b"VP8L":
+                b = data[21:25]
+                w = 1 + (((b[1] & 0x3F) << 8) | b[0])
+                h = 1 + (((b[3] & 0x0F) << 10) | (b[2] << 2) | ((b[1] & 0xC0) >> 6))
+                return w, h
+            if chunk == b"VP8X":
+                w = 1 + int.from_bytes(data[24:27], "little")
+                h = 1 + int.from_bytes(data[27:30], "little")
+                return w, h
+            return None
+        if ext == "jpg":
+            i, transposed = 2, False
+            while i + 4 <= len(data):
+                if data[i] != 0xFF:
+                    return None
+                marker = data[i + 1]
+                if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                    i += 2
+                    continue
+                (length,) = struct.unpack(">H", data[i + 2:i + 4])
+                if marker == 0xE1:
+                    transposed = transposed or _jpeg_exif_transposed(data[i + 4:i + 2 + length])
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB,
+                              0xCD, 0xCE, 0xCF):
+                    h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                    return (h, w) if transposed else (w, h)
+                if marker == 0xDA:
+                    return None
+                i += 2 + length
+    except (struct.error, IndexError):
+        return None
+    return None
+
+
+def _decode_init_image(inp: dict, model: dict) -> dict | None:
+    init = inp.get("initImage")
+    if init is None:
+        return None
+    if not model.get("supportsImg2Img", False):
+        raise InputError(f"IMG2IMG_NOT_SUPPORTED: {model['id']} does not accept a start image "
+                         "(initImage)")
+    data, ext, mime = _decode_image(init, "INVALID_INIT_IMAGE", "initImage")
+    size = image_size(data, ext)
+    if size is None or size[0] <= 0 or size[1] <= 0:
+        raise InputError("INVALID_INIT_IMAGE: could not read the size of initImage")
+    return {"data": data, "ext": ext, "mime": mime, "width": size[0], "height": size[1]}
 
 
 def _number(inp: dict, key: str, kind: type, lo: float, hi: float, required: bool = True):
@@ -194,10 +284,18 @@ def validate_generate(inp: dict, registry: dict) -> dict:
     neg = inp.get("negativePrompt")
     if neg is not None and not isinstance(neg, str):
         raise InputError("INVALID_INPUT: negativePrompt must be a string")
-    width = _number(inp, "width", int, MIN_SIDE, MAX_SIDE)
-    height = _number(inp, "height", int, MIN_SIDE, MAX_SIDE)
-    if width % 16 or height % 16:
+    init = _decode_init_image(inp, model)
+    # With a start image the output size follows it; width/height are ignored.
+    width = _number(inp, "width", int, MIN_SIDE, MAX_SIDE, required=init is None)
+    height = _number(inp, "height", int, MIN_SIDE, MAX_SIDE, required=init is None)
+    if init is None and (width % 16 or height % 16):
         raise InputError("INVALID_INPUT: width and height must be multiples of 16")
+    denoise = None
+    if init is not None:
+        denoise = _number(inp, "denoise", float, MIN_DENOISE, MAX_DENOISE, required=False)
+        if denoise is None:
+            denoise = DEFAULT_DENOISE
+        width, height = init_image_size(init["width"], init["height"])
     seed = _number(inp, "seed", int, 0, MAX_SEED, required=False)
     if seed is None:
         seed = random.randint(0, 2**53 - 1)
@@ -230,6 +328,7 @@ def validate_generate(inp: dict, registry: dict) -> dict:
         "model": mid, "prompt": prompt, "negativePrompt": neg,
         "width": width, "height": height, "seed": seed, "steps": steps, "cfg": cfg,
         "references": decoded, "loras": clean_loras,
+        "initImage": init, "denoise": denoise,
     }
 
 
@@ -414,8 +513,16 @@ def do_generate(job: dict, inp: dict) -> dict:
     progress = Throttle(job)
     # The stage list only depends on the graph's shape, so a preview graph with
     # placeholder reference names gives it before anything is uploaded.
+    init = params["initImage"]
+
+    def graph_init(name: str) -> dict | None:
+        if init is None:
+            return None
+        return {"name": name, "width": init["width"], "height": init["height"]}
+
     preview, _ = build_workflow(
-        {**params, "references": [f"ref{i}" for i in range(len(params["references"]))]},
+        {**params, "references": [f"ref{i}" for i in range(len(params["references"]))],
+         "initImage": graph_init("init")},
         registry)
     tracker = StageTracker(progress, preview, steps, t0)
     tracker.send(force=True)
@@ -427,8 +534,14 @@ def do_generate(job: dict, inp: dict) -> dict:
     ref_names = []
     for i, (data, ext, mime) in enumerate(params["references"], start=1):
         ref_names.append(client.upload_image(f"is_{tag}_ref{i}.{ext}", data, mime))
+    upload_names = list(ref_names)
+    init_name = None
+    if init is not None:
+        init_name = client.upload_image(f"is_{tag}_init.{init['ext']}", init["data"], init["mime"])
+        upload_names.append(init_name)
 
-    graph, out_node = build_workflow({**params, "references": ref_names}, registry)
+    graph, out_node = build_workflow(
+        {**params, "references": ref_names, "initImage": graph_init(init_name)}, registry)
     samplers = sampler_node_ids(graph)
     tracker.set_graph(graph)
 
@@ -457,7 +570,7 @@ def do_generate(job: dict, inp: dict) -> dict:
     img = images[0]
     data = client.view(img["filename"], img.get("subfolder", ""), img.get("type", "output"))
     size = png_size(data) or (params["width"], params["height"])
-    _cleanup(img, ref_names)
+    _cleanup(img, upload_names)
 
     t_end = clock()
     s0, s1 = res["sample_start"], res["sample_end"]

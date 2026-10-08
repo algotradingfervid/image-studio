@@ -20,13 +20,26 @@ and compare nodes of the templates are left out (out of scope).
   model, prompt, negativePrompt, width, height, seed, steps, cfg,
   references: [str]    ComfyUI input-image names (already uploaded)
   loras: [{filename, strength}]
+  initImage: {name, width, height} | None   img2img start image (already
+                       uploaded; width/height = its pixel size after EXIF
+                       orientation), chroma and zimage only
+  denoise: float       img2img strength (0.05-1.0, default 0.6)
 Missing steps/cfg/negativePrompt fall back to the registry defaults.
+
+img2img (models with "supportsImg2Img"): the empty latent is replaced by
+  LoadImage -> ImageScaleToTotalPixels(lanczos, 1 MP) -> ImageScale(lanczos,
+  W, H, center crop) -> VAEEncode(model VAE)
+where (W, H) = init_image_size(width, height): 1 MP, both sides rounded to
+multiples of 16. The requested width/height are ignored. The sampler's
+denoise (KSampler.denoise for Z-Image, BasicScheduler.denoise for Chroma) is
+set to `denoise`; steps stay as given (ComfyUI trims the schedule itself).
 
 Every node id is a string; links are `[node_id, output_index]`.
 """
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from registry import get_model, model_file
@@ -57,6 +70,7 @@ OUTPUT_TYPES: dict[str, list[str]] = {
     "ConditioningZeroOut": ["CONDITIONING"],
     "ReferenceLatent": ["CONDITIONING"],
     "ImageScaleToTotalPixels": ["IMAGE"],
+    "ImageScale": ["IMAGE"],
     "LoadImage": ["IMAGE", "MASK"],
     "TextEncodeQwenImage21": ["CONDITIONING", "CONDITIONING", "LATENT"],
     "QwenImage21Cache": ["MODEL"],
@@ -72,6 +86,11 @@ CHROMA_SHIFT = 1.0            # ModelSamplingAuraFlow "Flow Shift" = 1
 ZIMAGE_SHIFT = 3.0            # ModelSamplingAuraFlow = 3
 FLUX2_REF_MEGAPIXELS = 1.0    # ImageScaleToTotalPixels(lanczos, 1.0, 1)
 QWEN_REF_RESOLUTION = 1024    # TextEncodeQwenImage21 resolution (node + official default)
+INIT_MEGAPIXELS = 1.0         # img2img start image scaled to 1 MP (1024 * 1024 px)
+INIT_SIZE_STEP = 16           # latent-friendly: both sides multiples of 16
+INIT_MIN_SIDE, INIT_MAX_SIDE = 64, 4096
+DEFAULT_DENOISE = 0.6
+MIN_DENOISE, MAX_DENOISE = 0.05, 1.0
 
 
 class WorkflowError(ValueError):
@@ -108,7 +127,45 @@ def _resolved(params: dict, model: dict) -> dict:
         p["negativePrompt"] = d.get("negativePrompt", "")
     p.setdefault("references", [])
     p.setdefault("loras", [])
+    if p.get("initImage"):
+        if p.get("denoise") is None:
+            p["denoise"] = DEFAULT_DENOISE
+        p["denoise"] = min(max(float(p["denoise"]), MIN_DENOISE), MAX_DENOISE)
     return p
+
+
+def init_image_size(width: int, height: int) -> tuple[int, int]:
+    """Output size of an img2img job for a start image of `width` x `height`.
+
+    Same math as ImageScaleToTotalPixels (v0.39.0: scale_by = sqrt(MP * 1024^2
+    / (w * h)), round(side * scale_by / step) * step) with step 16, clamped
+    to [64, 4096].
+    """
+    if width <= 0 or height <= 0:
+        raise WorkflowError("INVALID_INIT_IMAGE: the start image has no pixels")
+    scale = math.sqrt(INIT_MEGAPIXELS * 1024 * 1024 / (width * height))
+
+    def side(v: int) -> int:
+        r = round(v * scale / INIT_SIZE_STEP) * INIT_SIZE_STEP
+        return int(min(max(r, INIT_MIN_SIDE), INIT_MAX_SIDE))
+
+    return side(width), side(height)
+
+
+def _init_latent(g: _Graph, init: dict, vae: str) -> tuple[list, int, int]:
+    """img2img: start image -> 1 MP -> multiple-of-16 size -> VAE latent."""
+    w, h = init_image_size(int(init["width"]), int(init["height"]))
+    img = g.add("LoadImage", "Start image", image=init["name"])
+    total = g.add("ImageScaleToTotalPixels", image=_out(img), upscale_method="lanczos",
+                  megapixels=INIT_MEGAPIXELS, resolution_steps=1)
+    sized = g.add("ImageScale", image=_out(total), upscale_method="lanczos",
+                  width=w, height=h, crop="center")
+    enc = g.add("VAEEncode", "Start image latent", pixels=_out(sized), vae=_out(vae))
+    return _out(enc), w, h
+
+
+def _denoise(p: dict) -> float:
+    return float(p["denoise"]) if p.get("initImage") else 1.0
 
 
 def _ref_names(refs: list) -> list[str]:
@@ -165,12 +222,15 @@ def _chroma(p: dict, model: dict) -> tuple[dict, str]:
                    negative=_out(neg), cfg=float(p["cfg"]))
     sampler = g.add("KSamplerSelect", sampler_name=d["sampler"] or "euler")
     sched = g.add("BasicScheduler", model=_out(shift), scheduler=d["scheduler"] or "beta",
-                  steps=int(p["steps"]), denoise=1.0)
+                  steps=int(p["steps"]), denoise=_denoise(p))
     noise = g.add("RandomNoise", noise_seed=int(p["seed"]))
-    latent = g.add("EmptySD3LatentImage", width=int(p["width"]), height=int(p["height"]),
-                   batch_size=1)
+    if p.get("initImage"):
+        latent, _, _ = _init_latent(g, p["initImage"], vae)
+    else:
+        latent = _out(g.add("EmptySD3LatentImage", width=int(p["width"]),
+                            height=int(p["height"]), batch_size=1))
     sca = g.add("SamplerCustomAdvanced", noise=_out(noise), guider=_out(guider),
-                sampler=_out(sampler), sigmas=_out(sched), latent_image=_out(latent))
+                sampler=_out(sampler), sigmas=_out(sched), latent_image=latent)
     return g.nodes, _decode_save(g, _out(sca, 0), vae)
 
 
@@ -188,12 +248,15 @@ def _zimage(p: dict, model: dict) -> tuple[dict, str]:
     shift = g.add("ModelSamplingAuraFlow", model=m, shift=ZIMAGE_SHIFT)
     pos = g.add("CLIPTextEncode", "Positive", text=p["prompt"], clip=_out(clip))
     neg = g.add("ConditioningZeroOut", conditioning=_out(pos))
-    latent = g.add("EmptySD3LatentImage", width=int(p["width"]), height=int(p["height"]),
-                   batch_size=1)
+    if p.get("initImage"):
+        latent, _, _ = _init_latent(g, p["initImage"], vae)
+    else:
+        latent = _out(g.add("EmptySD3LatentImage", width=int(p["width"]),
+                            height=int(p["height"]), batch_size=1))
     ks = g.add("KSampler", model=_out(shift), seed=int(p["seed"]), steps=int(p["steps"]),
                cfg=float(p["cfg"]), sampler_name=d["sampler"] or "res_multistep",
                scheduler=d["scheduler"] or "simple", positive=_out(pos),
-               negative=_out(neg), latent_image=_out(latent), denoise=1.0)
+               negative=_out(neg), latent_image=latent, denoise=_denoise(p))
     return g.nodes, _decode_save(g, _out(ks), vae)
 
 
@@ -291,6 +354,8 @@ def build_workflow(params: dict, registry: dict) -> tuple[dict, str]:
     if len(refs) > int(model.get("maxReferences", 0)):
         raise WorkflowError(
             f"TOO_MANY_REFERENCES: {model_id} accepts {model.get('maxReferences', 0)}")
+    if p.get("initImage") and not model.get("supportsImg2Img", False):
+        raise WorkflowError(f"IMG2IMG_NOT_SUPPORTED: {model_id} does not accept a start image")
     return _BUILDERS[model_id](p, model)
 
 
@@ -308,6 +373,7 @@ STAGES: tuple[str, ...] = (
     "loading_text_encoder",
     "encoding_prompt",
     "loading_model",
+    "preparing_init_image",
     "preparing_references",
     "sampling",
     "decoding",
@@ -319,6 +385,7 @@ STAGE_PHASE: dict[str, str] = {
     "loading_text_encoder": "loading",
     "encoding_prompt": "loading",
     "loading_model": "loading",
+    "preparing_init_image": "loading",
     "preparing_references": "loading",
     "sampling": "sampling",
     "decoding": "saving",
@@ -341,6 +408,7 @@ _STAGE_OF_CLASS: dict[str, str] = {
     "QwenImage21Cache": "loading_model",  # model patcher on the loader chain
     "LoadImage": "preparing_references",
     "ImageScaleToTotalPixels": "preparing_references",
+    "ImageScale": "preparing_references",
     "VAEEncode": "preparing_references",
     "ReferenceLatent": "preparing_references",
     "KSampler": "sampling",
@@ -365,11 +433,39 @@ def node_stage(class_type: str) -> str | None:
     return stage
 
 
+# Image-preparation classes that, when they feed a sampler's latent_image,
+# belong to the img2img start image rather than to the references.
+_INIT_IMAGE_CLASSES = frozenset({"LoadImage", "ImageScaleToTotalPixels", "ImageScale",
+                                 "VAEEncode"})
+
+
+def init_image_node_ids(graph: dict) -> set[str]:
+    """Nodes of the img2img start-image chain: every LoadImage / ImageScale* /
+    VAEEncode upstream of a sampler's latent_image input."""
+    out: set[str] = set()
+    stack = []
+    for node in graph.values():
+        if node.get("class_type") in SAMPLER_CLASSES:
+            link = node.get("inputs", {}).get("latent_image")
+            if isinstance(link, list):
+                stack.append(link[0])
+    while stack:
+        nid = stack.pop()
+        node = graph.get(nid)
+        if nid in out or node is None or node.get("class_type") not in _INIT_IMAGE_CLASSES:
+            continue
+        out.add(nid)
+        stack += [v[0] for v in node.get("inputs", {}).values() if isinstance(v, list)]
+    return out
+
+
 def graph_node_stages(graph: dict) -> dict[str, str]:
     """{node_id: stage} for every node of `graph` that maps to a stage."""
+    init_nodes = init_image_node_ids(graph)
     out = {}
     for nid, node in graph.items():
-        stage = node_stage(node.get("class_type", ""))
+        stage = ("preparing_init_image" if nid in init_nodes
+                 else node_stage(node.get("class_type", "")))
         if stage is not None:
             out[nid] = stage
     return out

@@ -9,6 +9,7 @@
       "precision": "fp8",
       "maxReferences": 0,
       "supportsNegativePrompt": true,
+      "supportsImg2Img": true,
       "defaults": {
         "steps": 40,
         "cfg": 3.0,
@@ -54,6 +55,7 @@
       "precision": "bf16 (no fp8 release)",
       "maxReferences": 0,
       "supportsNegativePrompt": false,
+      "supportsImg2Img": true,
       "defaults": {
         "steps": 8,
         "cfg": 1.0,
@@ -99,6 +101,7 @@
       "precision": "fp8",
       "maxReferences": 4,
       "supportsNegativePrompt": false,
+      "supportsImg2Img": false,
       "defaults": {
         "steps": 4,
         "cfg": 1.0,
@@ -145,6 +148,7 @@
       "precision": "int8",
       "maxReferences": 4,
       "supportsNegativePrompt": true,
+      "supportsImg2Img": false,
       "defaults": {
         "steps": 25,
         "cfg": 1.0,

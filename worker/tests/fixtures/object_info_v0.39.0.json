@@ -1,5 +1,6 @@
 {
  "_source": "GET /object_info from ComfyUI v0.39.0 (b0b74356), trimmed to the classes workflows.py uses",
+ "_added": "ImageScale transcribed from nodes.py at ComfyUI tag v0.39.0 (class ImageScale, INPUT_TYPES / RETURN_TYPES) for img2img, 2026-10-09",
  "nodes": {
   "UNETLoader": {
    "input": {
@@ -586,6 +587,42 @@
      },
      "resolution_steps": {
       "type": "INT"
+     }
+    },
+    "optional": {}
+   },
+   "output": [
+    "IMAGE"
+   ]
+  },
+  "ImageScale": {
+   "input": {
+    "required": {
+     "image": {
+      "type": "IMAGE"
+     },
+     "upscale_method": {
+      "type": "COMBO",
+      "options": [
+       "nearest-exact",
+       "bilinear",
+       "area",
+       "bicubic",
+       "lanczos"
+      ]
+     },
+     "width": {
+      "type": "INT"
+     },
+     "height": {
+      "type": "INT"
+     },
+     "crop": {
+      "type": "COMBO",
+      "options": [
+       "disabled",
+       "center"
+      ]
      }
     },
     "optional": {}

@@ -54,12 +54,18 @@ export function Gallery({
       <ul className="gallery" aria-label="Generated images, newest first">
         {items.map((im, i) => (
           <li key={im.id} className="gallery__item">
-            <button type="button" className="tile" onClick={() => onOpen(i)} aria-label={`Open image: ${im.prompt}`}>
+            <button type="button" className="tile" onClick={() => onOpen(i)} aria-label={`Open image${im.initImage ? " (img2img)" : ""}: ${im.prompt}`}>
               <img src={fileSrc(im.path)} alt="" loading="lazy" decoding="async" />
+              {im.initImage && (
+                <span className="tile__badge" title={`From a start image${im.denoise != null ? ` · strength ${im.denoise.toFixed(2)}` : ""}`}>
+                  img2img
+                </span>
+              )}
               <span className="tile__overlay" aria-hidden>
                 <span className="tile__prompt">{im.prompt}</span>
                 <span className="tile__meta">
-                  {modelNames[im.model] ?? im.model} · {im.aspectRatio} · {formatRelative(im.createdAt)}
+                  {modelNames[im.model] ?? im.model} · {im.initImage ? `img2img ${im.denoise?.toFixed(2) ?? ""}`.trim() : im.aspectRatio} ·{" "}
+                  {formatRelative(im.createdAt)}
                 </span>
               </span>
             </button>

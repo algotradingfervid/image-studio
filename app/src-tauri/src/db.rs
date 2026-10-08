@@ -37,6 +37,12 @@ pub struct ImageRecord {
     pub created_at: String,
     pub duration_ms: Option<u64>,
     pub runpod: RunpodTimes,
+    /// img2img start image (path of the imported reference file), if any.
+    #[serde(default)]
+    pub init_image: Option<String>,
+    /// img2img strength (denoise, 0.05–1.0); None for text-to-image.
+    #[serde(default)]
+    pub denoise: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,7 +90,8 @@ pub struct StatusSnapshot {
     pub comfyui_version: Option<String>,
 }
 
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE images (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   id TEXT NOT NULL UNIQUE,
@@ -128,7 +135,13 @@ CREATE TABLE settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
-"#];
+"#,
+    // 2: img2img (start image + strength); NULL for existing rows.
+    r#"
+ALTER TABLE images ADD COLUMN init_image TEXT;
+ALTER TABLE images ADD COLUMN denoise REAL;
+"#,
+];
 
 pub struct Db {
     conn: Connection,
@@ -172,8 +185,8 @@ impl Db {
     pub fn insert_image(&self, r: &ImageRecord) -> Result<(), String> {
         self.conn
             .execute(
-                "INSERT INTO images (id, path, model, prompt, negative_prompt, aspect_ratio, width, height, seed, steps, cfg, references_json, loras_json, created_at, duration_ms, delay_ms, execution_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                "INSERT INTO images (id, path, model, prompt, negative_prompt, aspect_ratio, width, height, seed, steps, cfg, references_json, loras_json, created_at, duration_ms, delay_ms, execution_ms, init_image, denoise)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
                 params![
                     r.id,
                     r.path,
@@ -192,6 +205,8 @@ impl Db {
                     r.duration_ms.map(|x| x as i64),
                     r.runpod.delay_ms.map(|x| x as i64),
                     r.runpod.execution_ms.map(|x| x as i64),
+                    r.init_image,
+                    r.denoise,
                 ],
             )
             .map_err(e)?;
@@ -224,6 +239,8 @@ impl Db {
                     delay_ms: opt_u64(row.get("delay_ms")?),
                     execution_ms: opt_u64(row.get("execution_ms")?),
                 },
+                init_image: row.get("init_image")?,
+                denoise: row.get("denoise")?,
             },
         ))
     }
@@ -429,7 +446,68 @@ mod tests {
                 delay_ms: Some(1),
                 execution_ms: Some(2),
             },
+            init_image: None,
+            denoise: None,
         }
+    }
+
+    #[test]
+    fn img2img_fields_roundtrip() {
+        let db = Db::open_in_memory().unwrap();
+        let mut r = img("a", 7);
+        r.init_image = Some("/refs/0000.jpg".into());
+        r.denoise = Some(0.45);
+        db.insert_image(&r).unwrap();
+        db.insert_image(&img("b", 8)).unwrap();
+        assert_eq!(db.get_image("a").unwrap(), Some(r.clone()));
+        assert_eq!(db.get_image("b").unwrap().unwrap().init_image, None);
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["initImage"], serde_json::json!("/refs/0000.jpg"));
+        assert_eq!(v["denoise"], serde_json::json!(0.45));
+        // records serialised before img2img still deserialise
+        let mut old = serde_json::to_value(img("c", 9)).unwrap();
+        old.as_object_mut().unwrap().remove("initImage");
+        old.as_object_mut().unwrap().remove("denoise");
+        let back: ImageRecord = serde_json::from_value(old).unwrap();
+        assert_eq!(back, img("c", 9));
+    }
+
+    #[test]
+    fn migrates_existing_v1_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("studio.db");
+        {
+            // A database written by the pre-img2img app (schema version 1).
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "BEGIN; {} PRAGMA user_version = 1; COMMIT;",
+                MIGRATIONS[0]
+            ))
+            .unwrap();
+            conn.execute(
+                "INSERT INTO images (id, path, model, prompt, negative_prompt, aspect_ratio, width, height, seed, steps, cfg, references_json, loras_json, created_at, duration_ms, delay_ms, execution_ms)
+                 VALUES ('old', '/x/old.png', 'zimage', 'p', '', '1:1', 1024, 1024, '5', 8, 1.0, '[]', '[]', 't', 10, NULL, NULL)",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        let old = db.get_image("old").unwrap().unwrap();
+        assert_eq!((old.seed, old.init_image, old.denoise), (5, None, None));
+        let mut r = img("new", 1);
+        r.init_image = Some("/refs/s.png".into());
+        r.denoise = Some(0.6);
+        db.insert_image(&r).unwrap();
+        drop(db);
+        // reopening runs no migration twice
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.get_image("new").unwrap(), Some(r));
+        assert_eq!(db.list_images(10, None).unwrap().0.len(), 2);
     }
 
     #[test]

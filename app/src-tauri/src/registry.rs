@@ -53,6 +53,9 @@ pub struct Model {
     pub max_references: u32,
     #[serde(default)]
     pub supports_negative_prompt: bool,
+    /// img2img ("start image" + strength) support; absent = false.
+    #[serde(default, rename = "supportsImg2Img")]
+    pub supports_img2img: bool,
     pub defaults: Defaults,
     #[serde(default)]
     pub civitai_base_models: Vec<String>,
@@ -153,6 +156,28 @@ mod tests {
             assert!(!m.files.is_empty());
         }
         assert_eq!(r.aspect("1:1").unwrap(), (1024, 1024));
+        let img2img: Vec<(&str, bool)> = r
+            .models
+            .iter()
+            .map(|m| (m.id.as_str(), m.supports_img2img))
+            .collect();
+        assert_eq!(
+            img2img,
+            [
+                ("chroma", true),
+                ("zimage", true),
+                ("flux2", false),
+                ("qwen", false)
+            ]
+        );
+        // exposed to the UI under its registry name, not duplicated in `extra`
+        let v = serde_json::to_value(r.model("chroma").unwrap()).unwrap();
+        assert_eq!(v["supportsImg2Img"], serde_json::json!(true));
+        assert!(!r
+            .model("chroma")
+            .unwrap()
+            .extra
+            .contains_key("supportsImg2Img"));
         assert!(r.aspect("5:5").is_err());
         // ae.safetensors is shared between chroma and zimage.
         assert_eq!(

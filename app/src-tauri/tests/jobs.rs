@@ -222,6 +222,146 @@ async fn generate_happy_path() {
     assert_eq!(run["input"]["loras"], json!([]));
     // zimage has no negative prompt support.
     assert_eq!(run["input"]["negativePrompt"], "");
+    // text-to-image: no img2img keys
+    assert!(run["input"].get("initImage").is_none());
+    assert!(run["input"].get("denoise").is_none());
+    assert_eq!((img.init_image.as_deref(), img.denoise), (None, None));
+}
+
+fn import_start_image(h: &Harness, w: u32, hgt: u32) -> app_lib::references::ImportedReference {
+    let img = image::RgbImage::from_pixel(w, hgt, image::Rgb([10, 200, 10]));
+    let mut buf = Vec::new();
+    image::DynamicImage::ImageRgb8(img)
+        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .unwrap();
+    app_lib::references::import_bytes(&h.core.cfg.references_dir(), &buf).unwrap()
+}
+
+#[tokio::test]
+async fn generate_img2img_sends_start_image_and_denoise() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/ep1/run"))
+        .respond_with(RunIds(AtomicUsize::new(0)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/ep1/status/rp-0"))
+        .respond_with(seq(vec![
+            json!({"id": "rp-0", "status": "IN_PROGRESS", "output": {"phase": "loading",
+                   "stage": "preparing_init_image", "stages": ["loading_model", "preparing_init_image", "sampling"]}}),
+            completed(9),
+        ]))
+        .mount(&server)
+        .await;
+    let h = harness(&server);
+    let start = import_start_image(&h, 300, 200);
+    let mut r = req(1, Some(9));
+    r.model = "chroma".into();
+    r.init_image_id = Some(start.ref_id.clone());
+    r.denoise = Some(0.35);
+    jobs::generate(&h.core, r).unwrap();
+    let job = wait_job(&h.sink).await;
+    assert_eq!(job.status, JobState::Completed, "{:?}", job.error);
+
+    let reqs = server.received_requests().await.unwrap();
+    let run: Value = reqs
+        .iter()
+        .find(|r| r.url.path().ends_with("/run"))
+        .unwrap()
+        .body_json()
+        .unwrap();
+    let input = &run["input"];
+    assert_eq!(input["model"], "chroma");
+    assert_eq!(input["denoise"], json!(0.35));
+    let stored = std::fs::read(&start.thumb_path).unwrap();
+    assert_eq!(
+        input["initImage"]["name"],
+        json!(std::path::Path::new(&start.thumb_path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy())
+    );
+    assert_eq!(
+        input["initImage"]["base64"],
+        json!(base64::engine::general_purpose::STANDARD.encode(stored))
+    );
+    assert_eq!(input["references"], json!([]));
+
+    // the stage passes through to the UI
+    let staged = h
+        .sink
+        .jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|j| j.progress.clone().and_then(|p| p.stage))
+        .unwrap();
+    assert_eq!(staged, "preparing_init_image");
+
+    // the record keeps the start image and strength, also in the database
+    let img = &job.images[0];
+    assert_eq!(img.init_image.as_deref(), Some(start.thumb_path.as_str()));
+    assert_eq!(img.denoise, Some(0.35));
+    let (list, _) = h.core.db.lock().unwrap().list_images(10, None).unwrap();
+    assert_eq!(list, job.images);
+}
+
+#[tokio::test]
+async fn generate_img2img_default_and_clamped_denoise() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/ep1/run"))
+        .respond_with(RunIds(AtomicUsize::new(0)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex("/v2/ep1/status/.*"))
+        .respond_with(seq(vec![completed(1)]))
+        .mount(&server)
+        .await;
+    let h = harness(&server);
+    let start = import_start_image(&h, 64, 64);
+    for (given, sent) in [(None, 0.6), (Some(0.0), 0.05), (Some(4.0), 1.0)] {
+        h.sink.jobs.lock().unwrap().clear();
+        let mut r = req(1, Some(1));
+        r.init_image_id = Some(start.ref_id.clone());
+        r.denoise = given;
+        jobs::generate(&h.core, r).unwrap();
+        let job = wait_job(&h.sink).await;
+        assert_eq!(job.images[0].denoise, Some(sent));
+        let reqs = server.received_requests().await.unwrap();
+        let run: Value = reqs
+            .iter()
+            .rfind(|r| r.url.path().ends_with("/run"))
+            .unwrap()
+            .body_json()
+            .unwrap();
+        assert_eq!(run["input"]["denoise"], json!(sent));
+    }
+}
+
+#[tokio::test]
+async fn generate_img2img_validation() {
+    let server = MockServer::start().await;
+    let h = harness(&server);
+    let start = import_start_image(&h, 32, 32);
+    for model in ["flux2", "qwen"] {
+        let mut r = req(1, None);
+        r.model = model.into();
+        r.init_image_id = Some(start.ref_id.clone());
+        let err = jobs::generate(&h.core, r).unwrap_err();
+        assert!(err.contains("does not take a start image"), "{err}");
+    }
+    let mut r = req(1, None);
+    r.init_image_id = Some("00000000-0000-0000-0000-000000000000".into());
+    assert!(jobs::generate(&h.core, r)
+        .unwrap_err()
+        .contains("start image is missing"));
+    let mut r = req(1, None);
+    r.init_image_id = Some("../../etc/passwd".into());
+    assert!(jobs::generate(&h.core, r).is_err());
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]

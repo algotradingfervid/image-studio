@@ -1,5 +1,6 @@
 //! Tauri commands. Arguments are flat camelCase keys, e.g.
-//! `invoke("generate", { model, prompt, aspectRatio, count, referenceIds, loras })`.
+//! `invoke("generate", { model, prompt, aspectRatio, count, referenceIds, loras,
+//! initImageId?, denoise? })`.
 //! Errors are user-readable strings.
 
 use crate::db::ImageRecord;
@@ -316,6 +317,8 @@ pub async fn generate(
     cfg: Option<f64>,
     reference_ids: Option<Vec<String>>,
     loras: Option<Vec<LoraChoice>>,
+    init_image_id: Option<String>,
+    denoise: Option<f64>,
 ) -> Res<JobStarted> {
     let req = GenerateRequest {
         model,
@@ -328,6 +331,8 @@ pub async fn generate(
         cfg,
         reference_ids: reference_ids.unwrap_or_default(),
         loras: loras.unwrap_or_default(),
+        init_image_id,
+        denoise,
     };
     // References are ≤1 MP files, so reading them inline is cheap.
     let job_id = jobs::generate(&core, req)?;

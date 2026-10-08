@@ -392,8 +392,12 @@ function makeImage(input: {
   createdAt: number;
   delayMs: number;
   executionMs: number;
+  /** img2img: start image path and strength; size = the start image's 1 MP / ×16 size. */
+  initImage?: string | null;
+  denoise?: number | null;
+  size?: [number, number] | null;
 }): ImageRecord {
-  const [width, height] = aspect[input.aspectRatio] ?? [1024, 1024];
+  const [width, height] = input.size ?? aspect[input.aspectRatio] ?? [1024, 1024];
   const m = models.find((x) => x.id === input.model);
   return {
     id: uid("img"),
@@ -412,7 +416,26 @@ function makeImage(input: {
     createdAt: new Date(input.createdAt).toISOString(),
     durationMs: input.delayMs + input.executionMs + 400,
     runpod: { delayMs: input.delayMs, executionMs: input.executionMs },
+    initImage: input.initImage ?? null,
+    denoise: input.initImage ? (input.denoise ?? 0.6) : null,
   };
+}
+
+/** Mirror of worker/src/workflows.py init_image_size: 1 MP, sides rounded to ×16, clamped 64–4096. */
+function initImageSize(w: number, h: number): [number, number] {
+  const scale = Math.sqrt((1024 * 1024) / (w * h));
+  const side = (v: number) => Math.min(4096, Math.max(64, Math.round((v * scale) / 16) * 16));
+  return [side(w), side(h)];
+}
+
+/** Pixel size of a start image (data URL or path); falls back to square. */
+function loadImageSize(src: string): Promise<[number, number]> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve(img.naturalWidth && img.naturalHeight ? [img.naturalWidth, img.naturalHeight] : [1024, 1024]);
+    img.onerror = () => resolve([1024, 1024]);
+    img.src = src;
+  });
 }
 
 // Seed gallery
@@ -448,6 +471,10 @@ if (!params.has("empty")) {
         createdAt: t,
         delayMs: i % 5 === 0 ? 48_000 : 900,
         executionMs: 6_000 + (i % 4) * 3_100,
+        // A few img2img examples (chroma/zimage), redrawn from an earlier tile.
+        ...(m.supportsImg2Img && i % 8 === 5 && images.length
+          ? { initImage: images[images.length - 1].path, denoise: 0.45, size: [1248, 832] as [number, number] }
+          : {}),
       }),
     );
     t -= 1000 * 60 * (17 + i * 13);
@@ -460,6 +487,7 @@ const STAGE_PHASE: Record<string, string> = {
   loading_text_encoder: "loading",
   encoding_prompt: "loading",
   loading_model: "loading",
+  preparing_init_image: "loading",
   preparing_references: "loading",
   sampling: "sampling",
   decoding: "saving",
@@ -483,7 +511,17 @@ async function pause(ms: number, cancelled: () => boolean): Promise<boolean> {
 async function runStages(job: Job, input: GenerateInput, steps: number, cold: boolean, cancelled: () => boolean): Promise<boolean | "failed"> {
   const warm = loadedModels.has(input.model);
   const refsUsed = input.referenceIds.length > 0;
-  const stages = ["loading_text_encoder", "encoding_prompt", "loading_model", ...(refsUsed ? ["preparing_references"] : []), "sampling", "decoding", "saving"];
+  const initUsed = !!input.initImageId;
+  const stages = [
+    "loading_text_encoder",
+    "encoding_prompt",
+    "loading_model",
+    ...(initUsed ? ["preparing_init_image"] : []),
+    ...(refsUsed ? ["preparing_references"] : []),
+    "sampling",
+    "decoding",
+    "saving",
+  ];
   const cachedStages = warm ? ["loading_text_encoder", "loading_model"] : [];
   const t0 = Date.now();
   const times: Record<string, number> = {};
@@ -536,6 +574,10 @@ async function runStages(job: Job, input: GenerateInput, steps: number, cold: bo
   }
   if (input.prompt.toLowerCase().includes("fail")) return "failed";
   loadedModels.add(input.model);
+  if (initUsed) {
+    enter("preparing_init_image");
+    if (!(await hold(500))) return false;
+  }
   if (refsUsed) {
     enter("preparing_references");
     if (!(await hold(700))) return false;
@@ -578,6 +620,8 @@ async function runJob(jobId: string, input: GenerateInput) {
   const steps = input.steps || m.defaults.steps || 30;
   const cfg = input.cfg ?? (m.defaults.cfg || 4);
   const baseSeed = input.seed ?? nextSeed();
+  const initPath = input.initImageId ? (refs.get(input.initImageId) ?? null) : null;
+  const initSize = initPath ? initImageSize(...(await loadImageSize(initPath))) : null;
   const job: Job = { jobId, status: "queued", total: input.count, completed: 0, progress: null, images: [], error: null };
   const cancelled = () => jobCancel.has(jobId);
   const stop = (status: Job["status"], error: string | null = null) => {
@@ -638,6 +682,9 @@ async function runJob(jobId: string, input: GenerateInput) {
       cfg,
       references: input.referenceIds.map((id) => refs.get(id) ?? "").filter(Boolean),
       loras: lorasUsed,
+      initImage: initPath,
+      denoise: initPath ? Math.min(1, Math.max(0.05, input.denoise ?? 0.6)) : null,
+      size: initSize,
       createdAt: Date.now(),
       delayMs,
       executionMs: Date.now() - execStart + 1200,
@@ -878,6 +925,8 @@ const commands: Record<string, Handler> = {
     if (missing.length) throw new Error(`MODEL_NOT_INSTALLED: ${missing.join(", ")}`);
     if (i.referenceIds.length > m.maxReferences) throw new Error(`${m.name} accepts at most ${m.maxReferences} references.`);
     if (i.loras.length > 3) throw new Error("At most 3 LoRAs per generation.");
+    if (i.initImageId && !m.supportsImg2Img) throw new Error(`${m.name} does not take a start image`);
+    if (i.initImageId && !refs.has(i.initImageId)) throw new Error("The start image is missing; please add it again");
     const jobId = uid("job");
     void runJob(jobId, i);
     return { jobId };

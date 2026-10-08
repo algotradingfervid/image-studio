@@ -19,6 +19,10 @@ use std::sync::Arc;
 pub const MAX_SEED: u64 = (1u64 << 53) - 1;
 pub const MAX_COUNT: u32 = 4;
 pub const MAX_LORAS: usize = 3;
+/// img2img strength (worker `denoise`): range and default.
+pub const MIN_DENOISE: f64 = 0.05;
+pub const MAX_DENOISE: f64 = 1.0;
+pub const DEFAULT_DENOISE: f64 = 0.6;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -129,6 +133,20 @@ pub struct GenerateRequest {
     pub reference_ids: Vec<String>,
     #[serde(default)]
     pub loras: Vec<LoraChoice>,
+    /// img2img start image: an id from `import_reference(_bytes)`.
+    #[serde(default)]
+    pub init_image_id: Option<String>,
+    /// img2img strength, clamped to 0.05..=1.0 (default 0.6); ignored without a start image.
+    #[serde(default)]
+    pub denoise: Option<f64>,
+}
+
+/// The strength sent with a start image: clamped, default when absent or not finite.
+pub fn resolve_denoise(denoise: Option<f64>) -> f64 {
+    denoise
+        .filter(|d| d.is_finite())
+        .unwrap_or(DEFAULT_DENOISE)
+        .clamp(MIN_DENOISE, MAX_DENOISE)
 }
 
 /// Seeds for `count` images: `seed, seed+1, …`; random u32-range seed when None.
@@ -185,6 +203,9 @@ fn build_plan(core: &Core, req: &GenerateRequest) -> Result<Plan, String> {
     if req.loras.len() > MAX_LORAS {
         return Err(format!("At most {MAX_LORAS} LoRAs per generation"));
     }
+    if req.init_image_id.is_some() && !model.supports_img2img {
+        return Err(format!("{} does not take a start image", model.name));
+    }
 
     let present = present_set(core);
     if has_cache(core) {
@@ -216,6 +237,24 @@ fn build_plan(core: &Core, req: &GenerateRequest) -> Result<Plan, String> {
         ref_paths.push(p.to_string_lossy().into_owned());
     }
 
+    // img2img: the start image goes through the same import pipeline as references.
+    let mut init = None;
+    if let Some(iid) = &req.init_image_id {
+        let p = crate::references::find(&core.cfg.references_dir(), iid)
+            .map_err(|_| "The start image is missing; please add it again".to_string())?;
+        let bytes =
+            std::fs::read(&p).map_err(|e| format!("Could not read the start image: {e}"))?;
+        let payload = json!({
+            "name": p.file_name().unwrap().to_string_lossy(),
+            "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+        });
+        init = Some((
+            payload,
+            p.to_string_lossy().into_owned(),
+            resolve_denoise(req.denoise),
+        ));
+    }
+
     let mut loras_payload = Vec::new();
     let mut lora_refs = Vec::new();
     {
@@ -242,7 +281,7 @@ fn build_plan(core: &Core, req: &GenerateRequest) -> Result<Plan, String> {
     }
 
     let seeds = expand_seeds(req.seed, req.count)?;
-    let template = json!({
+    let mut template = json!({
         "action": "generate",
         "model": model.id,
         "prompt": prompt,
@@ -255,6 +294,11 @@ fn build_plan(core: &Core, req: &GenerateRequest) -> Result<Plan, String> {
         "references": refs_payload,
         "loras": loras_payload,
     });
+    if let Some((payload, _, denoise)) = &init {
+        // The worker sizes the output from the start image (width/height ignored).
+        template["initImage"] = payload.clone();
+        template["denoise"] = json!(denoise);
+    }
     let record = ImageRecord {
         id: String::new(),
         path: String::new(),
@@ -272,6 +316,8 @@ fn build_plan(core: &Core, req: &GenerateRequest) -> Result<Plan, String> {
         created_at: String::new(),
         duration_ms: None,
         runpod: RunpodTimes::default(),
+        init_image: init.as_ref().map(|(_, path, _)| path.clone()),
+        denoise: init.as_ref().map(|(_, _, d)| *d),
     };
     Ok(Plan {
         template,
@@ -585,5 +631,15 @@ mod tests {
         assert!(expand_seeds(Some(MAX_SEED), 2).is_err());
         assert!(expand_seeds(Some(MAX_SEED), 1).is_ok());
         assert!(expand_seeds(Some(u64::MAX), 1).is_err());
+    }
+
+    #[test]
+    fn denoise_resolution() {
+        assert_eq!(resolve_denoise(None), DEFAULT_DENOISE);
+        assert_eq!(resolve_denoise(Some(0.35)), 0.35);
+        assert_eq!(resolve_denoise(Some(0.0)), MIN_DENOISE);
+        assert_eq!(resolve_denoise(Some(-3.0)), MIN_DENOISE);
+        assert_eq!(resolve_denoise(Some(1.7)), MAX_DENOISE);
+        assert_eq!(resolve_denoise(Some(f64::NAN)), DEFAULT_DENOISE);
     }
 }

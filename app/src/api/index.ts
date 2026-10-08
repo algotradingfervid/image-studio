@@ -99,6 +99,7 @@ export const deleteLora = (id: string) => call<Task | null>("delete_lora", { id 
 export const importReference = (path: string) => call<ImportedReference>("import_reference", { path });
 export const importReferenceBytes = (base64: string, mime: string) =>
   call<ImportedReference>("import_reference_bytes", { base64, mime });
+/** With `initImageId` (img2img), the output size follows the start image; `aspectRatio` is still required but ignored. */
 export const generate = (input: GenerateInput) => callObj<{ jobId: string }>("generate", input);
 export const cancelJob = (jobId: string) => call<void>("cancel_job", { jobId });
 /** Active jobs, for restoring job cards on app start. */

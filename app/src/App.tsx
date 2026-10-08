@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { inTauri, isConfigured } from "./api";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { GpuPill } from "./components/GpuPill";
 import { Icon, type IconName } from "./components/Icon";
 import { radioKeys } from "./components/radio";
@@ -148,12 +149,14 @@ function Shell() {
 
 export default function App() {
   return (
-    <ToastProvider>
-      <LibraryProvider>
-        <GpuProvider>
-          <Shell />
-        </GpuProvider>
-      </LibraryProvider>
-    </ToastProvider>
+    <ErrorBoundary>
+      <ToastProvider>
+        <LibraryProvider>
+          <GpuProvider>
+            <Shell />
+          </GpuProvider>
+        </LibraryProvider>
+      </ToastProvider>
+    </ErrorBoundary>
   );
 }

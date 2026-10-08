@@ -35,6 +35,8 @@ export interface ModelView {
   precision: string;
   maxReferences: number;
   supportsNegativePrompt: boolean;
+  /** img2img: accepts a start image (`initImageId`) + strength (`denoise`). */
+  supportsImg2Img: boolean;
   defaults: ModelDefaults;
   civitaiBaseModels: string[];
   installed: boolean;
@@ -209,7 +211,17 @@ export interface GenerateInput {
   cfg?: number;
   referenceIds: string[];
   loras: { loraId: string; strength: number }[];
+  /** img2img start image: an id from `import_reference(_bytes)` (models with `supportsImg2Img`). */
+  initImageId?: string;
+  /** img2img strength, 0.05–1.0 (backend default 0.6). Ignored without `initImageId`. */
+  denoise?: number;
 }
+
+/** img2img strength slider ("How much to change"). */
+export const DENOISE_MIN = 0.05;
+export const DENOISE_MAX = 1;
+export const DENOISE_STEP = 0.05;
+export const DENOISE_DEFAULT = 0.6;
 
 export interface ImageRecord {
   id: string;
@@ -229,6 +241,10 @@ export interface ImageRecord {
   createdAt: string;
   durationMs: number | null;
   runpod: { delayMs: number | null; executionMs: number | null };
+  /** img2img start image (stored file path); null/absent for text-to-image. */
+  initImage?: string | null;
+  /** img2img strength (denoise); null/absent for text-to-image. */
+  denoise?: number | null;
 }
 
 export interface ImagePage {
@@ -247,6 +263,7 @@ export type JobStage =
   | "loading_text_encoder"
   | "encoding_prompt"
   | "loading_model"
+  | "preparing_init_image"
   | "preparing_references"
   | "sampling"
   | "decoding"

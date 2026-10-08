@@ -22,6 +22,7 @@ const STAGE_LABEL: Record<string, string> = {
   loading_text_encoder: "Loading text encoder",
   encoding_prompt: "Encoding prompt",
   loading_model: "Loading model",
+  preparing_init_image: "Preparing start image",
   preparing_references: "Preparing references",
   sampling: "Generating",
   decoding: "Decoding",

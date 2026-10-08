@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState, type ChangeEvent, type DragEvent } from "react";
-import { fileSrc, isTaskActive, type Lora, type ModelView } from "../../api";
+import { DENOISE_MAX, DENOISE_MIN, DENOISE_STEP, fileSrc, isTaskActive, type Lora, type ModelView } from "../../api";
 import { AspectShape, Icon } from "../../components/Icon";
 import { radioKeys } from "../../components/radio";
 import { ASPECTS } from "../../lib/aspect";
@@ -64,6 +64,7 @@ export function ModelPicker({
                 ) : m.installed ? (
                   <>
                     {m.maxReferences > 0 && <span className="tag">refs ×{m.maxReferences}</span>}
+                    {m.supportsImg2Img && <span className="tag">img2img</span>}
                     <span className="tag">{m.defaults.steps ? `${m.defaults.steps} steps` : m.precision}</span>
                   </>
                 ) : (
@@ -131,6 +132,99 @@ export function References({
             <span>{refs.length === 0 ? "Drop, paste (⌘V) or choose images" : "Add"}</span>
           </button>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------- Start image (img2img) ----------------
+
+export function StartImage({
+  image,
+  denoise,
+  busy,
+  dragActive,
+  onDenoise,
+  onRemove,
+  onFiles,
+  onPick,
+}: {
+  image: RefItem | null;
+  denoise: number;
+  busy: boolean;
+  dragActive: boolean;
+  onDenoise: (v: number) => void;
+  onRemove: () => void;
+  onFiles: (files: File[]) => void;
+  onPick: () => void;
+}) {
+  const [over, setOver] = useState(false);
+  const id = useId();
+  const onDrop = (e: DragEvent) => {
+    e.preventDefault();
+    setOver(false);
+    const files = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith("image/"));
+    if (files.length) onFiles(files.slice(0, 1));
+  };
+  const dragProps = {
+    onDragOver: (e: DragEvent) => {
+      e.preventDefault();
+      setOver(true);
+    },
+    onDragLeave: () => setOver(false),
+    onDrop,
+  };
+
+  if (!image) {
+    return (
+      <div className={`dropzone dropzone--single ${over || dragActive ? "is-over" : ""}`} {...dragProps}>
+        <button type="button" className="dropzone__add" onClick={onPick} disabled={busy}>
+          <Icon name={busy ? "refresh" : "upload"} className={busy ? "spin" : ""} />
+          <span>{busy ? "Adding…" : "Drop, paste (⌘V) or choose an image"}</span>
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`start-image ${over || dragActive ? "is-over" : ""}`} {...dragProps}>
+      <figure className="ref-thumb start-image__thumb">
+        <img src={fileSrc(image.thumbPath)} alt="Start image" />
+        <button type="button" className="ref-thumb__remove" aria-label="Remove start image" title="Remove start image" onClick={onRemove}>
+          <Icon name="x" size={12} />
+        </button>
+        {busy && (
+          <span className="start-image__busy" aria-label="Replacing the start image">
+            <Icon name="refresh" className="spin" />
+          </span>
+        )}
+      </figure>
+      <div className="strength">
+        <div className="strength__head">
+          <label className="field__label" htmlFor={`${id}-denoise`}>
+            How much to change
+          </label>
+          <output className="mono strength__value" htmlFor={`${id}-denoise`}>
+            {denoise.toFixed(2)}
+          </output>
+        </div>
+        <input
+          id={`${id}-denoise`}
+          type="range"
+          min={DENOISE_MIN}
+          max={DENOISE_MAX}
+          step={DENOISE_STEP}
+          value={denoise}
+          aria-valuetext={`${denoise.toFixed(2)} (${denoise < 0.35 ? "close to the start image" : denoise > 0.75 ? "mostly reimagined" : "balanced"})`}
+          onChange={(e) => onDenoise(Math.round(Number(e.target.value) * 100) / 100)}
+        />
+        <div className="strength__ends" aria-hidden>
+          <span>Keep close</span>
+          <span>Reimagine</span>
+        </div>
+        <button type="button" className="link-btn strength__replace" onClick={onPick} disabled={busy}>
+          Replace image
+        </button>
       </div>
     </div>
   );
@@ -299,17 +393,34 @@ export function LoraPicker({
 
 // ---------------- Aspect + count ----------------
 
-export function AspectPicker({ value, onChange }: { value: string; onChange: (k: string) => void }) {
+export function AspectPicker({
+  value,
+  onChange,
+  disabled = false,
+  describedBy,
+}: {
+  value: string;
+  onChange: (k: string) => void;
+  /** img2img: the size follows the start image. */
+  disabled?: boolean;
+  describedBy?: string;
+}) {
   return (
     <div
-      className="chips"
+      className={`chips ${disabled ? "is-disabled" : ""}`}
       role="radiogroup"
       aria-label="Aspect ratio"
-      onKeyDown={radioKeys(
-        ASPECTS.map((a) => a.key),
-        value,
-        onChange,
-      )}
+      aria-disabled={disabled || undefined}
+      aria-describedby={describedBy}
+      onKeyDown={
+        disabled
+          ? undefined
+          : radioKeys(
+              ASPECTS.map((a) => a.key),
+              value,
+              onChange,
+            )
+      }
     >
       {ASPECTS.map((a) => (
         <button
@@ -318,7 +429,8 @@ export function AspectPicker({ value, onChange }: { value: string; onChange: (k:
           role="radio"
           aria-checked={a.key === value}
           tabIndex={a.key === value ? 0 : -1}
-          className={`chip chip--aspect ${a.key === value ? "is-selected" : ""}`}
+          className={`chip chip--aspect ${a.key === value && !disabled ? "is-selected" : ""}`}
+          disabled={disabled}
           onClick={() => onChange(a.key)}
           title={`${a.w} × ${a.h}`}
         >
