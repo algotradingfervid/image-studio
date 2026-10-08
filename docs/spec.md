@@ -192,3 +192,62 @@ Design: dark, polished studio look; keyboard-friendly; native window. No `window
 
 ## Out of scope
 FLUX.2 [dev], inpainting/editing, img2img for Chroma/Z-Image, Qwen prompt-enhancer encoders, multiple users/LAN, hosting the app.
+
+---
+
+## v3 change (2026-10-09): dedicated GPU pod with Start/Stop (replaces serverless for generation)
+Reason: in testing, serverless flex workers waited 16.5 min for a free GPU (every machine throttled). The user chose a dedicated pod.
+
+**GPU and location**
+- **GPU:** NVIDIA RTX PRO 6000 Blackwell Server Edition (96 GB), Secure Cloud, $2.49/h.
+- **Datacenter:** US-NE-1.
+- **Volume:** `image-studio-models-us` (`p6b2e0kjhk`), mounted at `/runpod-volume`, the same layout the worker already uses.
+- The app finds the volume by name with `GET /v2/network-volumes`; no ids are hard-coded in the app.
+
+**Pod lifecycle (Rust `pod.rs`, RunPod REST v2 `/v2/pods`)**
+- **Start:**
+  - Create a pod named `image-studio-gpu` with image `ghcr.io/algotradingfervid/image-studio-worker:latest`.
+  - `gpu` = RTX PRO 6000 Blackwell Server Edition × 1; `dataCenterIds` = [the volume's DC]; network mount {volumeId, path `/runpod-volume`}; `ports` `["8000/http"]`; container disk 20 GB.
+  - env: `MODE=pod`, `API_TOKEN=<random 32-byte, Keychain account pod_api_token>`, `IDLE_MINUTES=<setting, default 30>`, `HF_TOKEN`/`CIVITAI_API_KEY` as RunPod secret refs (`{{ RUNPOD_SECRET_image-studio-hf-token }}` etc. — existing secrets), plus whatever the watchdog needs (below).
+  - Then poll `https://<podId>-8000.proxy.runpod.net/health` (with token) until ready.
+  - The pod id is stored in SQLite, so it survives app restarts.
+- **Stop:** `DELETE /v2/pods/{id}` (terminate). All state lives on the volume and on the Mac.
+- **Generate while stopped:** auto-start, and show "Starting GPU…" phases.
+- **On app launch:** find any existing `image-studio-gpu` pod via `GET /v2/pods` and re-adopt it. Show a warning banner if it was left running.
+- **App-side auto-stop:** after `IDLE_MINUTES` with no jobs or tasks (only while the app is open).
+
+**Pod server (`worker/src/server.py`, `MODE=pod`)**
+- The entrypoint starts ComfyUI as today, then serves HTTP on `:8000` instead of `runpod.serverless.start`.
+- It is **API-compatible with RunPod serverless**, so the Rust client only swaps its base URL and token:
+  - `POST /run {input, policy?} → {id, status:"IN_QUEUE"}`
+  - `GET /status/{id} → {id, status, output, delayTime, executionTime, error?}`. While IN_PROGRESS, `output` = the latest `progress_update` payload. Statuses: IN_QUEUE / IN_PROGRESS / COMPLETED / FAILED / CANCELLED.
+  - `POST /cancel/{id}`
+  - `GET /health → {jobs:{inQueue,inProgress,completed,failed}, workers:{idle,running}, ready: bool, gpu: str, comfyui: str}`
+  - `GET /ping` (no auth, for liveness)
+- **Auth:** every endpoint except `/ping` needs `Authorization: Bearer $API_TOKEN` (constant-time compare). Missing or wrong → 401. The server refuses to start without `API_TOKEN`.
+- **Execution:**
+  - One job at a time, FIFO (ComfyUI is single-GPU).
+  - `download`/`delete`/`status` jobs may run concurrently with `generate`, using a separate executor.
+  - It reuses the existing handler action functions, unchanged, with a progress hook that writes to the job record.
+  - Finished jobs are kept for 30 min.
+- **Idle watchdog:** if no request other than `/ping` arrives within `IDLE_MINUTES` and no job is active, the pod **terminates itself** through the RunPod API, using `RUNPOD_POD_ID` (injected by RunPod) and an API key. Verify whether RunPod injects a pod-scoped `RUNPOD_API_KEY`; if not, the app passes the user's key as a pod env var. Log the shutdown.
+
+**App UI**
+- **GPU pill in the header:**
+  - `Stopped` + **Start**
+  - `Starting · <phase>` (creating pod → pulling image → booting ComfyUI → ready)
+  - `Running · RTX PRO 6000 · 23 min · ~$0.95` + **Stop**
+  - `Error` + message + Retry
+- **Settings:** "Auto-stop after N idle minutes" (default 30); GPU type (read-only for now).
+- **Startup banner** if a pod was found running.
+
+**New commands and events**
+- `get_gpu_state() -> GpuState`
+- `start_gpu() -> GpuState`
+- `stop_gpu() -> GpuState`
+- event `gpu-update` (GpuState)
+- `GpuState = {status: "stopped"|"starting"|"running"|"stopping"|"error", podId?, gpuType?, startedAt?, costPerHr?, phase?, error?, idleMinutes}`
+
+**Fix:** the volume total/free in the Models screen = the volume's `size` (GB, from `GET /v2/network-volumes`) minus the sum of present file sizes. The worker's `shutil.disk_usage` reports the whole shared filesystem.
+
+**Serverless:** the endpoint stays configured but unused. The Settings "Test connection" now checks the pod when it's running, and otherwise the RunPod API key.
