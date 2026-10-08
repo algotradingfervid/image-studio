@@ -499,6 +499,7 @@ async fn auto_stops_after_idle_minutes() {
     // An active job keeps the GPU alive (and counts as activity).
     let job = Job {
         job_id: "j".into(),
+        kind: Default::default(), // an image job (image profile)
         status: JobState::Running,
         total: 1,
         completed: 0,

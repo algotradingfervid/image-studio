@@ -4,12 +4,14 @@
 use crate::db::LoraRow;
 use crate::delete_rule::{plan_delete, KeptFile};
 use crate::links::sanitize_filename;
+use crate::pod::Profile;
 use crate::registry::ModelFile;
 use crate::runpod::{
     failure_message, parse_progress, RunStatus, DOWNLOAD_TIMEOUT_MS, GENERATE_TIMEOUT_MS,
 };
 use crate::state::{now_rfc3339, Core};
-use crate::status::{lora_folder, lora_view, present_set, refresh_status_opts, LoraView};
+use crate::status::{lora_folder, lora_view, present_set_for, refresh_status_opts_for, LoraView};
+use crate::worker::profile_for_model;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
@@ -62,6 +64,8 @@ pub struct Task {
 pub struct TaskEntry {
     pub task: Task,
     pub cancel: bool,
+    /// The GPU profile (volume) the task runs on.
+    pub profile: Profile,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -137,10 +141,11 @@ fn ensure_idle(core: &Core, kind: TargetType, id: &str) -> Result<(), String> {
 }
 
 pub fn download_model(core: &Arc<Core>, id: &str) -> Result<Task, String> {
-    let model = core.registry.require_model(id)?.clone();
+    let model = core.registry.any_model(id)?.clone();
+    let profile = profile_for_model(core, id);
     ensure_idle(core, TargetType::Model, id)?;
-    crate::worker::precheck(core)?;
-    let present = present_set(core);
+    crate::worker::precheck_for(core, profile)?;
+    let present = present_set_for(core, profile);
     // Send every file: the worker skips files already present with the right size.
     let files: Vec<Value> = model
         .files
@@ -163,6 +168,7 @@ pub fn download_model(core: &Arc<Core>, id: &str) -> Result<Task, String> {
         .sum();
     Ok(start_task(
         core,
+        profile,
         TaskKind::Download,
         TaskTarget {
             kind: TargetType::Model,
@@ -175,12 +181,13 @@ pub fn download_model(core: &Arc<Core>, id: &str) -> Result<Task, String> {
     ))
 }
 
+/// Delete plan against the model's own volume (image or video family).
 fn plan(core: &Core, id: &str) -> Result<(crate::delete_rule::DeletePlan, Vec<ModelFile>), String> {
-    let model = core.registry.require_model(id)?;
+    let model = core.registry.any_model(id)?;
     let p = plan_delete(
         model,
-        &core.registry.models,
-        &present_set(core),
+        core.registry.family_of(id),
+        &present_set_for(core, profile_for_model(core, id)),
         &busy_models(core),
     );
     let files = p.delete_files.clone();
@@ -206,13 +213,15 @@ pub fn delete_model(core: &Arc<Core>, id: &str) -> Result<DeleteResult, String> 
             task: None,
         });
     }
-    crate::worker::precheck(core)?;
+    let profile = profile_for_model(core, id);
+    crate::worker::precheck_for(core, profile)?;
     let payload: Vec<Value> = files
         .iter()
         .map(|f| json!({"folder": f.folder, "filename": f.filename}))
         .collect();
     let task = start_task(
         core,
+        profile,
         TaskKind::Delete,
         TaskTarget {
             kind: TargetType::Model,
@@ -237,8 +246,9 @@ pub async fn add_lora(
     name: Option<String>,
     trigger_words: Option<Vec<String>>,
 ) -> Result<LoraView, String> {
-    core.registry.require_model(model_id)?;
-    crate::worker::precheck(core)?;
+    core.registry.any_model(model_id)?;
+    let profile = profile_for_model(core, model_id);
+    crate::worker::precheck_for(core, profile)?;
     let r = core.resolver().resolve(url, &core.registry).await?;
     let filename = sanitize_filename(&r.filename)?;
     let row = LoraRow {
@@ -269,6 +279,7 @@ pub async fn add_lora(
     );
     start_task(
         core,
+        profile,
         TaskKind::Download,
         TaskTarget {
             kind: TargetType::Lora,
@@ -279,7 +290,7 @@ pub async fn add_lora(
         r.size_bytes.unwrap_or(0),
         OnDone::Nothing,
     );
-    Ok(lora_view(core, &row, &present_set(core)))
+    Ok(lora_view(core, &row, &present_set_for(core, profile)))
 }
 
 /// Deletes the LoRA file from the volume (when present) and then the record.
@@ -293,13 +304,15 @@ pub fn delete_lora(core: &Arc<Core>, id: &str) -> Result<Option<Task>, String> {
         .ok_or("LoRA not found")?;
     ensure_idle(core, TargetType::Lora, id)?;
     let folder = lora_folder(&row.model_id);
-    if !present_set(core).contains(&(folder.clone(), row.filename.clone())) {
+    let profile = profile_for_model(core, &row.model_id);
+    if !present_set_for(core, profile).contains(&(folder.clone(), row.filename.clone())) {
         core.db.lock().unwrap().delete_lora(id)?;
         return Ok(None);
     }
-    crate::worker::precheck(core)?;
+    crate::worker::precheck_for(core, profile)?;
     Ok(Some(start_task(
         core,
+        profile,
         TaskKind::Delete,
         TaskTarget {
             kind: TargetType::Lora,
@@ -324,6 +337,7 @@ pub fn cancel_task(core: &Core, task_id: &str) -> Result<(), String> {
 #[allow(clippy::too_many_arguments)]
 fn start_task(
     core: &Arc<Core>,
+    profile: Profile,
     kind: TaskKind,
     target: TaskTarget,
     input: Value,
@@ -346,12 +360,13 @@ fn start_task(
         TaskEntry {
             task: task.clone(),
             cancel: false,
+            profile,
         },
     );
     core.sink.task_update(&task);
     let core2 = core.clone();
     let id = task.task_id.clone();
-    tokio::spawn(async move { run_task(core2, id, input, timeout_ms, on_done).await });
+    tokio::spawn(async move { run_task(core2, profile, id, input, timeout_ms, on_done).await });
     task
 }
 
@@ -372,11 +387,11 @@ fn cancel_requested(core: &Core, id: &str) -> bool {
     core.tasks.lock().unwrap().get(id).is_some_and(|e| e.cancel)
 }
 
-async fn finish(core: &Arc<Core>, id: &str, status: TaskStatus, error: Option<String>) {
-    crate::pod::touch(core);
+async fn finish(core: &Arc<Core>, profile: Profile, id: &str, status: TaskStatus, error: Option<String>) {
+    crate::pod::touch_for(core, profile);
     // Refresh the cache before reporting the end so list_models is current
     // (only if the worker is up — never start the GPU just for this).
-    if let Err(e) = refresh_status_opts(core, false).await {
+    if let Err(e) = refresh_status_opts_for(core, profile, false).await {
         eprintln!("[tasks] status refresh after task failed: {e}");
     }
     let done = {
@@ -405,6 +420,7 @@ fn fail_now(core: &Core, id: &str, status: TaskStatus, e: Option<String>) {
 
 async fn run_task(
     core: Arc<Core>,
+    profile: Profile,
     id: String,
     input: Value,
     timeout_ms: u64,
@@ -414,7 +430,7 @@ async fn run_task(
     let client = {
         let (c, i) = (core.clone(), id.clone());
         let cancelled = move || cancel_requested(&c, &i);
-        crate::worker::client(&core, &mut |_| {}, &cancelled).await
+        crate::worker::client_for(&core, profile, &mut |_| {}, &cancelled).await
     };
     let client = match client {
         Ok(c) => c,
@@ -432,7 +448,7 @@ async fn run_task(
         tokio::time::sleep(core.cfg.poll_interval).await;
         if cancel_requested(&core, &id) {
             let _ = client.cancel(&rp_id).await;
-            finish(&core, &id, TaskStatus::Cancelled, None).await;
+            finish(&core, profile, &id, TaskStatus::Cancelled, None).await;
             return;
         }
         let s = match client.status(&rp_id).await {
@@ -443,7 +459,7 @@ async fn run_task(
             Err(e) => {
                 errors += 1;
                 if errors >= 30 {
-                    finish(&core, &id, TaskStatus::Failed, Some(e)).await;
+                    finish(&core, profile, &id, TaskStatus::Failed, Some(e)).await;
                     return;
                 }
                 continue;
@@ -475,15 +491,15 @@ async fn run_task(
                     }
                 }
                 update(&core, &id, |t| t.bytes = t.total_bytes);
-                finish(&core, &id, TaskStatus::Completed, None).await;
+                finish(&core, profile, &id, TaskStatus::Completed, None).await;
                 return;
             }
             RunStatus::Cancelled => {
-                finish(&core, &id, TaskStatus::Cancelled, None).await;
+                finish(&core, profile, &id, TaskStatus::Cancelled, None).await;
                 return;
             }
             RunStatus::Failed | RunStatus::TimedOut => {
-                finish(&core, &id, TaskStatus::Failed, Some(failure_message(&s))).await;
+                finish(&core, profile, &id, TaskStatus::Failed, Some(failure_message(&s))).await;
                 return;
             }
         }

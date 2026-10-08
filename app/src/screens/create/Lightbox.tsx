@@ -5,6 +5,16 @@ import { Dialog } from "../../components/Dialog";
 import { Icon } from "../../components/Icon";
 import { formatDateTime, formatDuration } from "../../lib/format";
 import { useToast } from "../../state/toast";
+import { formatClipLength, PREVIEW_UNAVAILABLE, unplayable } from "./Gallery";
+
+/** The stored file's extension (png/jpg/webp/mp4), for the download name. */
+function extOf(path: string, video: boolean): string {
+  if (video) return "mp4";
+  const m = path.match(/\.(png|jpe?g|webp|mp4)(?:$|[?#])/i);
+  if (!m) return "png";
+  const e = m[1].toLowerCase();
+  return e === "jpeg" ? "jpg" : e;
+}
 
 export function Lightbox({
   items,
@@ -13,6 +23,7 @@ export function Lightbox({
   onClose,
   onDeleted,
   onUseSettings,
+  onMakeVideo,
   modelNames,
 }: {
   items: ImageRecord[];
@@ -21,14 +32,23 @@ export function Lightbox({
   onClose: () => void;
   onDeleted: (id: string) => void;
   onUseSettings: (im: ImageRecord) => void;
+  /** Image records: open Create in Video mode with this image as the start frame. */
+  onMakeVideo?: (im: ImageRecord) => void;
   modelNames: Record<string, string>;
 }) {
   const toast = useToast();
   const im = index != null ? items[index] : undefined;
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [videoFailed, setVideoFailed] = useState(false);
+  const video = im?.kind === "video";
+  const noun = video ? "video" : "image";
+  const Noun = video ? "Video" : "Image";
 
-  useEffect(() => setConfirming(false), [index]);
+  useEffect(() => {
+    setConfirming(false);
+    setVideoFailed(false);
+  }, [index]);
 
   const go = (d: number) => {
     if (index == null) return;
@@ -39,13 +59,13 @@ export function Lightbox({
   const download = async () => {
     if (!im) return;
     try {
-      const name = `image-studio-${im.model}-${im.seed}.png`;
+      const name = `image-studio-${im.model}-${im.seed}.${extOf(im.path, video)}`;
       const dest = await api.pickSavePath(name);
       if (!dest) return;
       await api.exportImage({ id: im.id, destPath: dest });
-      toast.success("Image saved", dest);
+      toast.success(`${Noun} saved`, dest);
     } catch (e) {
-      toast.error("Couldn't save the image", e);
+      toast.error(`Couldn't save the ${noun}`, e);
     }
   };
 
@@ -65,9 +85,9 @@ export function Lightbox({
     try {
       await api.deleteImage(im.id);
       onDeleted(im.id);
-      toast.info("Image deleted");
+      toast.info(`${Noun} deleted`);
     } catch (e) {
-      toast.error("Couldn't delete the image", e);
+      toast.error(`Couldn't delete the ${noun}`, e);
     } finally {
       setBusy(false);
       setConfirming(false);
@@ -81,7 +101,7 @@ export function Lightbox({
           className="lightbox__layout"
           onKeyDown={(e) => {
             const t = e.target as HTMLElement;
-            if (t.tagName === "INPUT" || t.tagName === "TEXTAREA") return;
+            if (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "VIDEO") return;
             if (e.key === "ArrowLeft") {
               e.preventDefault();
               go(-1);
@@ -92,14 +112,38 @@ export function Lightbox({
           }}
         >
           <div className="lightbox__stage">
-            <img src={fileSrc(im.path)} alt={im.prompt} style={{ aspectRatio: `${im.width} / ${im.height}` }} />
-            <button type="button" className="lightbox__nav lightbox__nav--prev" aria-label="Previous image (←)" disabled={index === 0} onClick={() => go(-1)}>
+            {video ? (
+              videoFailed || unplayable(im.path) ? (
+                <figure className="lightbox__poster">
+                  {im.posterPath && <img src={fileSrc(im.posterPath)} alt={im.prompt} style={{ aspectRatio: `${im.width} / ${im.height}` }} />}
+                  <figcaption className="lightbox__unavailable">
+                    <Icon name="video" /> {PREVIEW_UNAVAILABLE}
+                  </figcaption>
+                </figure>
+              ) : (
+                <video
+                  key={im.id}
+                  className="lightbox__video"
+                  src={fileSrc(im.path)}
+                  poster={im.posterPath ? fileSrc(im.posterPath) : undefined}
+                  controls
+                  autoPlay
+                  playsInline
+                  style={{ aspectRatio: `${im.width} / ${im.height}` }}
+                  aria-label={`Video: ${im.prompt}`}
+                  onError={() => setVideoFailed(true)}
+                />
+              )
+            ) : (
+              <img src={fileSrc(im.path)} alt={im.prompt} style={{ aspectRatio: `${im.width} / ${im.height}` }} />
+            )}
+            <button type="button" className="lightbox__nav lightbox__nav--prev" aria-label={`Previous ${noun} (←)`} disabled={index === 0} onClick={() => go(-1)}>
               <Icon name="chevronLeft" size={20} />
             </button>
             <button
               type="button"
               className="lightbox__nav lightbox__nav--next"
-              aria-label="Next image (→)"
+              aria-label={`Next ${noun} (→)`}
               disabled={index === items.length - 1}
               onClick={() => go(1)}
             >
@@ -110,7 +154,7 @@ export function Lightbox({
             </span>
           </div>
 
-          <aside className="lightbox__side" aria-label="Image settings">
+          <aside className="lightbox__side" aria-label={`${Noun} settings`}>
             <header className="lightbox__head">
               <span className="eyebrow">{modelNames[im.model] ?? im.model}</span>
               <button type="button" className="icon-btn" aria-label="Close (Esc)" onClick={onClose} autoFocus>
@@ -120,12 +164,33 @@ export function Lightbox({
             <p className="lightbox__prompt">{im.prompt}</p>
 
             <dl className="specs">
-              <div>
-                <dt>Size</dt>
-                <dd className="mono">
-                  {im.initImage ? "start image" : im.aspectRatio} · {im.width}×{im.height}
-                </dd>
-              </div>
+              {video ? (
+                <>
+                  <div>
+                    <dt>Duration</dt>
+                    <dd className="mono">{formatClipLength(im.durationS) || "—"}</dd>
+                  </div>
+                  <div>
+                    <dt>Frame rate</dt>
+                    <dd className="mono">{im.fps ? `${im.fps} fps` : "—"}</dd>
+                  </div>
+                  <div>
+                    <dt>Resolution</dt>
+                    <dd className="mono">{im.width && im.height ? `${im.width}×${im.height}` : im.aspectRatio}</dd>
+                  </div>
+                  <div>
+                    <dt>Audio</dt>
+                    <dd>{im.hasAudio ? "Yes" : "No"}</dd>
+                  </div>
+                </>
+              ) : (
+                <div>
+                  <dt>Size</dt>
+                  <dd className="mono">
+                    {im.initImage ? "start image" : im.aspectRatio} · {im.width}×{im.height}
+                  </dd>
+                </div>
+              )}
               <div>
                 <dt>Seed</dt>
                 <dd className="mono">{im.seed}</dd>
@@ -158,7 +223,16 @@ export function Lightbox({
                   </dd>
                 </div>
               )}
-              {im.initImage && (
+              {im.initImage && video && (
+                <div className="specs__wide">
+                  <dt>Start image</dt>
+                  <dd className="start-spec">
+                    <img src={fileSrc(im.initImage)} alt="Start image" />
+                    <span className="hint">Image → video</span>
+                  </dd>
+                </div>
+              )}
+              {im.initImage && !video && (
                 <div className="specs__wide">
                   <dt>Start image</dt>
                   <dd className="start-spec">
@@ -207,15 +281,20 @@ export function Lightbox({
               </button>
               <div className="btn-row">
                 <button type="button" className="btn" onClick={download}>
-                  <Icon name="download" /> Download
+                  <Icon name="download" /> {video ? "Download .mp4" : "Download"}
                 </button>
                 <button type="button" className="btn" onClick={copyPrompt}>
                   <Icon name="copy" /> Copy prompt
                 </button>
               </div>
+              {!video && onMakeVideo && (
+                <button type="button" className="btn" onClick={() => onMakeVideo(im)}>
+                  <Icon name="video" /> Make video
+                </button>
+              )}
               {confirming ? (
                 <div className="confirm" role="group" aria-label="Confirm delete">
-                  <span>Delete this image permanently?</span>
+                  <span>Delete this {noun} permanently?</span>
                   <div className="btn-row">
                     <button type="button" className="btn btn--sm" onClick={() => setConfirming(false)} autoFocus>
                       Keep

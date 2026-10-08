@@ -43,6 +43,26 @@ pub struct ImageRecord {
     /// img2img strength (denoise, 0.05–1.0); None for text-to-image.
     #[serde(default)]
     pub denoise: Option<f64>,
+    /// "image" or "video" (spec v5). For videos `path` is the .mp4,
+    /// `aspect_ratio` holds the resolution id and `init_image` the i2v start image.
+    #[serde(default = "image_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub duration_s: Option<f64>,
+    #[serde(default)]
+    pub fps: Option<f64>,
+    #[serde(default)]
+    pub has_audio: Option<bool>,
+    /// Video poster frame (JPEG).
+    #[serde(default)]
+    pub poster_path: Option<String>,
+}
+
+pub const KIND_IMAGE: &str = "image";
+pub const KIND_VIDEO: &str = "video";
+
+fn image_kind() -> String {
+    KIND_IMAGE.to_string()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -141,7 +161,23 @@ CREATE TABLE settings (
 ALTER TABLE images ADD COLUMN init_image TEXT;
 ALTER TABLE images ADD COLUMN denoise REAL;
 "#,
+    // 3: video records (spec v5) and a status cache per volume/profile.
+    r#"
+ALTER TABLE images ADD COLUMN kind TEXT NOT NULL DEFAULT 'image';
+ALTER TABLE images ADD COLUMN duration_s REAL;
+ALTER TABLE images ADD COLUMN fps REAL;
+ALTER TABLE images ADD COLUMN has_audio INTEGER;
+ALTER TABLE images ADD COLUMN poster_path TEXT;
+CREATE TABLE volume_status (
+  profile TEXT PRIMARY KEY,
+  json TEXT NOT NULL,
+  checked_at TEXT NOT NULL
+);
+"#,
 ];
+
+/// `profile` key whose status lives in the original `model_status` table.
+pub const IMAGE_STATUS_KEY: &str = "image";
 
 pub struct Db {
     conn: Connection,
@@ -185,8 +221,8 @@ impl Db {
     pub fn insert_image(&self, r: &ImageRecord) -> Result<(), String> {
         self.conn
             .execute(
-                "INSERT INTO images (id, path, model, prompt, negative_prompt, aspect_ratio, width, height, seed, steps, cfg, references_json, loras_json, created_at, duration_ms, delay_ms, execution_ms, init_image, denoise)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                "INSERT INTO images (id, path, model, prompt, negative_prompt, aspect_ratio, width, height, seed, steps, cfg, references_json, loras_json, created_at, duration_ms, delay_ms, execution_ms, init_image, denoise, kind, duration_s, fps, has_audio, poster_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                 params![
                     r.id,
                     r.path,
@@ -207,6 +243,11 @@ impl Db {
                     r.runpod.execution_ms.map(|x| x as i64),
                     r.init_image,
                     r.denoise,
+                    r.kind,
+                    r.duration_s,
+                    r.fps,
+                    r.has_audio,
+                    r.poster_path,
                 ],
             )
             .map_err(e)?;
@@ -241,6 +282,11 @@ impl Db {
                 },
                 init_image: row.get("init_image")?,
                 denoise: row.get("denoise")?,
+                kind: row.get("kind")?,
+                duration_s: row.get("duration_s")?,
+                fps: row.get("fps")?,
+                has_audio: row.get("has_audio")?,
+                poster_path: row.get("poster_path")?,
             },
         ))
     }
@@ -395,6 +441,38 @@ impl Db {
         Ok(row.and_then(|(j, at)| serde_json::from_str(&j).ok().map(|s| (s, at))))
     }
 
+    /// Status cache for a profile's volume: "image" uses `model_status`
+    /// (unchanged), any other profile its own `volume_status` row.
+    pub fn save_status_for(&self, profile: &str, s: &StatusSnapshot, checked_at: &str) -> Result<(), String> {
+        if profile == IMAGE_STATUS_KEY {
+            return self.save_status(s, checked_at);
+        }
+        self.conn
+            .execute(
+                "INSERT INTO volume_status (profile, json, checked_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(profile) DO UPDATE SET json = excluded.json, checked_at = excluded.checked_at",
+                params![profile, serde_json::to_string(s).unwrap(), checked_at],
+            )
+            .map_err(e)?;
+        Ok(())
+    }
+
+    pub fn load_status_for(&self, profile: &str) -> Result<Option<(StatusSnapshot, String)>, String> {
+        if profile == IMAGE_STATUS_KEY {
+            return self.load_status();
+        }
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT json, checked_at FROM volume_status WHERE profile = ?1",
+                [profile],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(e)?;
+        Ok(row.and_then(|(j, at)| serde_json::from_str(&j).ok().map(|s| (s, at))))
+    }
+
     // ----- settings (key/value) -----
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>, String> {
@@ -448,6 +526,11 @@ mod tests {
             },
             init_image: None,
             denoise: None,
+            kind: KIND_IMAGE.into(),
+            duration_s: None,
+            fps: None,
+            has_audio: None,
+            poster_path: None,
         }
     }
 
@@ -508,6 +591,92 @@ mod tests {
         let db = Db::open(&path).unwrap();
         assert_eq!(db.get_image("new").unwrap(), Some(r));
         assert_eq!(db.list_images(10, None).unwrap().0.len(), 2);
+    }
+
+    #[test]
+    fn video_records_roundtrip_and_status_per_profile() {
+        let db = Db::open_in_memory().unwrap();
+        let mut v = img("v", 3);
+        v.kind = KIND_VIDEO.into();
+        v.path = "/x/videos/v.mp4".into();
+        v.aspect_ratio = "1280x720".into();
+        v.duration_s = Some(5.0);
+        v.fps = Some(24.0);
+        v.has_audio = Some(true);
+        v.poster_path = Some("/x/videos/v.jpg".into());
+        db.insert_image(&v).unwrap();
+        db.insert_image(&img("i", 4)).unwrap();
+        assert_eq!(db.get_image("v").unwrap(), Some(v.clone()));
+        assert_eq!(db.get_image("i").unwrap().unwrap().kind, "image");
+        let j = serde_json::to_value(&v).unwrap();
+        assert_eq!(j["kind"], "video");
+        assert_eq!(j["durationS"], serde_json::json!(5.0));
+        assert_eq!(j["hasAudio"], serde_json::json!(true));
+        assert_eq!(j["posterPath"], "/x/videos/v.jpg");
+        // older serialised records (no kind) read as images
+        let mut old = serde_json::to_value(img("c", 9)).unwrap();
+        for k in ["kind", "durationS", "fps", "hasAudio", "posterPath"] {
+            old.as_object_mut().unwrap().remove(k);
+        }
+        assert_eq!(serde_json::from_value::<ImageRecord>(old).unwrap(), img("c", 9));
+        // separate status caches per profile
+        let snap = |name: &str| StatusSnapshot {
+            files: vec![VolumeFile {
+                folder: "unet".into(),
+                filename: name.into(),
+                size_bytes: Some(1),
+            }],
+            ..Default::default()
+        };
+        db.save_status_for("image", &snap("img.safetensors"), "t1").unwrap();
+        assert!(db.load_status_for("video").unwrap().is_none());
+        db.save_status_for("video", &snap("vid.safetensors"), "t2").unwrap();
+        db.save_status_for("video", &snap("vid2.safetensors"), "t3").unwrap();
+        assert_eq!(db.load_status().unwrap(), Some((snap("img.safetensors"), "t1".into())));
+        assert_eq!(
+            db.load_status_for("video").unwrap(),
+            Some((snap("vid2.safetensors"), "t3".into()))
+        );
+    }
+
+    #[test]
+    fn migrates_v2_database_to_video_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("studio.db");
+        {
+            // A database written by the img2img app (schema version 2).
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "BEGIN; {} {} PRAGMA user_version = 2; COMMIT;",
+                MIGRATIONS[0], MIGRATIONS[1]
+            ))
+            .unwrap();
+            conn.execute(
+                "INSERT INTO images (id, path, model, prompt, negative_prompt, aspect_ratio, width, height, seed, steps, cfg, references_json, loras_json, created_at, duration_ms, delay_ms, execution_ms, init_image, denoise)
+                 VALUES ('old', '/x/old.png', 'chroma', 'p', '', '1:1', 1024, 1024, '5', 8, 1.0, '[]', '[]', 't', 10, NULL, NULL, '/r/s.png', 0.5)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO model_status (id, json, checked_at) VALUES (1, '{\"files\": []}', 'tc')",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        let old = db.get_image("old").unwrap().unwrap();
+        assert_eq!(old.kind, "image");
+        assert_eq!((old.duration_s, old.fps, old.has_audio, old.poster_path), (None, None, None, None));
+        assert_eq!((old.init_image.as_deref(), old.denoise), (Some("/r/s.png"), Some(0.5)));
+        assert_eq!(db.load_status().unwrap().unwrap().1, "tc", "image cache kept");
+        assert!(db.load_status_for("video").unwrap().is_none());
+        drop(db);
+        assert!(Db::open(&path).is_ok(), "reopening runs no migration twice");
     }
 
     #[test]

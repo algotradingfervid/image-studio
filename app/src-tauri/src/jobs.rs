@@ -1,12 +1,17 @@
 //! Generation job manager: one RunPod job per image (seeds seed..seed+n-1),
 //! polled every `poll_interval`, images decoded into `images/`, `job-update` emitted.
+//!
+//! Video jobs (spec v5, `generate_video`): one pod job per video on the
+//! `video` GPU profile; the MP4 and its JPEG poster are decoded into `videos/`
+//! and recorded in the same `images` table with `kind = "video"`.
 
-use crate::db::{ImageRecord, LoraRef, RunpodTimes};
+use crate::db::{ImageRecord, LoraRef, RunpodTimes, KIND_IMAGE, KIND_VIDEO};
+use crate::pod::Profile;
 use crate::runpod::{
     failure_message, parse_progress, Progress, RunStatus, RunpodClient, GENERATE_TIMEOUT_MS,
 };
 use crate::state::{now_rfc3339, Core};
-use crate::status::{has_cache, lora_folder, present_set};
+use crate::status::{has_cache, has_cache_for, lora_folder, present_set, present_set_for};
 use base64::Engine;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -23,6 +28,26 @@ pub const MAX_LORAS: usize = 3;
 pub const MIN_DENOISE: f64 = 0.05;
 pub const MAX_DENOISE: f64 = 1.0;
 pub const DEFAULT_DENOISE: f64 = 0.6;
+/// Execution timeout for one video job (video sampling takes minutes).
+pub const VIDEO_TIMEOUT_MS: u64 = 1_800_000;
+
+/// What a job produces; decides the GPU profile it runs on.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum JobKind {
+    #[default]
+    Image,
+    Video,
+}
+
+impl JobKind {
+    pub fn profile(self) -> Profile {
+        match self {
+            JobKind::Image => Profile::Image,
+            JobKind::Video => Profile::Video,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -98,6 +123,8 @@ impl From<Progress> for JobProgress {
 #[serde(rename_all = "camelCase")]
 pub struct Job {
     pub job_id: String,
+    /// "image" or "video" (additive, spec v5).
+    pub kind: JobKind,
     pub status: JobState,
     pub total: u32,
     pub completed: u32,
@@ -160,9 +187,250 @@ pub fn expand_seeds(seed: Option<u64>, count: u32) -> Result<Vec<u64>, String> {
 
 /// Everything resolved for the per-image `generate` inputs.
 struct Plan {
+    kind: JobKind,
     template: Value,
     seeds: Vec<u64>,
     record: ImageRecord, // template record; id/path/seed/times filled per image
+    timeout_ms: u64,
+}
+
+/// `generate_video` request (spec v5).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoRequest {
+    pub model: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub negative_prompt: Option<String>,
+    /// i2v start image: an id from `import_reference(_bytes)`.
+    #[serde(default)]
+    pub init_image_id: Option<String>,
+    /// i2v start image picked from the gallery: an image record id (kind
+    /// "image"). Its file is read in place (not copied); exclusive with
+    /// `init_image_id`.
+    #[serde(default)]
+    pub init_image_gallery_id: Option<String>,
+    pub duration_s: f64,
+    pub fps: f64,
+    pub resolution: String,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub steps: Option<u32>,
+    #[serde(default)]
+    pub cfg: Option<f64>,
+    #[serde(default)]
+    pub audio: bool,
+}
+
+/// A whole number as an integer JSON value, else a float.
+fn num(x: f64) -> Value {
+    if x.fract() == 0.0 && x.abs() < 1e15 {
+        json!(x as i64)
+    } else {
+        json!(x)
+    }
+}
+
+/// "1280x720" → (1280, 720).
+fn parse_wh(s: &str) -> Option<(u32, u32)> {
+    let (w, h) = s.split_once(['x', 'X', '×'])?;
+    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+}
+
+/// A gallery image as the i2v start image: read in place (never copied),
+/// downscaled in memory to ≤1 MP like imported references. Returns the
+/// worker payload and the gallery file's path (recorded as `init_image`).
+fn gallery_start_image(core: &Core, image_id: &str) -> Result<(Value, String), String> {
+    let rec = core
+        .db
+        .lock()
+        .unwrap()
+        .get_image(image_id)?
+        .ok_or("That gallery image no longer exists")?;
+    if rec.kind != KIND_IMAGE {
+        return Err("Pick an image (not a video) as the start image".into());
+    }
+    let bytes = std::fs::read(&rec.path)
+        .map_err(|e| format!("Could not read the gallery image: {e}"))?;
+    let (out, ext) = crate::references::process(&bytes)?;
+    let payload = json!({
+        "name": format!("{}.{ext}", rec.id),
+        "base64": base64::engine::general_purpose::STANDARD.encode(out),
+    });
+    Ok((payload, rec.path))
+}
+
+fn build_video_plan(core: &Core, req: &VideoRequest) -> Result<Plan, String> {
+    let model = core.registry.require_video_model(&req.model)?;
+    let prompt = req.prompt.trim();
+    if prompt.is_empty() {
+        return Err("Enter a prompt first".into());
+    }
+    if req.init_image_id.is_some() && req.init_image_gallery_id.is_some() {
+        return Err("Choose one start image".into());
+    }
+    let has_init = req.init_image_id.is_some() || req.init_image_gallery_id.is_some();
+    let mode = if has_init { "i2v" } else { "t2v" };
+    if !model.has_mode(mode) {
+        return Err(if mode == "i2v" {
+            format!("{} does not take a start image", model.name)
+        } else {
+            format!("{} needs a start image", model.name)
+        });
+    }
+    let limits = model.limits.clone();
+    if !(req.duration_s.is_finite() && req.duration_s > 0.0) {
+        return Err("Choose a duration".into());
+    }
+    if let Some(max) = limits.as_ref().and_then(|l| l.max_duration_s) {
+        if req.duration_s > max + 1e-9 {
+            return Err(format!("{} makes at most {max} s per video", model.name));
+        }
+    }
+    if let Some(min) = limits.as_ref().and_then(|l| l.min_duration_s) {
+        if req.duration_s < min - 1e-9 {
+            return Err(format!("{} makes at least {min} s per video", model.name));
+        }
+    }
+    if !(req.fps.is_finite() && req.fps > 0.0) {
+        return Err("Choose a frame rate".into());
+    }
+    if let Some(l) = limits.as_ref().filter(|l| !l.fps_options.is_empty()) {
+        if !l.fps_options.iter().any(|f| (f - req.fps).abs() < 1e-6) {
+            return Err(format!("{} does not support {} fps", model.name, req.fps));
+        }
+    }
+    let resolution = req.resolution.trim().to_string();
+    if resolution.is_empty() {
+        return Err("Choose a resolution".into());
+    }
+    if let Some(l) = limits.as_ref().filter(|l| !l.resolutions.is_empty()) {
+        let ids: Vec<String> = l
+            .resolutions
+            .iter()
+            .filter_map(crate::registry::resolution_id)
+            .collect();
+        if !ids.contains(&resolution) {
+            return Err(format!(
+                "{} does not support the resolution {resolution} (choose {})",
+                model.name,
+                ids.join(", ")
+            ));
+        }
+    }
+    if req.audio && model.audio != Some(true) {
+        return Err(format!("{} does not generate audio", model.name));
+    }
+    let steps = req
+        .steps
+        .or(Some(model.defaults.steps).filter(|s| *s > 0));
+    if let Some(s) = steps {
+        if s == 0 || s > 200 {
+            return Err("Set the number of steps (1–200) in Advanced".into());
+        }
+    }
+    let cfg = req.cfg.or(Some(model.defaults.cfg).filter(|c| *c > 0.0));
+    if let Some(c) = cfg {
+        if !(c > 0.0 && c <= 30.0) {
+            return Err("Set CFG (greater than 0, at most 30) in Advanced".into());
+        }
+    }
+    let negative = req
+        .negative_prompt
+        .clone()
+        .unwrap_or_else(|| model.defaults.negative_prompt.clone());
+
+    let profile = Profile::Video;
+    if has_cache_for(core, profile) {
+        let present = present_set_for(core, profile);
+        let missing: Vec<&str> = model
+            .files
+            .iter()
+            .filter(|f| !present.contains(&(f.folder.clone(), f.filename.clone())))
+            .map(|f| f.filename.as_str())
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "{} is not installed (missing {}). Download it on the Models tab, or Refresh if it was just installed.",
+                model.name,
+                missing.join(", ")
+            ));
+        }
+    }
+
+    let mut init = None;
+    if let Some(iid) = &req.init_image_id {
+        let p = crate::references::find(&core.cfg.references_dir(), iid)
+            .map_err(|_| "The start image is missing; please add it again".to_string())?;
+        let bytes =
+            std::fs::read(&p).map_err(|e| format!("Could not read the start image: {e}"))?;
+        let payload = json!({
+            "name": p.file_name().unwrap().to_string_lossy(),
+            "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+        });
+        init = Some((payload, p.to_string_lossy().into_owned()));
+    }
+    if let Some(gid) = &req.init_image_gallery_id {
+        init = Some(gallery_start_image(core, gid)?);
+    }
+
+    let seeds = expand_seeds(req.seed, 1)?;
+    let mut template = json!({
+        "action": "generate_video",
+        "model": model.id,
+        "prompt": prompt,
+        "durationS": num(req.duration_s),
+        "fps": num(req.fps),
+        "resolution": resolution,
+        "seed": 0,
+        "audio": req.audio,
+    });
+    if !negative.trim().is_empty() {
+        template["negativePrompt"] = json!(negative);
+    }
+    if let Some(s) = steps {
+        template["steps"] = json!(s);
+    }
+    if let Some(c) = cfg {
+        template["cfg"] = json!(c);
+    }
+    if let Some((payload, _)) = &init {
+        template["initImage"] = payload.clone();
+    }
+    let (width, height) = parse_wh(&resolution).unwrap_or((0, 0));
+    let record = ImageRecord {
+        id: String::new(),
+        path: String::new(),
+        model: model.id.clone(),
+        prompt: prompt.to_string(),
+        negative_prompt: negative,
+        aspect_ratio: resolution,
+        width,
+        height,
+        seed: 0,
+        steps: steps.unwrap_or(0),
+        cfg: cfg.unwrap_or(0.0),
+        references: vec![],
+        loras: vec![],
+        created_at: String::new(),
+        duration_ms: None,
+        runpod: RunpodTimes::default(),
+        init_image: init.map(|(_, path)| path),
+        denoise: None,
+        kind: KIND_VIDEO.into(),
+        duration_s: Some(req.duration_s),
+        fps: Some(req.fps),
+        has_audio: Some(req.audio),
+        poster_path: None,
+    };
+    Ok(Plan {
+        kind: JobKind::Video,
+        template,
+        seeds,
+        record,
+        timeout_ms: VIDEO_TIMEOUT_MS,
+    })
 }
 
 fn build_plan(core: &Core, req: &GenerateRequest) -> Result<Plan, String> {
@@ -318,21 +586,40 @@ fn build_plan(core: &Core, req: &GenerateRequest) -> Result<Plan, String> {
         runpod: RunpodTimes::default(),
         init_image: init.as_ref().map(|(_, path, _)| path.clone()),
         denoise: init.as_ref().map(|(_, _, d)| *d),
+        kind: KIND_IMAGE.into(),
+        duration_s: None,
+        fps: None,
+        has_audio: None,
+        poster_path: None,
     };
     Ok(Plan {
+        kind: JobKind::Image,
         template,
         seeds,
         record,
+        timeout_ms: GENERATE_TIMEOUT_MS,
     })
 }
 
 pub fn generate(core: &Arc<Core>, req: GenerateRequest) -> Result<String, String> {
     let plan = build_plan(core, &req)?;
-    crate::worker::precheck(core)?;
+    start_job(core, plan)
+}
+
+/// Queues one video job on the `video` GPU profile (started when stopped).
+pub fn generate_video(core: &Arc<Core>, req: VideoRequest) -> Result<String, String> {
+    let plan = build_video_plan(core, &req)?;
+    start_job(core, plan)
+}
+
+fn start_job(core: &Arc<Core>, plan: Plan) -> Result<String, String> {
+    let profile = plan.kind.profile();
+    crate::worker::precheck_for(core, profile)?;
     let job = Job {
         job_id: uuid::Uuid::new_v4().to_string(),
+        kind: plan.kind,
         status: JobState::Queued,
-        total: req.count,
+        total: plan.seeds.len() as u32,
         completed: 0,
         progress: None,
         images: vec![],
@@ -362,7 +649,7 @@ pub fn generate(core: &Arc<Core>, req: GenerateRequest) -> Result<String, String
             };
             let (c, i) = (core2.clone(), id2.clone());
             let cancelled = move || cancel_requested(&c, &i);
-            crate::worker::client(&core2, &mut on_phase, &cancelled).await
+            crate::worker::client_for(&core2, profile, &mut on_phase, &cancelled).await
         };
         match client {
             Ok(client) => run_job(core2, id2, client, plan).await,
@@ -417,7 +704,8 @@ fn update(core: &Core, id: &str, f: impl FnOnce(&mut Job)) {
 }
 
 fn finish(core: &Core, id: &str, status: JobState, error: Option<String>) {
-    crate::pod::touch(core);
+    let kind = core.jobs.lock().unwrap().get(id).map(|e| e.job.kind);
+    crate::pod::touch_for(core, kind.unwrap_or_default().profile());
     let done = core.jobs.lock().unwrap().remove(id).map(|mut e| {
         e.job.status = status;
         e.job.error = error;
@@ -431,6 +719,107 @@ fn finish(core: &Core, id: &str, status: JobState, error: Option<String>) {
 
 fn cancel_requested(core: &Core, id: &str) -> bool {
     core.jobs.lock().unwrap().get(id).is_some_and(|e| e.cancel)
+}
+
+fn decode_b64(b64: &str) -> Option<Vec<u8>> {
+    let b64 = b64.split_once(";base64,").map(|(_, d)| d).unwrap_or(b64);
+    base64::engine::general_purpose::STANDARD.decode(b64.trim()).ok()
+}
+
+/// An ISO-BMFF (MP4) file starts with a box whose type is `ftyp`.
+fn looks_like_mp4(bytes: &[u8]) -> bool {
+    bytes.len() > 12 && &bytes[4..8] == b"ftyp"
+}
+
+/// Decode the `generate_video` output: the MP4 into `videos/<id>.mp4`, the
+/// poster into `videos/<id>.jpg`, and a `kind = "video"` record.
+fn save_video(
+    core: &Core,
+    plan: &Plan,
+    sub: &Sub,
+    s: &crate::runpod::JobStatus,
+) -> Result<ImageRecord, String> {
+    let out = s.output.as_ref().ok_or("The worker returned no output")?;
+    let video = out.get("video").ok_or("The worker returned no video")?;
+    let bytes = video
+        .get("base64")
+        .and_then(Value::as_str)
+        .and_then(decode_b64)
+        .ok_or("The worker returned invalid video data")?;
+    if !looks_like_mp4(&bytes) {
+        return Err("The worker returned a file that is not an MP4 video".into());
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let dir = core.cfg.videos_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Could not save the video: {e}"))?;
+    let path = dir.join(format!("{id}.mp4"));
+    std::fs::write(&path, &bytes).map_err(|e| format!("Could not save the video: {e}"))?;
+    let poster_path = out
+        .pointer("/poster/base64")
+        .and_then(Value::as_str)
+        .and_then(decode_b64)
+        .and_then(|b| {
+            let ext = match image::guess_format(&b) {
+                Ok(image::ImageFormat::Png) => "png",
+                Ok(image::ImageFormat::WebP) => "webp",
+                _ => "jpg",
+            };
+            let p = dir.join(format!("{id}.{ext}"));
+            match std::fs::write(&p, &b) {
+                Ok(()) => Some(p.to_string_lossy().into_owned()),
+                Err(e) => {
+                    eprintln!("[jobs] could not save the video poster: {e}");
+                    None
+                }
+            }
+        });
+    let mut rec = plan.record.clone();
+    rec.id = id;
+    rec.path = path.to_string_lossy().into_owned();
+    rec.poster_path = poster_path;
+    rec.seed = video
+        .get("seed")
+        .or_else(|| out.get("seed"))
+        .and_then(Value::as_u64)
+        .unwrap_or(sub.seed);
+    if let Some(w) = video.get("width").and_then(Value::as_u64) {
+        rec.width = w as u32;
+    }
+    if let Some(h) = video.get("height").and_then(Value::as_u64) {
+        rec.height = h as u32;
+    }
+    if let Some(f) = video.get("fps").and_then(Value::as_f64) {
+        rec.fps = Some(f);
+    }
+    if let Some(d) = video.get("durationS").and_then(Value::as_f64) {
+        rec.duration_s = Some(d);
+    }
+    if let Some(a) = video.get("hasAudio").and_then(Value::as_bool) {
+        rec.has_audio = Some(a);
+    }
+    rec.created_at = now_rfc3339();
+    rec.duration_ms = out
+        .pointer("/timings/totalMs")
+        .and_then(Value::as_u64)
+        .or(s.execution_time_ms);
+    rec.runpod = RunpodTimes {
+        delay_ms: s.delay_time_ms,
+        execution_ms: s.execution_time_ms,
+    };
+    core.db.lock().unwrap().insert_image(&rec)?;
+    Ok(rec)
+}
+
+fn save_output(
+    core: &Core,
+    plan: &Plan,
+    sub: &Sub,
+    s: &crate::runpod::JobStatus,
+) -> Result<ImageRecord, String> {
+    match plan.kind {
+        JobKind::Image => save_image(core, plan, sub, s),
+        JobKind::Video => save_video(core, plan, sub, s),
+    }
 }
 
 /// Decode the `generate` output into a PNG file and an ImageRecord.
@@ -512,7 +901,7 @@ async fn run_job(core: Arc<Core>, id: String, client: RunpodClient, plan: Plan) 
         }
         let mut input = plan.template.clone();
         input["seed"] = json!(subs[i].seed);
-        match client.run(input, GENERATE_TIMEOUT_MS).await {
+        match client.run(input, plan.timeout_ms).await {
             Ok(rp) => subs[i].rp_id = Some(rp),
             Err(e) => {
                 if i == 0 {
@@ -563,7 +952,7 @@ async fn run_job(core: Arc<Core>, id: String, client: RunpodClient, plan: Plan) 
                 RunStatus::InQueue => sub.state = RunStatus::InQueue,
                 RunStatus::Completed => {
                     sub.progress = None;
-                    match save_image(&core, &plan, sub, &s) {
+                    match save_output(&core, &plan, sub, &s) {
                         Ok(rec) => {
                             sub.state = RunStatus::Completed;
                             update(&core, &id, |j| {

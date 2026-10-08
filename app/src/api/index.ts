@@ -14,6 +14,8 @@ import type {
   DeleteResult,
   EventMap,
   GenerateInput,
+  GenerateVideoInput,
+  GpuProfile,
   GpuState,
   ImagePage,
   Job,
@@ -62,19 +64,21 @@ export const saveSettings = (input: SaveSettingsInput) => callObj<Settings>("sav
 export const testConnection = () => call<ConnectionTest>("test_connection");
 export const listModels = () => call<ModelView[]>("list_models");
 /** Asks the worker for fresh status — auto-starts the GPU pod when stopped (can take minutes). */
-export const refreshStatus = () => call<StatusSnapshot>("refresh_status");
+export const refreshStatus = (profile: GpuProfile = "image") => call<StatusSnapshot>("refresh_status", { profile });
 /** Cached status from SQLite (no GPU). volume/checkedAt may be null. */
-export const getStatus = () => call<StatusSnapshot>("get_status");
+export const getStatus = (profile: GpuProfile = "image") => call<StatusSnapshot>("get_status", { profile });
 
 // ---------- GPU pod ----------
 
-export const getGpuState = () => call<GpuState>("get_gpu_state");
+export const getGpuState = (profile: GpuProfile = "image") => call<GpuState>("get_gpu_state", { profile });
+/** Every profile's state: [image, video]. */
+export const listGpuStates = () => call<GpuState[]>("list_gpu_states");
 /** Returns at once (usually "starting"); progress continues via `gpu-update`. No-op if already starting/running. */
-export const startGpu = () => call<GpuState>("start_gpu");
+export const startGpu = (profile: GpuProfile = "image") => call<GpuState>("start_gpu", { profile });
 /** Resolves after the pod is gone (emits "stopping" then "stopped"). */
-export const stopGpu = () => call<GpuState>("stop_gpu");
+export const stopGpu = (profile: GpuProfile = "image") => call<GpuState>("stop_gpu", { profile });
 /**
- * Answer to `quit-requested`. stopGpu: stop the pod (confirmed gone) and then quit —
+ * Answer to `quit-requested`. stopGpu: stop EVERY profile's pod (confirmed gone) and then quit —
  * rejects (and does not quit) when the pod couldn't be stopped. false: quit now.
  */
 export const confirmQuit = (stopGpu: boolean) => call<void>("confirm_quit", { stopGpu });
@@ -101,13 +105,15 @@ export const importReferenceBytes = (base64: string, mime: string) =>
   call<ImportedReference>("import_reference_bytes", { base64, mime });
 /** With `initImageId` (img2img), the output size follows the start image; `aspectRatio` is still required but ignored. */
 export const generate = (input: GenerateInput) => callObj<{ jobId: string }>("generate", input);
+/** Video job (spec v5); starts the video GPU when stopped. Progress arrives as `job-update` with kind "video". */
+export const generateVideo = (input: GenerateVideoInput) => callObj<{ jobId: string }>("generate_video", input);
 export const cancelJob = (jobId: string) => call<void>("cancel_job", { jobId });
 /** Active jobs, for restoring job cards on app start. */
 export const listJobs = () => call<Job[]>("list_jobs");
 export const listImages = (input: { limit?: number; before?: number | null }) =>
   callObj<ImagePage>("list_images", input.before == null ? { limit: input.limit } : input);
 export const deleteImage = (id: string) => call<void>("delete_image", { id });
-/** Copies the stored image file to `destPath` (chosen in the save dialog). */
+/** Copies the stored image (or video .mp4) file to `destPath` (chosen in the save dialog). */
 export const exportImage = (input: { id: string; destPath: string }) => callObj<void>("export_image", input);
 
 // ---------- Events ----------

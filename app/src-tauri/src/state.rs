@@ -89,6 +89,9 @@ pub struct Core {
     pub jobs: Mutex<HashMap<String, JobEntry>>,
     pub tasks: Mutex<HashMap<String, TaskEntry>>,
     pub refresh_lock: tokio::sync::Mutex<()>,
+    /// The video volume's refresh lock (a video refresh may wait for the
+    /// video GPU to start; it must not block image refreshes).
+    pub video_refresh_lock: tokio::sync::Mutex<()>,
     pub gpu: Gpu,
 }
 
@@ -100,7 +103,7 @@ impl Core {
         sink: Arc<dyn EventSink>,
         cfg: CoreConfig,
     ) -> Result<Arc<Core>, String> {
-        for d in [cfg.images_dir(), cfg.references_dir()] {
+        for d in [cfg.images_dir(), cfg.references_dir(), cfg.videos_dir()] {
             std::fs::create_dir_all(&d)
                 .map_err(|e| format!("Could not create {}: {e}", d.display()))?;
         }
@@ -115,6 +118,7 @@ impl Core {
             jobs: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
+            video_refresh_lock: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -145,6 +149,10 @@ impl CoreConfig {
     }
     pub fn references_dir(&self) -> PathBuf {
         self.data_dir.join("references")
+    }
+    /// Video files (.mp4) and their posters (spec v5).
+    pub fn videos_dir(&self) -> PathBuf {
+        self.data_dir.join("videos")
     }
 }
 

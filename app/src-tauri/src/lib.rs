@@ -62,7 +62,7 @@ fn build_core(app: &tauri::App) -> Result<Arc<state::Core>, String> {
 }
 
 /// True when quitting now must be confirmed: not yet confirmed, and a GPU
-/// pod is starting, running, stopping, or in error with a pod.
+/// pod of ANY profile is starting, running, stopping, or in error with a pod.
 fn must_confirm_quit<R: Runtime>(app: &AppHandle<R>) -> bool {
     if app.state::<QuitGuard>().confirmed() {
         return false;
@@ -79,14 +79,15 @@ fn ask_quit<R: Runtime>(app: &AppHandle<R>) {
         let _ = w.show();
         let _ = w.set_focus();
         let core = app.state::<Arc<state::Core>>();
-        let _ = app.emit(EVENT_QUIT_REQUESTED, pod::state(&core));
+        // Every profile's state; the dialog lists the ones not stopped.
+        let _ = app.emit(EVENT_QUIT_REQUESTED, pod::states(&core));
         return;
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let core = app.state::<Arc<state::Core>>().inner().clone();
         if let Err(e) = pod::stop_for_quit(&core).await {
-            eprintln!("[quit] could not stop the GPU pod before quitting: {e}");
+            eprintln!("[quit] could not stop every GPU pod before quitting: {e}");
         }
         app.state::<QuitGuard>().0.store(true, std::sync::atomic::Ordering::SeqCst);
         app.exit(0);
@@ -158,25 +159,28 @@ pub fn run() {
                 pod::run_monitor(pod_core, std::time::Duration::from_secs(30)).await
             });
             tauri::async_runtime::spawn(async move {
-                if core.settings.backend() == settings::Backend::Pod {
-                    if let Ok(rest) = pod::rest(&core) {
-                        if let Err(e) = pod::lookup_volume(&core, &rest).await {
-                            eprintln!("[startup] volume lookup failed: {e}");
+                if let Ok(rest) = pod::rest(&core) {
+                    // Every profile: re-adopt a pod left running (by its own
+                    // exact name), whatever the backend: adopting never creates
+                    // a pod, and an adopted idle pod is auto-stopped.
+                    for p in pod::Profile::ALL {
+                        if let Err(e) = pod::lookup_volume_for(&core, &rest, p).await {
+                            eprintln!("[startup] {} volume lookup failed: {e}", p.as_str());
                         }
-                        if let Err(e) = pod::adopt(&core).await {
-                            eprintln!("[startup] pod adopt failed: {e}");
+                        if let Err(e) = pod::adopt_for(&core, p).await {
+                            eprintln!("[startup] {} pod adopt failed: {e}", p.as_str());
                         }
-                        // Let an adopted pod finish its readiness check.
-                        let mut rx = pod::subscribe(&core);
-                        let _ = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-                            while pod::state(&core).status == pod::GpuStatus::Starting {
-                                if rx.changed().await.is_err() {
-                                    break;
-                                }
-                            }
-                        })
-                        .await;
                     }
+                    // Let an adopted image pod finish its readiness check.
+                    let mut rx = pod::subscribe(&core);
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                        while pod::state(&core).status == pod::GpuStatus::Starting {
+                            if rx.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    })
+                    .await;
                 }
                 // Refresh the status cache on start only if it is older than
                 // 24 h — and never start the GPU just for that.
@@ -203,6 +207,7 @@ pub fn run() {
             commands::save_settings,
             commands::test_connection,
             commands::get_gpu_state,
+            commands::list_gpu_states,
             commands::start_gpu,
             commands::stop_gpu,
             commands::confirm_quit,
@@ -220,6 +225,7 @@ pub fn run() {
             commands::import_reference,
             commands::import_reference_bytes,
             commands::generate,
+            commands::generate_video,
             commands::cancel_job,
             commands::list_jobs,
             commands::list_images,

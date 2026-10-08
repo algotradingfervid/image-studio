@@ -4,7 +4,8 @@
 //! - start: `POST /v2/pods` (CreatePodRequest), then poll `GET /v2/pods/{id}`
 //!   and the pod server (`/ping`, `/health`) until ComfyUI is ready
 //! - stop: `DELETE /v2/pods/{id}` (terminate), then poll until it is gone
-//! - adopt: on launch, `GET /v2/pods` and re-adopt a pod named `image-studio-gpu`
+//! - adopt: on launch, `GET /v2/pods` and re-adopt a pod named after the
+//!   profile (`image-studio-gpu` / `image-studio-video-gpu`)
 //! - idle: app-side auto-stop after `idleMinutes` without jobs or tasks, and
 //!   from the Error state (after 2 min when a start or stop failed)
 //!
@@ -14,12 +15,19 @@
 //! Before creating, and after an ambiguous create error, pods are looked up
 //! by name so a pod that was created anyway is adopted, never duplicated.
 //!
-//! State changes are emitted as `gpu-update`. Secrets are never logged.
+//! Profiles (spec v5): `image` and `video` are independent pods, each with its
+//! own state, epoch, idle timer, stored pod id, volume list and GPU list, and
+//! the full safety logic above. Pods are matched by EXACT name, so one
+//! profile never adopts, stops or terminates the other's pod. The video
+//! profile refuses to start in `US-*` / `EU-*` datacenters (licence).
+//!
+//! State changes are emitted as `gpu-update` (with `profile`). Secrets are
+//! never logged.
 
 use crate::runpod::RunpodClient;
 use crate::state::Core;
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,6 +36,11 @@ use tokio::sync::watch;
 pub const DEFAULT_REST_ROOT: &str = "https://api.runpod.io";
 pub const DEFAULT_PROXY_TEMPLATE: &str = "https://{podId}-8000.proxy.runpod.net";
 pub const POD_NAME: &str = "image-studio-gpu";
+/// The video profile's pod (spec v5).
+pub const VIDEO_POD_NAME: &str = "image-studio-video-gpu";
+/// Datacenter id prefixes the video profile must never run in (MiniMax H3
+/// licence: excluded territories EU/UK/KR/US).
+pub const VIDEO_EXCLUDED_DC_PREFIXES: [&str; 2] = ["US-", "EU-"];
 /// Default pod image (spec "v4"): the slim runtime image. Its boot script
 /// fetches the worker code from GitHub at `WORKER_REF` on every start.
 /// Overridable with the `podImage` config key (`Settings::pod_image`).
@@ -38,6 +51,7 @@ pub const LEGACY_POD_IMAGE: &str = "ghcr.io/algotradingfervid/image-studio-worke
 pub const VOLUME_PATH: &str = "/runpod-volume";
 /// Display fallback before a pod reports its GPU (first default priority).
 pub const GPU_TYPE: &str = crate::settings::DEFAULT_GPU_TYPES[0];
+pub const VIDEO_GPU_TYPE: &str = crate::settings::DEFAULT_VIDEO_GPU_TYPES[0];
 pub const CONTAINER_DISK_GB: u32 = 20;
 pub const FALLBACK_COST_PER_HR: f64 = 2.49;
 pub const HF_SECRET_REF: &str = "{{ RUNPOD_SECRET_image-studio-hf-token }}";
@@ -56,9 +70,90 @@ pub const PHASE_MACHINE: &str = "Waiting for machine";
 pub const PHASE_PULLING: &str = "Pulling image";
 pub const PHASE_BOOTING: &str = "Booting ComfyUI";
 
-/// SQLite `settings` keys.
+/// SQLite `settings` keys (image profile; the video profile has its own).
 pub const DB_POD_ID: &str = "gpu_pod_id";
 pub const DB_VOLUME_SIZE_GB: &str = "gpu_volume_size_gb";
+pub const DB_VIDEO_POD_ID: &str = "video_gpu_pod_id";
+pub const DB_VIDEO_VOLUME_SIZE_GB: &str = "video_gpu_volume_size_gb";
+
+/// A GPU pod profile (spec v5).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Profile {
+    #[default]
+    Image,
+    Video,
+}
+
+impl Profile {
+    pub const ALL: [Profile; 2] = [Profile::Image, Profile::Video];
+
+    /// Pod name; pods are matched by this exact name.
+    pub fn pod_name(self) -> &'static str {
+        match self {
+            Profile::Image => POD_NAME,
+            Profile::Video => VIDEO_POD_NAME,
+        }
+    }
+
+    pub fn db_pod_id(self) -> &'static str {
+        match self {
+            Profile::Image => DB_POD_ID,
+            Profile::Video => DB_VIDEO_POD_ID,
+        }
+    }
+
+    pub fn db_volume_size(self) -> &'static str {
+        match self {
+            Profile::Image => DB_VOLUME_SIZE_GB,
+            Profile::Video => DB_VIDEO_VOLUME_SIZE_GB,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Profile::Image => "image",
+            Profile::Video => "video",
+        }
+    }
+
+    fn default_gpu(self) -> &'static str {
+        match self {
+            Profile::Image => GPU_TYPE,
+            Profile::Video => VIDEO_GPU_TYPE,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Profile::Image => 0,
+            Profile::Video => 1,
+        }
+    }
+
+    /// Command argument: absent → `image` (backward compatible).
+    pub fn parse(s: Option<&str>) -> Result<Profile, String> {
+        match s.map(str::trim) {
+            None | Some("") | Some("image") => Ok(Profile::Image),
+            Some("video") => Ok(Profile::Video),
+            Some(o) => Err(format!("Unknown GPU profile \"{o}\" (use image or video)")),
+        }
+    }
+}
+
+/// The video profile must not run where the H3 licence excludes it.
+pub fn check_datacenter(p: Profile, data_center: &str) -> Result<(), String> {
+    if p == Profile::Video
+        && VIDEO_EXCLUDED_DC_PREFIXES
+            .iter()
+            .any(|x| data_center.to_ascii_uppercase().starts_with(x))
+    {
+        return Err(format!(
+            "The video GPU can't run in {data_center}: the MiniMax H3 licence excludes the EU, UK, South Korea and the USA. Use the Canada volume (image-studio-video in CA-MTL-3) — check videoVolumeNames in the settings file."
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -85,6 +180,7 @@ pub enum StopReason {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct GpuState {
+    pub profile: Profile,
     pub status: GpuStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pod_id: Option<String>,
@@ -110,7 +206,12 @@ pub struct GpuState {
 
 impl GpuState {
     pub fn stopped(idle_minutes: u32) -> GpuState {
+        GpuState::stopped_for(Profile::Image, idle_minutes)
+    }
+
+    pub fn stopped_for(profile: Profile, idle_minutes: u32) -> GpuState {
         GpuState {
+            profile,
             status: GpuStatus::Stopped,
             pod_id: None,
             gpu_type: None,
@@ -137,6 +238,10 @@ struct Inner {
     /// The Error came from a failed start or stop: auto-stop any pod after
     /// `ERROR_AUTO_STOP_SECS` rather than `idleMinutes`.
     urgent: bool,
+    /// The startup adopt has listed RunPod's pods at least once this session.
+    /// Until it has, the monitor retries it so a pod left running by a
+    /// previous session is never forgotten after a failed first lookup.
+    adopted: bool,
 }
 
 impl Inner {
@@ -152,27 +257,46 @@ impl Inner {
     }
 }
 
-/// GPU pod state held by `Core`.
-pub struct Gpu {
+/// One profile's pod state.
+struct Slot {
     inner: Mutex<Inner>,
     tx: watch::Sender<GpuState>,
 }
 
+/// GPU pod state held by `Core`: one independent slot per profile.
+pub struct Gpu {
+    slots: [Slot; 2],
+}
+
 impl Gpu {
     pub fn new(idle_minutes: u32, now: DateTime<Utc>) -> Gpu {
-        let s = GpuState::stopped(idle_minutes);
-        let (tx, _) = watch::channel(s.clone());
+        let slot = |p: Profile| {
+            let s = GpuState::stopped_for(p, idle_minutes);
+            let (tx, _) = watch::channel(s.clone());
+            Slot {
+                inner: Mutex::new(Inner {
+                    state: s,
+                    epoch: 0,
+                    last_active: now,
+                    error_since: None,
+                    urgent: false,
+                    adopted: false,
+                }),
+                tx,
+            }
+        };
         Gpu {
-            inner: Mutex::new(Inner {
-                state: s,
-                epoch: 0,
-                last_active: now,
-                error_since: None,
-                urgent: false,
-            }),
-            tx,
+            slots: [slot(Profile::Image), slot(Profile::Video)],
         }
     }
+
+    fn slot(&self, p: Profile) -> &Slot {
+        &self.slots[p.index()]
+    }
+}
+
+fn inner(core: &Core, p: Profile) -> std::sync::MutexGuard<'_, Inner> {
+    core.gpu.slot(p).inner.lock().unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -280,13 +404,13 @@ impl RestClient {
             .unwrap_or_default())
     }
 
-    /// Pods named `POD_NAME` that are not TERMINATED.
-    pub async fn find_named_pods(&self) -> Result<Vec<Value>, RestError> {
+    /// Pods named exactly `name` that are not TERMINATED.
+    pub async fn find_named_pods(&self, name: &str) -> Result<Vec<Value>, RestError> {
         Ok(self
             .list_pods()
             .await?
             .into_iter()
-            .filter(|p| pod_str(p, "name") == Some(POD_NAME))
+            .filter(|p| pod_str(p, "name") == Some(name))
             .filter(|p| pod_str(p, "status") != Some("TERMINATED"))
             .collect())
     }
@@ -352,7 +476,9 @@ impl RestClient {
 /// self-terminate watchdog (RunPod injects its own `RUNPOD_API_KEY`).
 /// `image` is `Settings::pod_image`; `worker_ref` (`WORKER_REF`) is the git
 /// ref the runtime image's boot script fetches the worker code from.
-pub fn create_payload(
+#[allow(clippy::too_many_arguments)]
+pub fn create_payload_for(
+    p: Profile,
     vol: &VolumeInfo,
     gpu_type: &str,
     token: &str,
@@ -372,7 +498,7 @@ pub fn create_payload(
         env.insert("RUNPOD_TERMINATE_API_KEY".into(), json!(k));
     }
     json!({
-        "name": POD_NAME,
+        "name": p.pod_name(),
         "image": image,
         "cloud": "SECURE",
         "gpu": {"id": gpu_type, "count": 1},
@@ -382,6 +508,28 @@ pub fn create_payload(
         "ports": ["8000/http"],
         "env": env,
     })
+}
+
+/// Image-profile payload (see `create_payload_for`).
+pub fn create_payload(
+    vol: &VolumeInfo,
+    gpu_type: &str,
+    token: &str,
+    idle_minutes: u32,
+    api_key: Option<&str>,
+    image: &str,
+    worker_ref: &str,
+) -> Value {
+    create_payload_for(
+        Profile::Image,
+        vol,
+        gpu_type,
+        token,
+        idle_minutes,
+        api_key,
+        image,
+        worker_ref,
+    )
 }
 
 pub fn proxy_base(template: &str, pod_id: &str) -> String {
@@ -396,9 +544,9 @@ fn is_live(pod: &Value) -> bool {
     pod_str(pod, "status").is_some_and(|s| LIVE_STATUSES.contains(&s))
 }
 
-/// Pods named `POD_NAME` that are not TERMINATED (`GET /v2/pods`).
-pub async fn find_named_pods(rest: &RestClient) -> Result<Vec<Value>, RestError> {
-    rest.find_named_pods().await
+/// Pods named exactly after profile `p` that are not TERMINATED (`GET /v2/pods`).
+pub async fn find_named_pods(rest: &RestClient, p: Profile) -> Result<Vec<Value>, RestError> {
+    rest.find_named_pods(p.pod_name()).await
 }
 
 fn pod_cost(pod: &Value) -> Option<f64> {
@@ -421,65 +569,86 @@ fn pod_started(pod: &Value) -> Option<String> {
 // ---------------------------------------------------------------------------
 // State
 
+/// Image-profile state (backward compatible).
 pub fn state(core: &Core) -> GpuState {
-    let mut s = core.gpu.inner.lock().unwrap().state.clone();
+    state_for(core, Profile::Image)
+}
+
+pub fn state_for(core: &Core, p: Profile) -> GpuState {
+    let mut s = inner(core, p).state.clone();
     s.idle_minutes = core.settings.idle_minutes();
+    s.profile = p;
     s
 }
 
-pub fn subscribe(core: &Core) -> watch::Receiver<GpuState> {
-    core.gpu.tx.subscribe()
+/// Every profile's state, in `Profile::ALL` order.
+pub fn states(core: &Core) -> Vec<GpuState> {
+    Profile::ALL.iter().map(|p| state_for(core, *p)).collect()
 }
 
-fn emit(core: &Core, s: &GpuState) {
-    core.gpu.tx.send_replace(s.clone());
+pub fn subscribe(core: &Core) -> watch::Receiver<GpuState> {
+    subscribe_for(core, Profile::Image)
+}
+
+pub fn subscribe_for(core: &Core, p: Profile) -> watch::Receiver<GpuState> {
+    core.gpu.slot(p).tx.subscribe()
+}
+
+fn emit(core: &Core, p: Profile, s: &GpuState) {
+    core.gpu.slot(p).tx.send_replace(s.clone());
     core.sink.gpu_update(s);
 }
 
 /// Apply `f` to the state (only while `epoch` is current, if given) and emit
 /// on change. Returns false when the epoch is stale.
-fn set_state(core: &Core, epoch: Option<u64>, f: impl FnOnce(&mut GpuState)) -> bool {
+fn set_state(core: &Core, p: Profile, epoch: Option<u64>, f: impl FnOnce(&mut GpuState)) -> bool {
     let now = (core.cfg.clock)();
     let changed = {
-        let mut g = core.gpu.inner.lock().unwrap();
+        let mut g = inner(core, p);
         if epoch.is_some_and(|e| e != g.epoch) {
             return false;
         }
         let before = g.state.clone();
         f(&mut g.state);
         g.state.idle_minutes = core.settings.idle_minutes();
+        g.state.profile = p;
         g.track_error(before.status, now);
         (g.state != before).then(|| g.state.clone())
     };
     if let Some(s) = changed {
-        emit(core, &s);
+        emit(core, p, &s);
     }
     true
 }
 
-fn is_current(core: &Core, epoch: u64) -> bool {
-    core.gpu.inner.lock().unwrap().epoch == epoch
+fn is_current(core: &Core, p: Profile, epoch: u64) -> bool {
+    inner(core, p).epoch == epoch
 }
 
-/// Record GPU activity (resets the idle timer).
+/// Record image-GPU activity (resets the idle timer).
 pub fn touch(core: &Core) {
-    let now = (core.cfg.clock)();
-    core.gpu.inner.lock().unwrap().last_active = now;
+    touch_for(core, Profile::Image)
 }
 
-fn persist_pod_id(core: &Core, id: Option<&str>) {
+/// Record GPU activity for profile `p` (resets its idle timer).
+pub fn touch_for(core: &Core, p: Profile) {
+    let now = (core.cfg.clock)();
+    inner(core, p).last_active = now;
+}
+
+fn persist_pod_id(core: &Core, p: Profile, id: Option<&str>) {
     let db = core.db.lock().unwrap();
-    let r = db.set_setting(DB_POD_ID, id.unwrap_or(""));
+    let r = db.set_setting(p.db_pod_id(), id.unwrap_or(""));
     if let Err(e) = r {
-        eprintln!("[pod] could not persist the pod id: {e}");
+        eprintln!("[pod:{}] could not persist the pod id: {e}", p.as_str());
     }
 }
 
-fn stored_pod_id(core: &Core) -> Option<String> {
+fn stored_pod_id(core: &Core, p: Profile) -> Option<String> {
     core.db
         .lock()
         .unwrap()
-        .get_setting(DB_POD_ID)
+        .get_setting(p.db_pod_id())
         .ok()
         .flatten()
         .filter(|s| !s.is_empty())
@@ -506,24 +675,33 @@ pub fn pod_client(core: &Core, pod_id: &str) -> Result<RunpodClient, String> {
     ))
 }
 
-/// Looks up the volume and caches its size (for the Models screen usage).
+/// Looks up the image volume and caches its size (for the Models screen usage).
 pub async fn lookup_volume(core: &Core, rest: &RestClient) -> Result<VolumeInfo, String> {
-    let vol = rest.find_volume(&core.settings.volume_names()).await?;
+    lookup_volume_for(core, rest, Profile::Image).await
+}
+
+/// Looks up profile `p`'s volume (its own name list) and caches its size.
+pub async fn lookup_volume_for(core: &Core, rest: &RestClient, p: Profile) -> Result<VolumeInfo, String> {
+    let vol = rest.find_volume(&core.settings.volume_names_for(p)).await?;
     if vol.size_gb > 0 {
         let _ = core
             .db
             .lock()
             .unwrap()
-            .set_setting(DB_VOLUME_SIZE_GB, &vol.size_gb.to_string());
+            .set_setting(p.db_volume_size(), &vol.size_gb.to_string());
     }
     Ok(vol)
 }
 
 pub fn cached_volume_size_gb(core: &Core) -> Option<u64> {
+    cached_volume_size_gb_for(core, Profile::Image)
+}
+
+pub fn cached_volume_size_gb_for(core: &Core, p: Profile) -> Option<u64> {
     core.db
         .lock()
         .unwrap()
-        .get_setting(DB_VOLUME_SIZE_GB)
+        .get_setting(p.db_volume_size())
         .ok()
         .flatten()
         .and_then(|s| s.parse().ok())
@@ -539,8 +717,8 @@ fn cleanup_failed_msg(detail: &str) -> String {
 
 /// Marks the current Error as coming from a failed start/stop, so the
 /// monitor stops any pod after `ERROR_AUTO_STOP_SECS`.
-fn mark_urgent(core: &Core) {
-    let mut g = core.gpu.inner.lock().unwrap();
+fn mark_urgent(core: &Core, p: Profile) {
+    let mut g = inner(core, p);
     if g.state.status == GpuStatus::Error {
         g.urgent = true;
     }
@@ -548,36 +726,36 @@ fn mark_urgent(core: &Core) {
 
 /// A pod may still be billing: show Error with `id` tracked and persisted.
 /// Applied regardless of the epoch, so a concurrent Stop can never hide it.
-fn fail_with_pod(core: &Core, id: &str, msg: &str) {
-    persist_pod_id(core, Some(id));
-    set_state(core, None, |s| {
+fn fail_with_pod(core: &Core, p: Profile, id: &str, msg: &str) {
+    persist_pod_id(core, p, Some(id));
+    set_state(core, p, None, |s| {
         s.status = GpuStatus::Error;
         s.phase = None;
         s.pod_id = Some(id.to_string());
         s.error = Some(msg.to_string());
     });
-    mark_urgent(core);
+    mark_urgent(core, p);
 }
 
 /// A start (or adopt) loop failed: Error for this epoch.
-fn fail_start(core: &Core, epoch: u64, msg: String) {
-    eprintln!("[pod] start failed: {msg}");
-    let applied = set_state(core, Some(epoch), |s| {
+fn fail_start(core: &Core, p: Profile, epoch: u64, msg: String) {
+    eprintln!("[pod:{}] start failed: {msg}", p.as_str());
+    let applied = set_state(core, p, Some(epoch), |s| {
         s.status = GpuStatus::Error;
         s.phase = None;
         s.error = Some(msg);
     });
     if applied {
-        mark_urgent(core);
+        mark_urgent(core, p);
     }
 }
 
 /// `id` is confirmed gone: stop tracking it.
-fn forget_pod(core: &Core, epoch: Option<u64>, id: &str) {
-    if stored_pod_id(core).as_deref() == Some(id) {
-        persist_pod_id(core, None);
+fn forget_pod(core: &Core, p: Profile, epoch: Option<u64>, id: &str) {
+    if stored_pod_id(core, p).as_deref() == Some(id) {
+        persist_pod_id(core, p, None);
     }
-    set_state(core, epoch, |s| {
+    set_state(core, p, epoch, |s| {
         if s.pod_id.as_deref() == Some(id) {
             s.pod_id = None;
         }
@@ -590,13 +768,18 @@ fn forget_pod(core: &Core, epoch: Option<u64>, id: &str) {
 /// Starts the pod in the background (no-op when starting or running) and
 /// returns the new state. Progress arrives as `gpu-update` events.
 pub fn start(core: &Arc<Core>) -> Result<GpuState, String> {
+    start_for(core, Profile::Image)
+}
+
+/// `start` for profile `p`.
+pub fn start_for(core: &Arc<Core>, p: Profile) -> Result<GpuState, String> {
     rest(core)?; // fail fast without an API key
     let (epoch, prev_pod) = {
-        let mut g = core.gpu.inner.lock().unwrap();
+        let mut g = inner(core, p);
         match g.state.status {
             GpuStatus::Running | GpuStatus::Starting => {
                 drop(g);
-                return Ok(state(core));
+                return Ok(state_for(core, p));
             }
             GpuStatus::Stopping => {
                 return Err("The GPU is still stopping; try again in a moment".into())
@@ -607,57 +790,68 @@ pub fn start(core: &Arc<Core>) -> Result<GpuState, String> {
         let prev = g.state.pod_id.clone();
         (g.epoch, prev)
     };
-    let prev_pod = prev_pod.or_else(|| stored_pod_id(core));
-    set_state(core, Some(epoch), |s| {
+    let prev_pod = prev_pod.or_else(|| stored_pod_id(core, p));
+    set_state(core, p, Some(epoch), |s| {
         *s = GpuState {
             status: GpuStatus::Starting,
             pod_id: prev_pod.clone(),
             phase: Some(PHASE_CREATING.into()),
-            ..GpuState::stopped(0)
+            ..GpuState::stopped_for(p, 0)
         };
     });
     let core2 = core.clone();
     tokio::spawn(async move {
-        if let Err(e) = start_inner(&core2, epoch, prev_pod).await {
-            fail_start(&core2, epoch, e);
+        if let Err(e) = start_inner(&core2, p, epoch, prev_pod).await {
+            fail_start(&core2, p, epoch, e);
         }
     });
-    Ok(state(core))
+    Ok(state_for(core, p))
 }
 
-async fn start_inner(core: &Arc<Core>, epoch: u64, prev_pod: Option<String>) -> Result<(), String> {
+async fn start_inner(
+    core: &Arc<Core>,
+    p: Profile,
+    epoch: u64,
+    prev_pod: Option<String>,
+) -> Result<(), String> {
     let rest = rest(core)?;
+    if p == Profile::Video {
+        // Licence guard before touching any pod: never place video in an
+        // excluded territory.
+        let vol = lookup_volume_for(core, &rest, p).await?;
+        check_datacenter(p, &vol.data_center)?;
+    }
     // A pod left from an earlier error: reuse it if it is still coming up,
     // otherwise terminate it (confirmed) before creating a fresh one.
     let mut pod_id = None;
     if let Some(id) = prev_pod {
         match rest.get_pod(&id).await {
-            Ok(p) if is_live(&p) => pod_id = Some(id),
+            Ok(pod) if is_live(&pod) => pod_id = Some(id),
             Ok(_) => {
                 if let Err(e) = terminate(core, &id).await {
                     let msg = cleanup_failed_msg(&e);
-                    fail_with_pod(core, &id, &msg);
+                    fail_with_pod(core, p, &id, &msg);
                     return Err(msg);
                 }
-                forget_pod(core, Some(epoch), &id);
+                forget_pod(core, p, Some(epoch), &id);
             }
-            Err(e) if e.not_found() => forget_pod(core, Some(epoch), &id),
+            Err(e) if e.not_found() => forget_pod(core, p, Some(epoch), &id),
             Err(e) => return Err(e.message),
         }
     }
-    // A pod named POD_NAME may exist that the app lost track of (e.g. an
-    // ambiguous create): adopt it instead of creating a duplicate.
+    // A pod with this profile's name may exist that the app lost track of
+    // (e.g. an ambiguous create): adopt it instead of creating a duplicate.
     if pod_id.is_none() {
-        pod_id = claim_named_pod(core, &rest, epoch).await?;
+        pod_id = claim_named_pod(core, p, &rest, epoch).await?;
     }
     let pod_id = match pod_id {
         Some(id) => id,
-        None => create_pod(core, &rest, epoch).await?,
+        None => create_pod(core, p, &rest, epoch).await?,
     };
-    if !is_current(core, epoch) {
+    if !is_current(core, p, epoch) {
         return Ok(());
     }
-    wait_ready(core, &rest, epoch, &pod_id).await
+    wait_ready(core, p, &rest, epoch, &pod_id).await
 }
 
 /// Before creating: terminates (confirmed) every named pod that is not
@@ -665,49 +859,51 @@ async fn start_inner(core: &Arc<Core>, epoch: u64, prev_pod: Option<String>) -> 
 /// (the stored id first). Returns the adopted id.
 async fn claim_named_pod(
     core: &Arc<Core>,
+    p: Profile,
     rest: &RestClient,
     epoch: u64,
 ) -> Result<Option<String>, String> {
-    let pods = find_named_pods(rest)
+    let name = p.pod_name();
+    let pods = find_named_pods(rest, p)
         .await
         .map_err(|e| format!("Could not check for an existing GPU pod: {}", e.message))?;
-    let stored = stored_pod_id(core);
-    let (mut live, dead): (Vec<&Value>, Vec<&Value>) = pods.iter().partition(|p| is_live(p));
-    live.sort_by_key(|p| pod_str(p, "id") != stored.as_deref()); // stored id first
+    let stored = stored_pod_id(core, p);
+    let (mut live, dead): (Vec<&Value>, Vec<&Value>) = pods.iter().partition(|x| is_live(x));
+    live.sort_by_key(|x| pod_str(x, "id") != stored.as_deref()); // stored id first
     let keep = live.first().copied();
     let extra = live.iter().skip(1).copied();
-    for p in dead.into_iter().chain(extra) {
-        let Some(id) = pod_str(p, "id") else { continue };
+    for x in dead.into_iter().chain(extra) {
+        let Some(id) = pod_str(x, "id") else { continue };
         eprintln!(
-            "[pod] terminating leftover {POD_NAME} pod {id} ({})",
-            pod_str(p, "status").unwrap_or("unknown")
+            "[pod] terminating leftover {name} pod {id} ({})",
+            pod_str(x, "status").unwrap_or("unknown")
         );
         if let Err(e) = terminate(core, id).await {
             let msg = cleanup_failed_msg(&e);
-            fail_with_pod(core, id, &msg);
+            fail_with_pod(core, p, id, &msg);
             return Err(msg);
         }
-        forget_pod(core, Some(epoch), id);
+        forget_pod(core, p, Some(epoch), id);
     }
     let Some(pod) = keep else { return Ok(None) };
     let Some(id) = pod_str(pod, "id") else {
         return Ok(None);
     };
-    eprintln!("[pod] adopting existing {POD_NAME} pod {id} instead of creating one");
-    track_pod(core, epoch, pod, None);
+    eprintln!("[pod] adopting existing {name} pod {id} instead of creating one");
+    track_pod(core, p, epoch, pod, None);
     Ok(Some(id.to_string()))
 }
 
 /// Records `pod` as the current pod (persisted id, cost, GPU, start time).
-fn track_pod(core: &Core, epoch: u64, pod: &Value, placed_gpu: Option<&str>) {
+fn track_pod(core: &Core, p: Profile, epoch: u64, pod: &Value, placed_gpu: Option<&str>) {
     let id = pod_str(pod, "id").unwrap_or("").to_string();
-    persist_pod_id(core, Some(&id));
-    set_state(core, Some(epoch), |s| {
+    persist_pod_id(core, p, Some(&id));
+    set_state(core, p, Some(epoch), |s| {
         s.pod_id = Some(id.clone());
         s.cost_per_hr = pod_cost(pod).or(Some(FALLBACK_COST_PER_HR));
         s.gpu_type = pod_gpu(pod)
             .or(placed_gpu.map(str::to_string))
-            .or(Some(GPU_TYPE.into()));
+            .or(Some(p.default_gpu().into()));
         s.started_at = pod_started(pod).or_else(|| Some(now_str(core)));
         s.phase = Some(PHASE_MACHINE.into());
     });
@@ -715,12 +911,13 @@ fn track_pod(core: &Core, epoch: u64, pod: &Value, placed_gpu: Option<&str>) {
 
 /// Creates the pod (GPU fallback). After an ambiguous error the pod may
 /// exist anyway, so the pods are re-listed by name and a new one adopted.
-async fn create_pod(core: &Arc<Core>, rest: &RestClient, epoch: u64) -> Result<String, String> {
-    let vol = lookup_volume(core, rest).await?;
+async fn create_pod(core: &Arc<Core>, p: Profile, rest: &RestClient, epoch: u64) -> Result<String, String> {
+    let vol = lookup_volume_for(core, rest, p).await?;
+    check_datacenter(p, &vol.data_center)?; // never create where the licence forbids
     let token = core.settings.pod_token()?;
     let key = core.settings.runpod_api_key();
     let key = key.as_deref().filter(|_| core.settings.pass_api_key_to_pod());
-    let (pod, placed_gpu) = match create_with_fallback(core, rest, &vol, &token, key).await {
+    let (pod, placed_gpu) = match create_with_fallback(core, p, rest, &vol, &token, key).await {
         Ok(x) => x,
         Err(CreateError {
             message,
@@ -733,21 +930,21 @@ async fn create_pod(core: &Arc<Core>, rest: &RestClient, epoch: u64) -> Result<S
             gpu,
         }) => {
             eprintln!("[pod] create failed ambiguously; checking whether the pod exists: {message}");
-            match find_created_pod(core, rest).await {
+            match find_created_pod(core, p, rest).await {
                 Some(pod) => (pod, gpu),
-                None if !is_current(core, epoch) => {
+                None if !is_current(core, p, epoch) => {
                     // Stopped meanwhile: don't let a pod that shows up later
                     // go unnoticed behind "Stopped" — Error (urgent) makes the
                     // monitor look for it by name and stop it.
                     let msg = format!(
                         "RunPod didn't confirm whether the GPU pod was created ({message}). If one appears, the app stops it automatically; you can also press Stop."
                     );
-                    set_state(core, None, |s| {
+                    set_state(core, p, None, |s| {
                         s.status = GpuStatus::Error;
                         s.phase = None;
                         s.error = Some(msg.clone());
                     });
-                    mark_urgent(core);
+                    mark_urgent(core, p);
                     return Err(msg);
                 }
                 None => return Err(message),
@@ -755,36 +952,36 @@ async fn create_pod(core: &Arc<Core>, rest: &RestClient, epoch: u64) -> Result<S
         }
     };
     let id = pod_str(&pod, "id").unwrap_or("").to_string();
-    if !is_current(core, epoch) {
+    if !is_current(core, p, epoch) {
         // Stopped (or restarted) while the create was in flight: clean up,
         // unless a newer start already adopted this very pod.
-        if state(core).pod_id.as_deref() != Some(id.as_str()) {
+        if state_for(core, p).pod_id.as_deref() != Some(id.as_str()) {
             if let Err(e) = terminate(core, &id).await {
                 let msg = cleanup_failed_msg(&e);
-                fail_with_pod(core, &id, &msg);
+                fail_with_pod(core, p, &id, &msg);
                 return Err(msg);
             }
-            forget_pod(core, None, &id);
+            forget_pod(core, p, None, &id);
         }
         return Err("superseded by a newer start/stop".into()); // not shown: the epoch moved on
     }
-    track_pod(core, epoch, &pod, Some(&placed_gpu));
+    track_pod(core, p, epoch, &pod, Some(&placed_gpu));
     Ok(id)
 }
 
 /// After an ambiguous create: lists the pods up to 3 times,
 /// `pod_poll_interval` apart (3 s in production), for a live named pod.
-async fn find_created_pod(core: &Core, rest: &RestClient) -> Option<Value> {
+async fn find_created_pod(core: &Core, p: Profile, rest: &RestClient) -> Option<Value> {
     for attempt in 1..=3 {
         tokio::time::sleep(core.cfg.pod_poll_interval).await;
-        match find_named_pods(rest).await {
+        match find_named_pods(rest, p).await {
             Ok(pods) => {
-                if let Some(p) = pods.into_iter().find(|p| is_live(p) && pod_str(p, "id").is_some()) {
+                if let Some(x) = pods.into_iter().find(|x| is_live(x) && pod_str(x, "id").is_some()) {
                     eprintln!(
                         "[pod] the pod was created despite the error; adopting {}",
-                        pod_str(&p, "id").unwrap_or("")
+                        pod_str(&x, "id").unwrap_or("")
                     );
-                    return Some(p);
+                    return Some(x);
                 }
             }
             Err(e) => eprintln!("[pod] listing pods failed (attempt {attempt}/3): {}", e.message),
@@ -807,18 +1004,20 @@ struct CreateError {
 /// is ambiguous.
 async fn create_with_fallback(
     core: &Core,
+    p: Profile,
     rest: &RestClient,
     vol: &VolumeInfo,
     token: &str,
     api_key: Option<&str>,
 ) -> Result<(Value, String), CreateError> {
-    let gpus = core.settings.gpu_types();
+    let gpus = core.settings.gpu_types_for(p);
     let image = core.settings.pod_image();
     let worker_ref = core.settings.worker_ref();
     eprintln!("[pod] image {image}, WORKER_REF {worker_ref}");
     let mut last = String::new();
     for gpu in &gpus {
-        let body = create_payload(
+        let body = create_payload_for(
+            p,
             vol,
             gpu,
             token,
@@ -865,7 +1064,13 @@ fn now_str(core: &Core) -> String {
 }
 
 /// Poll the pod until ComfyUI is ready, updating the phase.
-async fn wait_ready(core: &Arc<Core>, rest: &RestClient, epoch: u64, id: &str) -> Result<(), String> {
+async fn wait_ready(
+    core: &Arc<Core>,
+    p: Profile,
+    rest: &RestClient,
+    epoch: u64,
+    id: &str,
+) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + core.cfg.pod_start_timeout;
     let client = pod_client(core, id)?;
     let http = reqwest::Client::builder()
@@ -875,7 +1080,7 @@ async fn wait_ready(core: &Arc<Core>, rest: &RestClient, epoch: u64, id: &str) -
     let mut api_errors = 0;
     let mut phase = PHASE_MACHINE.to_string();
     loop {
-        if !is_current(core, epoch) {
+        if !is_current(core, p, epoch) {
             return Ok(());
         }
         match rest.get_pod(id).await {
@@ -896,9 +1101,9 @@ async fn wait_ready(core: &Arc<Core>, rest: &RestClient, epoch: u64, id: &str) -
                         } else {
                             match client.health().await {
                                 Ok(h) if h.ready == Some(true) => {
-                                    touch(core);
+                                    touch_for(core, p);
                                     let armed = h.watchdog.as_ref().and_then(|w| w.armed);
-                                    set_state(core, Some(epoch), |s| {
+                                    set_state(core, p, Some(epoch), |s| {
                                         s.status = GpuStatus::Running;
                                         s.phase = None;
                                         s.error = None;
@@ -929,16 +1134,16 @@ async fn wait_ready(core: &Arc<Core>, rest: &RestClient, epoch: u64, id: &str) -
                         let what = format!("The GPU pod stopped unexpectedly while starting (status {other}).");
                         if let Err(e) = terminate(core, id).await {
                             let msg = format!("{what} {}", cleanup_failed_msg(&e));
-                            fail_with_pod(core, id, &msg);
+                            fail_with_pod(core, p, id, &msg);
                             return Err(msg);
                         }
-                        forget_pod(core, Some(epoch), id);
+                        forget_pod(core, p, Some(epoch), id);
                         return Err(format!(
                             "{what} It was terminated; check the worker image, then try again."
                         ));
                     }
                 };
-                set_state(core, Some(epoch), |s| {
+                set_state(core, p, Some(epoch), |s| {
                     s.phase = Some(phase.clone());
                     if let Some(c) = pod_cost(&pod) {
                         s.cost_per_hr = Some(c);
@@ -949,7 +1154,7 @@ async fn wait_ready(core: &Arc<Core>, rest: &RestClient, epoch: u64, id: &str) -
                 });
             }
             Err(e) if e.not_found() => {
-                forget_pod(core, Some(epoch), id);
+                forget_pod(core, p, Some(epoch), id);
                 return Err("The GPU pod disappeared while starting (terminated outside the app?)".into());
             }
             Err(e) => {
@@ -965,10 +1170,10 @@ async fn wait_ready(core: &Arc<Core>, rest: &RestClient, epoch: u64, id: &str) -
             let what = format!("The GPU did not become ready within {mins} min (last phase: {phase}).");
             if let Err(e) = terminate(core, id).await {
                 let msg = format!("{what} {}", cleanup_failed_msg(&e));
-                fail_with_pod(core, id, &msg);
+                fail_with_pod(core, p, id, &msg);
                 return Err(msg);
             }
-            forget_pod(core, Some(epoch), id);
+            forget_pod(core, p, Some(epoch), id);
             return Err(format!(
                 "{what} The pod was terminated so it doesn't keep billing; try Start again."
             ));
@@ -980,35 +1185,47 @@ async fn wait_ready(core: &Arc<Core>, rest: &RestClient, epoch: u64, id: &str) -
 // ---------------------------------------------------------------------------
 // Stop
 
-/// Terminates every pod named `POD_NAME` plus the tracked/stored pod (even
-/// if named differently) and confirms each is gone. On any failure the GPU
-/// shows Error and keeps a remaining pod id.
+/// Stops the image profile (see `stop_for`).
 pub async fn stop(core: &Arc<Core>, reason: StopReason) -> Result<GpuState, String> {
-    let tracked = {
-        let mut g = core.gpu.inner.lock().unwrap();
+    stop_for(core, Profile::Image, reason).await
+}
+
+/// Terminates every pod named exactly after profile `p` plus that profile's
+/// tracked/stored pod (even if named differently) and confirms each is gone.
+/// On any failure the GPU shows Error and keeps a remaining pod id. The
+/// other profile's pod is never touched.
+pub async fn stop_for(core: &Arc<Core>, p: Profile, reason: StopReason) -> Result<GpuState, String> {
+    // Bump the epoch and show Stopping atomically, so a start that slips in
+    // between can never see the old status with the new epoch.
+    let now = (core.cfg.clock)();
+    let (tracked, stopping) = {
+        let mut g = inner(core, p);
         match g.state.status {
             GpuStatus::Stopped | GpuStatus::Stopping => {
                 drop(g);
-                return Ok(state(core));
+                return Ok(state_for(core, p));
             }
             _ => {}
         }
         g.epoch += 1;
-        g.state.pod_id.clone()
+        let before = g.state.status;
+        g.state.status = GpuStatus::Stopping;
+        g.state.phase = None;
+        g.state.error = None;
+        g.state.idle_minutes = core.settings.idle_minutes();
+        g.track_error(before, now);
+        (g.state.pod_id.clone(), g.state.clone())
     };
-    set_state(core, None, |s| {
-        s.status = GpuStatus::Stopping;
-        s.phase = None;
-        s.error = None;
-    });
-    let mut ids: Vec<String> = tracked.into_iter().chain(stored_pod_id(core)).collect();
+    emit(core, p, &stopping);
+    let mut ids: Vec<String> = tracked.into_iter().chain(stored_pod_id(core, p)).collect();
     let mut problems: Vec<String> = Vec::new();
     match rest(core) {
         Err(e) => problems.push(e),
-        Ok(rest) => match find_named_pods(&rest).await {
-            Ok(pods) => ids.extend(pods.iter().filter_map(|p| pod_str(p, "id")).map(str::to_string)),
+        Ok(rest) => match find_named_pods(&rest, p).await {
+            Ok(pods) => ids.extend(pods.iter().filter_map(|x| pod_str(x, "id")).map(str::to_string)),
             Err(e) => problems.push(format!(
-                "couldn't list the pods to find every {POD_NAME} pod: {}",
+                "couldn't list the pods to find every {} pod: {}",
+                p.pod_name(),
                 e.message
             )),
         },
@@ -1035,29 +1252,29 @@ pub async fn stop(core: &Arc<Core>, reason: StopReason) -> Result<GpuState, Stri
 
     if !problems.is_empty() {
         let keep = remaining.first().cloned();
-        persist_pod_id(core, keep.as_deref());
+        persist_pod_id(core, p, keep.as_deref());
         let msg = format!(
             "Couldn't stop the GPU pod{} — it may still be billing. Press Stop to try again. ({})",
             if remaining.len() > 1 { "s" } else { "" },
             problems.join("; ")
         );
-        set_state(core, None, |s| {
+        set_state(core, p, None, |s| {
             s.status = GpuStatus::Error;
             s.phase = None;
             s.pod_id = keep.clone();
             s.error = Some(msg.clone());
         });
-        mark_urgent(core);
+        mark_urgent(core, p);
         return Err(msg);
     }
-    persist_pod_id(core, None);
-    set_state(core, None, |s| {
+    persist_pod_id(core, p, None);
+    set_state(core, p, None, |s| {
         *s = GpuState {
             stop_reason: Some(reason),
-            ..GpuState::stopped(0)
+            ..GpuState::stopped_for(p, 0)
         };
     });
-    Ok(state(core))
+    Ok(state_for(core, p))
 }
 
 /// Deletes the pod and waits until RunPod reports it gone (404 or
@@ -1088,39 +1305,48 @@ async fn terminate(core: &Core, id: &str) -> Result<(), String> {
 
 /// Finds an existing `image-studio-gpu` pod and re-adopts it.
 pub async fn adopt(core: &Arc<Core>) -> Result<GpuState, String> {
+    adopt_for(core, Profile::Image).await
+}
+
+/// Finds an existing pod named exactly after profile `p` and re-adopts it.
+pub async fn adopt_for(core: &Arc<Core>, p: Profile) -> Result<GpuState, String> {
+    let name = p.pod_name();
     let rest = rest(core)?;
-    let pods = find_named_pods(&rest).await?;
-    let stored = stored_pod_id(core);
+    let pods = find_named_pods(&rest, p).await?;
+    inner(core, p).adopted = true;
+    let stored = stored_pod_id(core, p);
     let mut ours: Vec<&Value> = pods.iter().collect();
-    ours.sort_by_key(|p| pod_str(p, "id") != stored.as_deref()); // stored id first
+    // Live pods first (an EXITED stored pod must not hide a billing one),
+    // then the stored id.
+    ours.sort_by_key(|x| (!is_live(x), pod_str(x, "id") != stored.as_deref()));
     let Some(pod) = ours.first().cloned().cloned() else {
-        persist_pod_id(core, None);
-        return Ok(state(core));
+        persist_pod_id(core, p, None);
+        return Ok(state_for(core, p));
     };
     if ours.len() > 1 {
         eprintln!(
-            "[pod] {} pods named {POD_NAME} exist; adopting one (Stop terminates all)",
+            "[pod] {} pods named {name} exist; adopting one (Stop terminates all)",
             ours.len()
         );
     }
     let id = pod_str(&pod, "id").unwrap_or("").to_string();
-    persist_pod_id(core, Some(&id));
+    persist_pod_id(core, p, Some(&id));
     let epoch = {
-        let mut g = core.gpu.inner.lock().unwrap();
+        let mut g = inner(core, p);
         g.epoch += 1;
         g.epoch
     };
     let status = pod_str(&pod, "status").unwrap_or("");
     let base = GpuState {
         pod_id: Some(id.clone()),
-        gpu_type: pod_gpu(&pod).or(Some(GPU_TYPE.into())),
+        gpu_type: pod_gpu(&pod).or(Some(p.default_gpu().into())),
         started_at: pod_started(&pod),
         cost_per_hr: pod_cost(&pod).or(Some(FALLBACK_COST_PER_HR)),
         left_running: true,
-        ..GpuState::stopped(0)
+        ..GpuState::stopped_for(p, 0)
     };
     if is_live(&pod) {
-        set_state(core, Some(epoch), |s| {
+        set_state(core, p, Some(epoch), |s| {
             *s = GpuState {
                 status: GpuStatus::Starting,
                 phase: Some(PHASE_MACHINE.into()),
@@ -1130,23 +1356,23 @@ pub async fn adopt(core: &Arc<Core>) -> Result<GpuState, String> {
         // An already-ready pod turns Running on the first poll.
         let core2 = core.clone();
         tokio::spawn(async move {
-            if let Err(e) = wait_ready(&core2, &rest, epoch, &id).await {
-                fail_start(&core2, epoch, e);
+            if let Err(e) = wait_ready(&core2, p, &rest, epoch, &id).await {
+                fail_start(&core2, p, epoch, e);
             }
         });
     } else {
-        set_state(core, Some(epoch), |s| {
+        set_state(core, p, Some(epoch), |s| {
             *s = GpuState {
                 status: GpuStatus::Error,
                 error: Some(format!(
-                    "A GPU pod named {POD_NAME} exists but is {}. Stop it, then Start again.",
+                    "A GPU pod named {name} exists but is {}. Stop it, then Start again.",
                     status.to_lowercase()
                 )),
                 ..base
             };
         });
     }
-    Ok(state(core))
+    Ok(state_for(core, p))
 }
 
 // ---------------------------------------------------------------------------
@@ -1159,16 +1385,26 @@ pub async fn ensure_running(
     on_phase: &mut (dyn FnMut(&str) + Send),
     cancelled: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<String, String> {
-    let mut rx = subscribe(core);
-    if state(core).status != GpuStatus::Running {
-        start(core)?;
+    ensure_running_for(core, Profile::Image, on_phase, cancelled).await
+}
+
+/// `ensure_running` for profile `p`.
+pub async fn ensure_running_for(
+    core: &Arc<Core>,
+    p: Profile,
+    on_phase: &mut (dyn FnMut(&str) + Send),
+    cancelled: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<String, String> {
+    let mut rx = subscribe_for(core, p);
+    if state_for(core, p).status != GpuStatus::Running {
+        start_for(core, p)?;
     }
     let mut last_phase: Option<String> = None;
     loop {
-        let s = state(core);
+        let s = state_for(core, p);
         match s.status {
             GpuStatus::Running => {
-                touch(core);
+                touch_for(core, p);
                 return s.pod_id.ok_or_else(|| "The GPU pod has no id".into());
             }
             GpuStatus::Starting => {
@@ -1195,41 +1431,73 @@ pub async fn ensure_running(
     }
 }
 
-pub fn is_busy(core: &Core) -> bool {
-    !core.jobs.lock().unwrap().is_empty() || !core.tasks.lock().unwrap().is_empty()
+/// Any job or task runs on profile `p` (its pod is in use).
+pub fn is_busy(core: &Core, p: Profile) -> bool {
+    core.jobs
+        .lock()
+        .unwrap()
+        .values()
+        .any(|e| e.job.kind.profile() == p)
+        || core.tasks.lock().unwrap().values().any(|e| e.profile == p)
 }
 
-/// True when quitting now could leave a billed pod behind (the UI asks).
+/// True when quitting now could leave a billed pod behind (the UI asks),
+/// for ANY profile.
 pub fn needs_quit_confirm(core: &Core) -> bool {
-    let s = state(core);
+    Profile::ALL.iter().any(|p| needs_quit_confirm_for(core, *p))
+}
+
+pub fn needs_quit_confirm_for(core: &Core, p: Profile) -> bool {
+    let s = state_for(core, p);
     match s.status {
         GpuStatus::Starting | GpuStatus::Running | GpuStatus::Stopping => true,
-        GpuStatus::Error => s.pod_id.is_some() || stored_pod_id(core).is_some(),
+        // Always: an ambiguous create leaves Error with no id while RunPod may
+        // still bring a pod up; `stop_for_quit` checks by name.
+        GpuStatus::Error => true,
         GpuStatus::Stopped => false,
     }
 }
 
-/// Stop before quitting: like `stop`, but also waits out a stop already in
-/// progress, and fails unless the GPU ends Stopped (pods confirmed gone).
-pub async fn stop_for_quit(core: &Arc<Core>) -> Result<GpuState, String> {
-    let mut rx = subscribe(core);
-    stop(core, StopReason::User).await?;
+/// Stop before quitting, for EVERY profile (in parallel): each is stopped
+/// like `stop_for`, waiting out a stop already in progress. Fails unless
+/// every profile ends Stopped (pods confirmed gone); a failure on one
+/// profile never skips the other.
+pub async fn stop_for_quit(core: &Arc<Core>) -> Result<Vec<GpuState>, String> {
+    let (a, b) = tokio::join!(
+        stop_profile_for_quit(core, Profile::Image),
+        stop_profile_for_quit(core, Profile::Video)
+    );
+    match (a, b) {
+        (Ok(a), Ok(b)) => Ok(vec![a, b]),
+        (Err(e), Ok(_)) | (Ok(_), Err(e)) => Err(e),
+        (Err(a), Err(b)) => Err(format!("{a} {b}")),
+    }
+}
+
+async fn stop_profile_for_quit(core: &Arc<Core>, p: Profile) -> Result<GpuState, String> {
+    let mut rx = subscribe_for(core, p);
+    let label = p.as_str();
+    stop_for(core, p, StopReason::User)
+        .await
+        .map_err(|e| format!("({label} GPU) {e}"))?;
     let wait = core.cfg.pod_stop_timeout + Duration::from_secs(30);
     let _ = tokio::time::timeout(wait, async {
-        while state(core).status == GpuStatus::Stopping {
+        while state_for(core, p).status == GpuStatus::Stopping {
             if rx.changed().await.is_err() {
                 break;
             }
         }
     })
     .await;
-    let s = state(core);
+    let s = state_for(core, p);
     match s.status {
         GpuStatus::Stopped => Ok(s),
-        GpuStatus::Stopping => Err("The GPU pod is still stopping; it may still be billing".into()),
-        _ => Err(s
-            .error
-            .unwrap_or_else(|| "The GPU pod could not be stopped; it may still be billing".into())),
+        GpuStatus::Stopping => Err(format!(
+            "The {label} GPU pod is still stopping; it may still be billing"
+        )),
+        _ => Err(s.error.unwrap_or_else(|| {
+            format!("The {label} GPU pod could not be stopped; it may still be billing")
+        })),
     }
 }
 
@@ -1238,37 +1506,46 @@ pub async fn stop_for_quit(core: &Arc<Core>) -> Result<GpuState, String> {
 /// `ERROR_AUTO_STOP_SECS` when a start/stop failed, else after
 /// `idleMinutes`. Returns the new state when it stopped the pod.
 pub async fn idle_check(core: &Arc<Core>) -> Option<GpuState> {
-    let s = state(core);
+    idle_check_for(core, Profile::Image).await
+}
+
+/// `idle_check` for profile `p` (its own idle timer and busy jobs/tasks).
+pub async fn idle_check_for(core: &Arc<Core>, p: Profile) -> Option<GpuState> {
+    let s = state_for(core, p);
     match s.status {
         GpuStatus::Running => {}
-        GpuStatus::Error => return error_auto_stop(core, &s).await,
+        GpuStatus::Error => return error_auto_stop(core, p, &s).await,
         _ => return None,
     }
-    if is_busy(core) {
-        touch(core);
+    if is_busy(core, p) {
+        touch_for(core, p);
         return None;
     }
-    let idle_for = (core.cfg.clock)() - core.gpu.inner.lock().unwrap().last_active;
+    let idle_for = (core.cfg.clock)() - inner(core, p).last_active;
     let limit = chrono::Duration::minutes(core.settings.idle_minutes() as i64);
     if idle_for < limit {
         return None;
     }
-    eprintln!("[pod] auto-stop after {} idle minutes", core.settings.idle_minutes());
-    stop(core, StopReason::Idle).await.ok()
+    eprintln!(
+        "[pod:{}] auto-stop after {} idle minutes",
+        p.as_str(),
+        core.settings.idle_minutes()
+    );
+    stop_for(core, p, StopReason::Idle).await.ok()
 }
 
-async fn error_auto_stop(core: &Arc<Core>, s: &GpuState) -> Option<GpuState> {
+async fn error_auto_stop(core: &Arc<Core>, p: Profile, s: &GpuState) -> Option<GpuState> {
     let now = (core.cfg.clock)();
     let (since, urgent, last_active) = {
-        let g = core.gpu.inner.lock().unwrap();
+        let g = inner(core, p);
         (g.error_since.unwrap_or(now), g.urgent, g.last_active)
     };
     let due = if urgent {
         // Nothing useful runs on a pod whose start/stop failed.
         now - since >= chrono::Duration::seconds(ERROR_AUTO_STOP_SECS)
     } else {
-        if is_busy(core) {
-            touch(core);
+        if is_busy(core, p) {
+            touch_for(core, p);
             return None;
         }
         now - since.max(last_active) >= chrono::Duration::minutes(core.settings.idle_minutes() as i64)
@@ -1277,24 +1554,29 @@ async fn error_auto_stop(core: &Arc<Core>, s: &GpuState) -> Option<GpuState> {
         return None;
     }
     let has_pod = s.pod_id.is_some()
-        || stored_pod_id(core).is_some()
+        || stored_pod_id(core, p).is_some()
         || match rest(core) {
-            Ok(r) => find_named_pods(&r).await.is_ok_and(|p| !p.is_empty()),
+            Ok(r) => find_named_pods(&r, p).await.is_ok_and(|x| !x.is_empty()),
             Err(_) => false,
         };
     if !has_pod {
         return None;
     }
-    eprintln!("[pod] auto-stop from the error state");
-    stop(core, StopReason::Idle).await.ok()
+    eprintln!("[pod:{}] auto-stop from the error state", p.as_str());
+    stop_for(core, p, StopReason::Idle).await.ok()
 }
 
 /// Detects a pod that vanished (e.g. its own idle watchdog terminated it,
 /// or the RunPod console) while Starting, Running or Error, and terminates
 /// an EXITED pod (it still holds resources). Never creates pods.
 pub async fn liveness_check(core: &Arc<Core>) {
+    liveness_check_for(core, Profile::Image).await
+}
+
+/// `liveness_check` for profile `p` (only ever looks at that profile's pod id).
+pub async fn liveness_check_for(core: &Arc<Core>, p: Profile) {
     let (s, epoch) = {
-        let g = core.gpu.inner.lock().unwrap();
+        let g = inner(core, p);
         (g.state.clone(), g.epoch)
     };
     if !matches!(
@@ -1311,19 +1593,20 @@ pub async fn liveness_check(core: &Arc<Core>) {
         Ok(p) => pod_str(&p, "status").unwrap_or("").to_string(),
     };
     match status.as_str() {
-        "TERMINATED" => mark_external(core, epoch, &id),
+        "TERMINATED" => mark_external(core, p, epoch, &id),
         // While Starting, wait_ready handles (and terminates) an EXITED pod.
         "EXITED" if s.status != GpuStatus::Starting => {
-            if !is_current(core, epoch) {
+            if !is_current(core, p, epoch) {
                 return;
             }
-            eprintln!("[pod] pod {id} exited; terminating it");
+            eprintln!("[pod:{}] pod {id} exited; terminating it", p.as_str());
             match terminate(core, &id).await {
-                Ok(()) => mark_external(core, epoch, &id),
+                Ok(()) => mark_external(core, p, epoch, &id),
                 Err(e) => {
-                    if is_current(core, epoch) {
+                    if is_current(core, p, epoch) {
                         fail_with_pod(
                             core,
+                            p,
                             &id,
                             &format!("The GPU pod exited. {}", cleanup_failed_msg(&e)),
                         );
@@ -1337,10 +1620,10 @@ pub async fn liveness_check(core: &Arc<Core>) {
 
 /// The pod is confirmed gone: Stopped (External), unless the user acted
 /// meanwhile. Bumps the epoch so a start loop for it exits quietly.
-fn mark_external(core: &Core, epoch: u64, id: &str) {
+fn mark_external(core: &Core, p: Profile, epoch: u64, id: &str) {
     let now = (core.cfg.clock)();
     let s = {
-        let mut g = core.gpu.inner.lock().unwrap();
+        let mut g = inner(core, p);
         if g.epoch != epoch || g.state.pod_id.as_deref() != Some(id) {
             return;
         }
@@ -1348,24 +1631,44 @@ fn mark_external(core: &Core, epoch: u64, id: &str) {
         let before = g.state.status;
         g.state = GpuState {
             stop_reason: Some(StopReason::External),
-            ..GpuState::stopped(core.settings.idle_minutes())
+            ..GpuState::stopped_for(p, core.settings.idle_minutes())
         };
         g.track_error(before, now);
         g.state.clone()
     };
-    if stored_pod_id(core).as_deref() == Some(id) {
-        persist_pod_id(core, None);
+    if stored_pod_id(core, p).as_deref() == Some(id) {
+        persist_pod_id(core, p, None);
     }
-    emit(core, &s);
+    emit(core, p, &s);
 }
 
-/// Background loop, every `period`: idle/error auto-stop, else liveness.
+/// One monitor tick for every profile: idle/error auto-stop, else liveness.
+/// Profiles tick in parallel so a slow stop on one never delays the other.
+pub async fn monitor_tick(core: &Arc<Core>) {
+    tokio::join!(tick_for(core, Profile::Image), tick_for(core, Profile::Video));
+}
+
+async fn tick_for(core: &Arc<Core>, p: Profile) {
+    let retry_adopt = {
+        let g = inner(core, p);
+        !g.adopted && g.state.status == GpuStatus::Stopped
+    };
+    if retry_adopt && rest(core).is_ok() {
+        if let Err(e) = adopt_for(core, p).await {
+            eprintln!("[pod] {} adopt retry failed: {e}", p.as_str());
+        }
+        return;
+    }
+    if idle_check_for(core, p).await.is_none() {
+        liveness_check_for(core, p).await;
+    }
+}
+
+/// Background loop, every `period`: `monitor_tick`.
 pub async fn run_monitor(core: Arc<Core>, period: Duration) {
     loop {
         tokio::time::sleep(period).await;
-        if idle_check(&core).await.is_none() {
-            liveness_check(&core).await;
-        }
+        monitor_tick(&core).await;
     }
 }
 
@@ -1406,7 +1709,7 @@ mod tests {
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(
             v,
-            json!({"status": "stopped", "idleMinutes": 30, "leftRunning": false, "stopReason": "idle"})
+            json!({"profile": "image", "status": "stopped", "idleMinutes": 30, "leftRunning": false, "stopReason": "idle"})
         );
     }
 }

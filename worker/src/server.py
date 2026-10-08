@@ -12,9 +12,9 @@ serverless, so the app only swaps its base URL and token:
 Every route is also served under /v2/{anything}/..., the serverless URL shape.
 All routes except /ping need `Authorization: Bearer $API_TOKEN`.
 
-Execution: `generate` jobs run one at a time in FIFO order (one GPU); other
-actions (status/download/delete) run on a separate executor, concurrently with
-generation. Both reuse handler.handler() unchanged; progress reaches the job
+Execution: `generate` and `generate_video` jobs run one at a time in FIFO
+order (one GPU); other actions (status/download/delete) run on a separate
+executor, concurrently with generation. Both reuse handler.handler() unchanged; progress reaches the job
 record through the job's "_progress" hook, and cancellation through "_cancel".
 
 Idle watchdog: when no authenticated request has arrived for IDLE_MINUTES
@@ -51,8 +51,12 @@ log = logging.getLogger("image_studio.server")
 PORT = int(os.environ.get("PORT", "8000"))
 JOB_TTL_S = 30 * 60
 AUX_WORKERS = 4
-MAX_BODY_BYTES = 32 * 1024 * 1024  # references can make /run ~10 MB
-GENERATE_ACTIONS = frozenset({"generate"})
+# Request bodies only (aiohttp client_max_size): references / a start image
+# make /run ~10 MB at most. Responses are not size-limited by aiohttp, so a
+# generate_video output (MP4 as base64, ~1.33x the file; a 10-20 s 720p clip
+# is typically 5-30 MB -> ~7-40 MB JSON) is served whole from /status.
+MAX_BODY_BYTES = 32 * 1024 * 1024
+GENERATE_ACTIONS = frozenset({"generate", "generate_video"})
 
 IN_QUEUE, IN_PROGRESS = "IN_QUEUE", "IN_PROGRESS"
 COMPLETED, FAILED, CANCELLED, TIMED_OUT = "COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"

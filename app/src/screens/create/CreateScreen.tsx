@@ -12,6 +12,7 @@ import {
   type Job,
 } from "../../api";
 import { Icon } from "../../components/Icon";
+import { radioKeys } from "../../components/radio";
 import { useGpu } from "../../state/gpu";
 import { useLibrary } from "../../state/library";
 import { useToast } from "../../state/toast";
@@ -24,18 +25,23 @@ import {
   LoraPicker,
   MAX_LORAS,
   ModelPicker,
+  ModeSwitch,
   References,
   StartImage,
   type AdvancedValues,
+  type CreateMode,
   type LoraPick,
   type RefItem,
 } from "./Controls";
 import { Gallery } from "./Gallery";
+import { GalleryPicker } from "./GalleryPicker";
 import { JobCard, type JobView } from "./JobCard";
 import { Lightbox } from "./Lightbox";
+import { VideoPanel, type VideoPanelHandle } from "./VideoPanel";
 
 const PAGE = 24;
 const LAST_MODEL_KEY = "imagestudio.lastModel";
+const MODE_KEY = "imagestudio.createMode";
 const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp|tiff?|heic)$/i;
 
 function readLastModel(): string {
@@ -46,7 +52,18 @@ function readLastModel(): string {
   }
 }
 
+function readMode(): CreateMode {
+  try {
+    return localStorage.getItem(MODE_KEY) === "video" ? "video" : "image";
+  } catch {
+    return "image";
+  }
+}
+
 const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
+
+export type GalleryFilter = "all" | "image" | "video";
+const isVideo = (im: ImageRecord) => im.kind === "video";
 
 export function CreateScreen({ active, onNavigate }: { active: boolean; onNavigate: (t: Tab) => void }) {
   const lib = useLibrary();
@@ -55,6 +72,20 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   const gpu = useGpu();
   // Pod backend with the GPU off: Generate auto-starts it first.
   const startsGpu = gpu.podMode && gpuIsOff(gpu.state);
+  const imageModels = lib.imageModels;
+
+  // ---------- Image | Video ----------
+  const [mode, setModeState] = useState<CreateMode>(readMode);
+  const setMode = useCallback((m: CreateMode) => {
+    setModeState(m);
+    try {
+      localStorage.setItem(MODE_KEY, m);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+  const videoRef = useRef<VideoPanelHandle>(null);
+  const modeSwitch = <ModeSwitch value={mode} onChange={setMode} />;
 
   // ---------- form state ----------
   const [modelId, setModelId] = useState<string>(readLastModel);
@@ -66,6 +97,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   // img2img start image (models with supportsImg2Img) and its strength.
   const [startImage, setStartImage] = useState<RefItem | null>(null);
   const [startBusy, setStartBusy] = useState(false);
+  const [startPickerOpen, setStartPickerOpen] = useState(false);
   const [denoise, setDenoise] = useState(DENOISE_DEFAULT);
   const [aspect, setAspect] = useState("1:1");
   const [count, setCount] = useState(1);
@@ -76,7 +108,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   const fileInput = useRef<HTMLInputElement>(null);
   const startFileInput = useRef<HTMLInputElement>(null);
 
-  const model = lib.models.find((m) => m.id === modelId);
+  const model = imageModels.find((m) => m.id === modelId);
   const maxRefs = model?.maxReferences ?? 0;
   const img2img = !!model?.supportsImg2Img;
   const startActive = img2img && !!startImage;
@@ -85,12 +117,12 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   // Pick an initial model once the registry arrives.
   const initialised = useRef(false);
   useEffect(() => {
-    if (initialised.current || lib.models.length === 0) return;
+    if (initialised.current || imageModels.length === 0) return;
     initialised.current = true;
-    const m = lib.models.find((x) => x.id === modelId) ?? lib.models.find((x) => x.installed) ?? lib.models[0];
+    const m = imageModels.find((x) => x.id === modelId) ?? imageModels.find((x) => x.installed) ?? imageModels[0];
     setModelId(m.id);
     setAdv(advancedDefaults(m));
-  }, [lib.models, modelId]);
+  }, [imageModels, modelId]);
 
   useEffect(() => {
     try {
@@ -110,7 +142,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
 
   const selectModel = (id: string) => {
     if (id === modelId) return;
-    const next = lib.models.find((m) => m.id === id);
+    const next = imageModels.find((m) => m.id === id);
     if (!next) return;
     const droppedRefs = Math.max(0, refs.length - next.maxReferences);
     const keptLoras = loraPicks.filter((p) => lib.loras.find((l) => l.id === p.loraId)?.modelId === id);
@@ -226,7 +258,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   const onDroppedPaths = toStart ? addStartPaths : addPaths;
   const handlers = useRef({ onPastedFiles, onDroppedPaths });
   handlers.current = { onPastedFiles, onDroppedPaths };
-  const refsEnabled = active && (maxRefs > 0 || img2img);
+  const refsEnabled = active && mode === "image" && (maxRefs > 0 || img2img);
 
   useEffect(() => {
     if (!refsEnabled) return;
@@ -286,13 +318,17 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
 
   const imagesRef = useRef(images);
   imagesRef.current = images;
+  /** The gallery filter (declared below); the lightbox index points into the filtered list. */
+  const filterRef = useRef<GalleryFilter>("all");
+  const matches = (im: ImageRecord) => filterRef.current === "all" || (filterRef.current === "video") === isVideo(im);
 
   const prependImages = useCallback((recs: ImageRecord[]) => {
     const fresh = recs.filter((r) => !imagesRef.current.some((p) => p.id === r.id));
     if (!fresh.length) return;
     imagesRef.current = [...fresh.reverse(), ...imagesRef.current];
     setImages(imagesRef.current);
-    setLightbox((i) => (i == null ? i : i + fresh.length));
+    const shift = fresh.filter(matches).length;
+    setLightbox((i) => (i == null ? i : i + shift));
   }, []);
 
   useEffect(() => {
@@ -433,9 +469,18 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
 
   // ---------- restore ----------
   const applySettings = async (im: ImageRecord) => {
-    const m = lib.models.find((x) => x.id === im.model);
+    if (isVideo(im)) {
+      setLightbox(null);
+      setMode("video");
+      // A start frame taken from the gallery is re-selected in place (matched by its file path).
+      const galleryStart = im.initImage ? (imagesRef.current.find((x) => x.kind !== "video" && x.path === im.initImage) ?? null) : null;
+      await videoRef.current?.applySettings(im, galleryStart);
+      return;
+    }
+    const m = imageModels.find((x) => x.id === im.model);
     if (!m) return toast.error("That model is no longer available", im.model);
     setLightbox(null);
+    setMode("image");
     setModelId(m.id);
     setPrompt(im.prompt);
     setAspect(im.aspectRatio);
@@ -502,7 +547,8 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     const next = imagesRef.current.filter((x) => x.id !== id);
     imagesRef.current = next;
     setImages(next);
-    setLightbox((i) => (i == null || next.length === 0 ? null : Math.min(i, next.length - 1)));
+    const left = next.filter(matches).length;
+    setLightbox((i) => (i == null || left === 0 ? null : Math.min(i, left - 1)));
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
@@ -512,13 +558,49 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     }
   };
 
-  const activeJobs = jobs.filter(isJobActive).length;
+  const activeJobs = jobs.filter((j) => isJobActive(j) && j.kind !== "video").length;
+  const activeVideoJobs = jobs.filter((j) => isJobActive(j) && j.kind === "video").length;
+
+  const onVideoQueued = useCallback((job: JobView) => {
+    setJobs((js) =>
+      js.some((j) => j.jobId === job.jobId)
+        ? js.map((j) => (j.jobId === job.jobId ? { ...j, modelName: job.modelName, prompt: job.prompt, kind: "video" } : j))
+        : [...js, job],
+    );
+  }, []);
+
+  // ---------- gallery filter ----------
+  const [filter, setFilter] = useState<GalleryFilter>("all");
+  filterRef.current = filter;
+  const shown = useMemo(
+    () => (filter === "all" ? images : images.filter((im) => (filter === "video") === isVideo(im))),
+    [images, filter],
+  );
+  const videoCount = useMemo(() => images.filter(isVideo).length, [images]);
+
+  /** The video GPU's start note on video job cards while that GPU is off or starting. */
+  const vgpu = gpu.profiles.video;
+  const videoGpuNote =
+    gpu.podMode && (gpuIsOff(vgpu.state) || vgpu.state?.status === "starting")
+      ? `Starting the video GPU (${vgpu.startTarget}, ${vgpu.costLabel}) — it auto-stops after ${vgpu.idleMinutes} idle minutes.`
+      : null;
 
   return (
     <div className="create">
+      <VideoPanel
+        ref={videoRef}
+        hidden={mode !== "video"}
+        active={active && mode === "video"}
+        modeSwitch={modeSwitch}
+        onNavigate={onNavigate}
+        onQueued={onVideoQueued}
+        activeJobs={activeVideoJobs}
+        modelNames={modelNames}
+      />
       <form
         className="panel"
         aria-label="Generation settings"
+        hidden={mode !== "image"}
         onKeyDown={onKeyDown}
         onSubmit={(e: FormEvent) => {
           e.preventDefault();
@@ -526,12 +608,13 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         }}
       >
         <div className="panel__scroll">
+          {modeSwitch}
           <section className="section">
             <h2 className="section__title">Model</h2>
-            {lib.models.length === 0 ? (
+            {imageModels.length === 0 ? (
               <div className="skeleton skeleton--cards" aria-label="Loading models" />
             ) : (
-              <ModelPicker models={lib.models} value={modelId} onChange={selectModel} />
+              <ModelPicker models={imageModels} value={modelId} onChange={selectModel} />
             )}
             {model && !model.installed && (
               <div className="notice notice--inline">
@@ -604,6 +687,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
                 onRemove={() => setStartImage(null)}
                 onFiles={addStartFiles}
                 onPick={pickStart}
+                onPickGallery={() => setStartPickerOpen(true)}
               />
             </section>
           )}
@@ -671,10 +755,16 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
                 key={j.jobId}
                 job={j}
                 podMode={gpu.podMode}
+                gpuNote={j.kind === "video" && (j.status === "queued" || j.status === "starting") ? videoGpuNote : null}
                 onCancel={() => cancelJob(j.jobId)}
                 onDismiss={() => setJobs((js) => js.filter((x) => x.jobId !== j.jobId))}
                 onOpenImage={(id) => {
-                  const i = images.findIndex((x) => x.id === id);
+                  let i = shown.findIndex((x) => x.id === id);
+                  if (i < 0) {
+                    // Hidden by the gallery filter: show everything, then open it.
+                    setFilter("all");
+                    i = images.findIndex((x) => x.id === id);
+                  }
                   if (i >= 0) setLightbox(i);
                 }}
               />
@@ -683,10 +773,22 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         )}
         <div className="canvas__head">
           <h2 className="canvas__title">Gallery</h2>
-          <span className="hint">{images.length ? `${images.length}${hasMore ? "+" : ""} images` : ""}</span>
+          <GalleryFilterChips value={filter} onChange={(f) => {
+            setFilter(f);
+            setLightbox(null);
+          }} />
+          <span className="hint canvas__count">
+            {images.length
+              ? filter === "all"
+                ? `${images.length}${hasMore ? "+" : ""} items${videoCount ? ` · ${videoCount} video${videoCount === 1 ? "" : "s"}` : ""}`
+                : `${shown.length}${hasMore ? "+" : ""} ${filter === "video" ? (shown.length === 1 ? "video" : "videos") : shown.length === 1 ? "image" : "images"}`
+              : ""}
+          </span>
         </div>
         <Gallery
-          items={images}
+          items={shown}
+          filter={filter}
+          loadedCount={images.length}
           modelNames={modelNames}
           loading={loadingImages}
           hasMore={hasMore}
@@ -697,13 +799,33 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
       </main>
 
       <Lightbox
-        items={images}
+        items={shown}
         index={lightbox}
         onIndex={setLightbox}
         onClose={() => setLightbox(null)}
         onDeleted={onDeleted}
         onUseSettings={applySettings}
+        onMakeVideo={
+          lib.videoModels.some((m) => m.modes?.includes("i2v"))
+            ? (im) => {
+                setLightbox(null);
+                setMode("video");
+                videoRef.current?.startFromImage(im);
+              }
+            : undefined
+        }
         modelNames={modelNames}
+      />
+
+      <GalleryPicker
+        open={startPickerOpen}
+        modelNames={modelNames}
+        onClose={() => setStartPickerOpen(false)}
+        onPick={(rec) => {
+          setStartPickerOpen(false);
+          // Image mode has no gallery-id argument: import the gallery file like any other start image.
+          void setStartFrom(() => api.importReference(rec.path));
+        }}
       />
 
       <input
@@ -729,6 +851,41 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
           if (files.length) void addFiles(files);
         }}
       />
+    </div>
+  );
+}
+
+const FILTERS: { id: GalleryFilter; label: string }[] = [
+  { id: "all", label: "All" },
+  { id: "image", label: "Images" },
+  { id: "video", label: "Videos" },
+];
+
+function GalleryFilterChips({ value, onChange }: { value: GalleryFilter; onChange: (f: GalleryFilter) => void }) {
+  return (
+    <div
+      className="chips chips--filter"
+      role="radiogroup"
+      aria-label="Show"
+      onKeyDown={radioKeys(
+        FILTERS.map((f) => f.id),
+        value,
+        onChange,
+      )}
+    >
+      {FILTERS.map((f) => (
+        <button
+          key={f.id}
+          type="button"
+          role="radio"
+          aria-checked={f.id === value}
+          tabIndex={f.id === value ? 0 : -1}
+          className={`chip chip--filter ${f.id === value ? "is-selected" : ""}`}
+          onClick={() => onChange(f.id)}
+        >
+          {f.label}
+        </button>
+      ))}
     </div>
   );
 }

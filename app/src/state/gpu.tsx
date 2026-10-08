@@ -1,24 +1,30 @@
-// The dedicated GPU pod: live state from `gpu-update`, Start/Stop, and the
-// confirmations that go with it (stopping while work runs, starting a billed pod
-// for a Models-screen action, quitting while a pod may still be billing).
+// The dedicated GPU pods — one per profile ("image" in EU-RO-1, "video" in CA-MTL-3, spec v5):
+// live state from `gpu-update`, Start/Stop, and the confirmations that go with them
+// (stopping while work runs, starting a billed pod for a Models-screen action, quitting
+// while any pod may still be billing).
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import * as api from "../api";
-import { gpuIsOff, isTaskActive, type GpuState, type Job } from "../api";
+import { gpuIsOff, isTaskActive, type GpuProfile, type GpuState, type Job } from "../api";
+import { useNow } from "../lib/useNow";
 import { Dialog } from "../components/Dialog";
 import { Icon } from "../components/Icon";
-import { formatUsd, shortGpuName } from "../lib/format";
+import { formatElapsed, formatUsd, shortGpuName, toDate } from "../lib/format";
 import { useLibrary } from "./library";
 import { useToast } from "./toast";
 
 const DEFAULT_COST = 2.49;
 const DEFAULT_IDLE = 30;
 
-interface Gpu {
+export const PROFILES: GpuProfile[] = ["image", "video"];
+/** "Images" / "Video" — the pill and dialog label of a profile. */
+export const PROFILE_LABEL: Record<GpuProfile, string> = { image: "Images", video: "Video" };
+
+/** Everything the UI needs about one profile's pod. */
+export interface GpuProfileInfo {
+  profile: GpuProfile;
   /** null until the first get_gpu_state answers. */
   state: GpuState | null;
-  /** The pod backend is selected (false for legacy serverless: no pill, no prompts). */
-  podMode: boolean;
   /** Short name of the pod's actual GPU ("RTX PRO 6000"); before a pod exists, the first-priority GPU. */
   gpuName: string;
   /** What a start will try: "RTX PRO 6000" or "RTX PRO 6000 or the next available GPU". */
@@ -28,16 +34,25 @@ interface Gpu {
   /** "~$2.49/h" when the pod reports its price, else "~$2.49/h or less" (the GPU isn't chosen yet). */
   costLabel: string;
   idleMinutes: number;
-  /** Jobs + model/LoRA tasks that are queued or running. */
+  /** Jobs + model/LoRA tasks of this profile that are queued or running. */
   activeWork: number;
-  start(): Promise<void>;
-  /** Stops the pod; asks first (in-app) when a job or task is active. */
-  stop(): void;
+  /** Starting, running, stopping, or in error with a pod that may still bill. */
+  live: boolean;
+}
+
+interface Gpu extends Omit<GpuProfileInfo, "profile" | "live"> {
+  /** The image profile's fields are spread at the top level (state, gpuName, costLabel, …) for older callers. */
+  profiles: Record<GpuProfile, GpuProfileInfo>;
+  /** The pod backend is selected (false for legacy serverless: no pill, no prompts). */
+  podMode: boolean;
+  start(profile?: GpuProfile): Promise<void>;
+  /** Stops that profile's pod; asks first (in-app) when a job or task is active on it. */
+  stop(profile?: GpuProfile): void;
   /**
-   * Before an action that auto-starts the GPU: resolves true at once when the GPU is
+   * Before an action that auto-starts a GPU: resolves true at once when that profile's GPU is
    * starting/running (or in serverless mode); otherwise asks and resolves with the answer.
    */
-  confirmStart(action?: string): Promise<boolean>;
+  confirmStart(action?: string, profile?: GpuProfile): Promise<boolean>;
 }
 
 const Ctx = createContext<Gpu | null>(null);
@@ -49,47 +64,76 @@ export function useGpu(): Gpu {
 }
 
 const jobActive = (j: Job) => api.isJobActive(j);
+const jobProfile = (j: Job): GpuProfile => (j.kind === "video" ? "video" : "image");
+
+/** A pod may exist (and bill) in this state. */
+export const gpuIsLive = (g: GpuState | null | undefined): boolean =>
+  !!g && (g.status === "starting" || g.status === "running" || g.status === "stopping" || (g.status === "error" && !!g.podId));
+
+const emptyStates: Record<GpuProfile, GpuState | null> = { image: null, video: null };
 
 export function GpuProvider({ children }: { children: ReactNode }) {
   const toast = useToast();
   const lib = useLibrary();
-  const [state, setState] = useState<GpuState | null>(null);
-  const prev = useRef<GpuState | null>(null);
-  const [activeJobIds, setActiveJobIds] = useState<Set<string>>(() => new Set());
-  const [stopAsk, setStopAsk] = useState(false);
+  const [states, setStates] = useState<Record<GpuProfile, GpuState | null>>(emptyStates);
+  const prev = useRef<Record<GpuProfile, GpuState | null>>({ ...emptyStates });
+  /** Active generation jobs by id → the profile they run on. */
+  const [activeJobs, setActiveJobs] = useState<Map<string, GpuProfile>>(() => new Map());
+  const [stopAsk, setStopAsk] = useState<GpuProfile | null>(null);
   const [stopping, setStopping] = useState(false);
-  const [startAsk, setStartAsk] = useState<{ action?: string; resolve: (ok: boolean) => void } | null>(null);
+  const [startAsk, setStartAsk] = useState<{ action?: string; profile: GpuProfile; resolve: (ok: boolean) => void } | null>(null);
   // Quit confirmation (the backend emits `quit-requested` on ⌘Q / window close).
   const [quitAsk, setQuitAsk] = useState(false);
   const [quitBusy, setQuitBusy] = useState<null | "stop" | "quit">(null);
   const [quitError, setQuitError] = useState<string | null>(null);
 
-  const podMode = (lib.settings?.backend ?? "pod") === "pod";
-  const knownCost = state?.costPerHr ?? null;
-  const costPerHr = knownCost ?? lib.settings?.fallbackCostPerHr ?? DEFAULT_COST;
-  const costLabel = knownCost != null ? `~${formatUsd(knownCost)}/h` : `~${formatUsd(costPerHr)}/h or less`;
-  const idleMinutes = state?.idleMinutes ?? lib.settings?.idleMinutes ?? DEFAULT_IDLE;
-  const firstGpu = lib.settings?.gpuTypes?.[0] ?? lib.settings?.gpuType;
-  const gpuName = shortGpuName(state?.gpuType ?? firstGpu);
-  const startTarget = (lib.settings?.gpuTypes?.length ?? 0) > 1 ? `${shortGpuName(firstGpu)} or the next available GPU` : shortGpuName(firstGpu);
-  const activeTasks = lib.models.filter((m) => isTaskActive(m.task)).length + lib.loras.filter((l) => isTaskActive(l.task)).length;
-  const activeWork = activeJobIds.size + activeTasks;
+  const s = lib.settings;
+  const podMode = (s?.backend ?? "pod") === "pod";
+
+  const videoModelIds = useMemo(() => new Set(lib.videoModels.map((m) => m.id)), [lib.videoModels]);
+  const tasksOf = (p: GpuProfile) =>
+    lib.models.filter((m) => isTaskActive(m.task) && (videoModelIds.has(m.id) ? "video" : "image") === p).length +
+    (p === "image" ? lib.loras.filter((l) => isTaskActive(l.task)).length : 0);
+  const jobsOf = (p: GpuProfile) => [...activeJobs.values()].filter((x) => x === p).length;
+
+  const info = (p: GpuProfile): GpuProfileInfo => {
+    const state = states[p];
+    const knownCost = state?.costPerHr ?? null;
+    const costPerHr = knownCost ?? s?.fallbackCostPerHr ?? DEFAULT_COST;
+    const list = p === "video" ? (s?.videoGpuTypes ?? []) : s?.gpuTypes?.length ? s.gpuTypes : s?.gpuType ? [s.gpuType] : [];
+    const firstGpu = list[0];
+    return {
+      profile: p,
+      state,
+      gpuName: shortGpuName(state?.gpuType ?? firstGpu),
+      startTarget: list.length > 1 ? `${shortGpuName(firstGpu)} or the next available GPU` : shortGpuName(firstGpu),
+      costPerHr,
+      costLabel: knownCost != null ? `~${formatUsd(knownCost)}/h` : `~${formatUsd(costPerHr)}/h or less`,
+      idleMinutes: state?.idleMinutes ?? s?.idleMinutes ?? DEFAULT_IDLE,
+      activeWork: jobsOf(p) + tasksOf(p),
+      live: gpuIsLive(state),
+    };
+  };
+  const profiles: Record<GpuProfile, GpuProfileInfo> = { image: info("image"), video: info("video") };
 
   // Toast only on transitions, so a re-emitted state doesn't toast twice.
   const apply = useCallback(
     (g: GpuState) => {
-      const before = prev.current;
-      prev.current = g;
-      setState(g);
+      const p: GpuProfile = g.profile === "video" ? "video" : "image";
+      const before = prev.current[p];
+      prev.current = { ...prev.current, [p]: g };
+      setStates((cur) => ({ ...cur, [p]: g }));
       if (!before || before.status === g.status) return;
+      const what = p === "video" ? "video GPU" : "GPU";
+      const What = p === "video" ? "Video GPU" : "GPU";
       if (g.status === "stopped" && g.stopReason === "idle" && before.status === "error") {
-        toast.info("GPU pod stopped automatically", "It was left over from a GPU problem, so the app stopped it to end billing.");
+        toast.info(`${What} pod stopped automatically`, "It was left over from a GPU problem, so the app stopped it to end billing.");
       } else if (g.status === "stopped" && g.stopReason === "idle") {
-        toast.info(`GPU stopped after ${g.idleMinutes} idle minutes`, "Start it again any time — generating starts it too.");
+        toast.info(`${What} stopped after ${g.idleMinutes} idle minutes`, "Start it again any time — generating starts it too.");
       } else if (g.status === "stopped" && g.stopReason === "external") {
-        toast.info("The GPU pod stopped", "It was stopped outside the app — by its own idle watchdog or in the RunPod console.");
+        toast.info(`The ${what} pod stopped`, "It was stopped outside the app — by its own idle watchdog or in the RunPod console.");
       } else if (g.status === "error") {
-        toast.error("GPU problem", g.error ?? undefined);
+        toast.error(`${What} problem`, g.error ?? undefined);
       }
     },
     [toast],
@@ -97,16 +141,23 @@ export function GpuProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let alive = true;
+    // Seed each profile once; an event may already have delivered something newer.
+    const seed = (g: GpuState, p: GpuProfile) => {
+      if (!alive || prev.current[p]) return;
+      const st = { ...g, profile: p };
+      prev.current = { ...prev.current, [p]: st };
+      setStates((cur) => ({ ...cur, [p]: st }));
+    };
     api
-      .getGpuState()
-      .then((g) => {
-        // An event may already have delivered something newer.
-        if (alive && !prev.current) {
-          prev.current = g;
-          setState(g);
-        }
-      })
-      .catch((e) => toast.error("Couldn't read the GPU state", e));
+      .listGpuStates()
+      .then((list) => list.forEach((g, i) => seed(g, g.profile ?? PROFILES[i] ?? "image")))
+      .catch(() =>
+        // Older core without list_gpu_states: the image profile only.
+        api
+          .getGpuState("image")
+          .then((g) => seed(g, "image"))
+          .catch((e) => toast.error("Couldn't read the GPU state", e)),
+      );
     const un = api.onEvent("gpu-update", apply);
     return () => {
       alive = false;
@@ -115,8 +166,10 @@ export function GpuProvider({ children }: { children: ReactNode }) {
   }, [apply, toast]);
 
   useEffect(() => {
-    const un = api.onEvent("quit-requested", (g) => {
-      apply(g);
+    const un = api.onEvent("quit-requested", (payload) => {
+      // Payload: every profile's state (older cores sent a single GpuState).
+      const list = Array.isArray(payload) ? payload : [payload as GpuState];
+      list.forEach(apply);
       setQuitError(null);
       setQuitAsk(true);
     });
@@ -146,17 +199,21 @@ export function GpuProvider({ children }: { children: ReactNode }) {
       .listJobs()
       .then((js) => {
         if (!alive) return;
-        setActiveJobIds((cur) => new Set([...cur, ...js.filter(jobActive).map((j) => j.jobId)]));
+        setActiveJobs((cur) => {
+          const next = new Map(cur);
+          for (const j of js.filter(jobActive)) next.set(j.jobId, jobProfile(j));
+          return next;
+        });
       })
       .catch(() => {
         /* nothing to track */
       });
     const un = api.onEvent("job-update", (j) => {
-      setActiveJobIds((cur) => {
+      setActiveJobs((cur) => {
         const on = jobActive(j);
         if (on === cur.has(j.jobId)) return cur;
-        const next = new Set(cur);
-        if (on) next.add(j.jobId);
+        const next = new Map(cur);
+        if (on) next.set(j.jobId, jobProfile(j));
         else next.delete(j.jobId);
         return next;
       });
@@ -167,40 +224,51 @@ export function GpuProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  const start = useCallback(async () => {
-    try {
-      apply(await api.startGpu());
-    } catch (e) {
-      toast.error("Couldn't start the GPU", e);
-    }
-  }, [apply, toast]);
+  const start = useCallback(
+    async (profile: GpuProfile = "image") => {
+      try {
+        const g = await api.startGpu(profile);
+        apply({ ...g, profile: g.profile ?? profile });
+      } catch (e) {
+        toast.error(profile === "video" ? "Couldn't start the video GPU" : "Couldn't start the GPU", e);
+      }
+    },
+    [apply, toast],
+  );
 
-  const doStop = useCallback(async () => {
-    setStopping(true);
-    try {
-      apply(await api.stopGpu());
-    } catch (e) {
-      toast.error("Couldn't stop the GPU", e);
-    } finally {
-      setStopping(false);
-      setStopAsk(false);
-    }
-  }, [apply, toast]);
+  const doStop = useCallback(
+    async (profile: GpuProfile) => {
+      setStopping(true);
+      try {
+        const g = await api.stopGpu(profile);
+        apply({ ...g, profile: g.profile ?? profile });
+      } catch (e) {
+        toast.error(profile === "video" ? "Couldn't stop the video GPU" : "Couldn't stop the GPU", e);
+      } finally {
+        setStopping(false);
+        setStopAsk(null);
+      }
+    },
+    [apply, toast],
+  );
 
-  const activeWorkRef = useRef(activeWork);
-  activeWorkRef.current = activeWork;
-  const stop = useCallback(() => {
-    if (activeWorkRef.current > 0) setStopAsk(true);
-    else void doStop();
-  }, [doStop]);
+  const workRef = useRef({ image: 0, video: 0 });
+  workRef.current = { image: profiles.image.activeWork, video: profiles.video.activeWork };
+  const stop = useCallback(
+    (profile: GpuProfile = "image") => {
+      if (workRef.current[profile] > 0) setStopAsk(profile);
+      else void doStop(profile);
+    },
+    [doStop],
+  );
 
-  const stateRef = useRef(state);
-  stateRef.current = state;
+  const statesRef = useRef(states);
+  statesRef.current = states;
   const podModeRef = useRef(podMode);
   podModeRef.current = podMode;
-  const confirmStart = useCallback((action?: string) => {
-    if (!podModeRef.current || !gpuIsOff(stateRef.current)) return Promise.resolve(true);
-    return new Promise<boolean>((resolve) => setStartAsk({ action, resolve }));
+  const confirmStart = useCallback((action?: string, profile: GpuProfile = "image") => {
+    if (!podModeRef.current || !gpuIsOff(statesRef.current[profile])) return Promise.resolve(true);
+    return new Promise<boolean>((resolve) => setStartAsk({ action, profile, resolve }));
   }, []);
 
   const answerStart = (ok: boolean) => {
@@ -208,50 +276,65 @@ export function GpuProvider({ children }: { children: ReactNode }) {
     setStartAsk(null);
   };
 
-  const value = useMemo<Gpu>(
-    () => ({ state, podMode, gpuName, startTarget, costPerHr, costLabel, idleMinutes, activeWork, start, stop, confirmStart }),
-    [state, podMode, gpuName, startTarget, costPerHr, costLabel, idleMinutes, activeWork, start, stop, confirmStart],
-  );
+  const img = profiles.image;
+  const value: Gpu = {
+    state: img.state,
+    gpuName: img.gpuName,
+    startTarget: img.startTarget,
+    costPerHr: img.costPerHr,
+    costLabel: img.costLabel,
+    idleMinutes: img.idleMinutes,
+    activeWork: img.activeWork + profiles.video.activeWork,
+    profiles,
+    podMode,
+    start,
+    stop,
+    confirmStart,
+  };
 
-  const work = [
-    activeJobIds.size ? `${activeJobIds.size} generation${activeJobIds.size === 1 ? "" : "s"}` : null,
-    activeTasks ? `${activeTasks} download/delete task${activeTasks === 1 ? "" : "s"}` : null,
-  ]
-    .filter(Boolean)
-    .join(" and ");
+  const workText = (p: GpuProfile) => {
+    const jobs = jobsOf(p);
+    const tasks = tasksOf(p);
+    const noun = p === "video" ? "video" : "generation";
+    return [jobs ? `${jobs} ${noun}${jobs === 1 ? "" : "s"}` : null, tasks ? `${tasks} download/delete task${tasks === 1 ? "" : "s"}` : null]
+      .filter(Boolean)
+      .join(" and ");
+  };
 
-  const quitWhat =
-    state?.status === "starting"
-      ? `A GPU pod is starting (${costLabel})`
-      : state?.status === "stopping"
-        ? `The GPU pod is still stopping (${costLabel})`
-        : state?.status === "error"
-          ? `A GPU pod may still be billing (${costLabel})`
-          : `A GPU pod is running (${costLabel})`;
+  const stopInfo = stopAsk ? profiles[stopAsk] : null;
+  const startInfo = startAsk ? profiles[startAsk.profile] : null;
+  const quitList = PROFILES.map((p) => profiles[p]).filter((x) => x.live);
+  const quitWork = PROFILES.map(workText).filter(Boolean).join("; ");
+  const allArmed = quitList.every((x) => x.state?.watchdogArmed === true);
+  const anyUnarmed = quitList.some((x) => x.state?.watchdogArmed === false);
+  const idleShown = img.idleMinutes;
 
   return (
     <Ctx.Provider value={value}>
       {children}
 
       <Dialog
-        open={stopAsk}
-        onClose={stopping ? () => {} : () => setStopAsk(false)}
-        title="Stop the GPU?"
+        open={!!stopAsk}
+        onClose={stopping ? () => {} : () => setStopAsk(null)}
+        title={stopAsk === "video" ? "Stop the video GPU?" : "Stop the GPU?"}
         footer={
           <>
-            <button type="button" className="btn" onClick={() => setStopAsk(false)} disabled={stopping} autoFocus>
+            <button type="button" className="btn" onClick={() => setStopAsk(null)} disabled={stopping} autoFocus>
               Keep running
             </button>
-            <button type="button" className="btn btn--danger" onClick={() => void doStop()} disabled={stopping}>
+            <button type="button" className="btn btn--danger" onClick={() => stopAsk && void doStop(stopAsk)} disabled={stopping}>
               <Icon name="stop" /> {stopping ? "Stopping…" : "Stop GPU"}
             </button>
           </>
         }
       >
-        <p className="gpu-dialog__lede">
-          {work || "Work"} {activeWork === 1 ? "is" : "are"} still running on the GPU. Stopping the pod ends {activeWork === 1 ? "it" : "them"} now —
-          unfinished images and downloads are lost.
-        </p>
+        {stopInfo && (
+          <p className="gpu-dialog__lede">
+            {workText(stopInfo.profile) || "Work"} {stopInfo.activeWork === 1 ? "is" : "are"} still running on the{" "}
+            {stopInfo.profile === "video" ? "video GPU" : "GPU"}. Stopping the pod ends {stopInfo.activeWork === 1 ? "it" : "them"} now — unfinished{" "}
+            {stopInfo.profile === "video" ? "videos" : "images"} and downloads are lost.
+          </p>
+        )}
       </Dialog>
 
       <Dialog
@@ -277,18 +360,22 @@ export function GpuProvider({ children }: { children: ReactNode }) {
                 Cancel
               </button>
               <button type="button" className="btn" onClick={() => void quit(false)} disabled={!!quitBusy}>
-                Quit and keep it running
+                Quit anyway
               </button>
               <button type="button" className="btn btn--primary" onClick={() => void quit(true)} disabled={!!quitBusy} autoFocus>
-                <Icon name="stop" /> {quitBusy === "stop" ? "Stopping GPU…" : "Stop GPU & Quit"}
+                <Icon name="stop" /> {quitBusy === "stop" ? (quitList.length > 1 ? "Stopping GPUs…" : "Stopping GPU…") : quitList.length > 1 ? "Stop GPUs & Quit" : "Stop GPU & Quit"}
               </button>
             </>
           )
         }
       >
         <p className="gpu-dialog__lede">
-          {quitWhat}. {activeWork > 0 ? `${work || "Work"} ${activeWork === 1 ? "is" : "are"} still running on it. ` : ""}
-          Stop it before quitting so it doesn't keep billing?
+          {quitList.length > 1 ? "These GPU pods may be billing:" : "This GPU pod may be billing:"}
+        </p>
+        <QuitPodList items={quitList} />
+        <p className="gpu-dialog__lede">
+          {quitWork ? `${quitWork} still running. ` : ""}
+          Stop {quitList.length > 1 ? "them" : "it"} before quitting so {quitList.length > 1 ? "they don't" : "it doesn't"} keep billing?
         </p>
         {quitError ? (
           <p className="notice notice--error" role="alert">
@@ -296,11 +383,11 @@ export function GpuProvider({ children }: { children: ReactNode }) {
           </p>
         ) : (
           <p className="hint">
-            {state?.watchdogArmed === true
-              ? `If you keep it running, the pod stops itself after ${idleMinutes} idle minutes.`
-              : state?.watchdogArmed === false
-                ? "If you keep it running, nothing stops it while the app is closed — the pod can't stop itself. Stop it later from the app or the RunPod console."
-                : `If you keep it running, the pod's own watchdog may stop it after ${idleMinutes} idle minutes; otherwise stop it later from the app or the RunPod console.`}
+            {allArmed
+              ? `If you quit anyway, each pod stops itself after ${idleShown} idle minutes.`
+              : anyUnarmed
+                ? "If you quit anyway, nothing stops a pod that can't stop itself while the app is closed. Stop it later from the app or the RunPod console."
+                : `If you quit anyway, each pod's own watchdog may stop it after ${idleShown} idle minutes; otherwise stop it later from the app or the RunPod console.`}
           </p>
         )}
       </Dialog>
@@ -308,7 +395,15 @@ export function GpuProvider({ children }: { children: ReactNode }) {
       <Dialog
         open={!!startAsk}
         onClose={() => answerStart(false)}
-        title={startAsk?.action ? `Start the GPU to ${startAsk.action}?` : "Start the GPU?"}
+        title={
+          startAsk?.profile === "video"
+            ? startAsk.action
+              ? `Start the video GPU to ${startAsk.action}?`
+              : "Start the video GPU?"
+            : startAsk?.action
+              ? `Start the GPU to ${startAsk.action}?`
+              : "Start the GPU?"
+        }
         footer={
           <>
             <button type="button" className="btn" onClick={() => answerStart(false)}>
@@ -320,11 +415,44 @@ export function GpuProvider({ children }: { children: ReactNode }) {
           </>
         }
       >
-        <p className="gpu-dialog__lede">
-          This starts the GPU pod ({startTarget}, {costLabel}). It auto-stops after {idleMinutes} idle minutes.
-        </p>
+        {startInfo && (
+          <p className="gpu-dialog__lede">
+            This starts the {startInfo.profile === "video" ? "video GPU pod in Canada" : "GPU pod"} ({startInfo.startTarget}, {startInfo.costLabel}). It auto-stops
+            after {startInfo.idleMinutes} idle minutes.
+          </p>
+        )}
         <p className="hint">Starting takes a few minutes; the action waits in the queue until the GPU is ready.</p>
       </Dialog>
     </Ctx.Provider>
+  );
+}
+
+/** One row per billing pod: "Images · RTX PRO 4500 · running 12 min · ~$0.50". */
+function QuitPodList({ items }: { items: GpuProfileInfo[] }) {
+  const now = useNow(items.length > 0, 15_000);
+  return (
+    <ul className="plain quit-pods">
+      {items.map((x) => {
+        const g = x.state!;
+        const started = toDate(g.startedAt);
+        const ms = started ? Math.max(0, now - started.getTime()) : 0;
+        const status =
+          g.status === "starting" ? `starting${g.phase ? ` (${g.phase})` : ""}` : g.status === "stopping" ? "stopping" : g.status === "error" ? "error — may still be billing" : "running";
+        return (
+          <li key={x.profile} className="quit-pods__row">
+            <span className={`quit-pods__dot quit-pods__dot--${g.status}`} aria-hidden />
+            <strong>{PROFILE_LABEL[x.profile]}</strong>
+            <span>· {x.gpuName}</span>
+            <span>· {status}</span>
+            {started && (
+              <span className="mono">
+                · {formatElapsed(ms)} · ~{formatUsd((ms / 3_600_000) * x.costPerHr)}
+              </span>
+            )}
+            <span className="hint mono">({x.costLabel})</span>
+          </li>
+        );
+      })}
+    </ul>
   );
 }

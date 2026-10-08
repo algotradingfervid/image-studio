@@ -26,6 +26,14 @@ pub const DEFAULT_GPU_TYPES: &[&str] = &[
     "NVIDIA GeForce RTX 4090",
     "NVIDIA RTX PRO 4000 Blackwell",
 ];
+/// Video profile (spec v5): its volume in CA-MTL-3 (Canada), and GPUs with
+/// at least 80 GB, in priority order.
+pub const DEFAULT_VIDEO_VOLUME_NAMES: &[&str] = &["image-studio-video"];
+pub const DEFAULT_VIDEO_GPU_TYPES: &[&str] = &[
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "NVIDIA H200",
+    "NVIDIA H100 80GB HBM3",
+];
 /// Git ref the pod's boot script fetches worker code from (`WORKER_REF`): a
 /// branch, tag or commit SHA of the image-studio repo (spec "v4").
 pub const DEFAULT_WORKER_REF: &str = "main";
@@ -210,6 +218,11 @@ pub struct AppConfig {
     pub volume_names: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_types: Option<Vec<String>>,
+    /// Video profile volume names / GPU list (config file only; spec v5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_volume_names: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_gpu_types: Option<Vec<String>>,
     /// `WORKER_REF` for the pod (default "main"). Pin a commit SHA for
     /// stability. Edited in the config file only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -341,6 +354,28 @@ impl Settings {
 
     pub fn gpu_types(&self) -> Vec<String> {
         list_or(self.config.lock().unwrap().gpu_types.as_ref(), DEFAULT_GPU_TYPES)
+    }
+
+    /// Volume names for a GPU profile (image: `volumeNames`, video: `videoVolumeNames`).
+    pub fn volume_names_for(&self, p: crate::pod::Profile) -> Vec<String> {
+        match p {
+            crate::pod::Profile::Image => self.volume_names(),
+            crate::pod::Profile::Video => list_or(
+                self.config.lock().unwrap().video_volume_names.as_ref(),
+                DEFAULT_VIDEO_VOLUME_NAMES,
+            ),
+        }
+    }
+
+    /// GPU priority list for a profile (image: `gpuTypes`, video: `videoGpuTypes`).
+    pub fn gpu_types_for(&self, p: crate::pod::Profile) -> Vec<String> {
+        match p {
+            crate::pod::Profile::Image => self.gpu_types(),
+            crate::pod::Profile::Video => list_or(
+                self.config.lock().unwrap().video_gpu_types.as_ref(),
+                DEFAULT_VIDEO_GPU_TYPES,
+            ),
+        }
     }
 
     /// `WORKER_REF` passed to the pod (config `workerRef`, default "main").

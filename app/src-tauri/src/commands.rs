@@ -4,9 +4,9 @@
 //! Errors are user-readable strings.
 
 use crate::db::ImageRecord;
-use crate::jobs::{self, GenerateRequest, Job, LoraChoice};
+use crate::jobs::{self, GenerateRequest, Job, LoraChoice, VideoRequest};
 use crate::links::ResolvedLora;
-use crate::pod::{self, GpuState};
+use crate::pod::{self, GpuState, Profile};
 use crate::references::{self, ImportedReference};
 use crate::runpod::Health;
 use crate::settings::{Backend, SavePodSettings, SaveSettings, SettingsView};
@@ -44,6 +44,9 @@ pub struct SettingsResponse {
     pub worker_ref: String,
     /// Pod container image (config file only).
     pub pod_image: String,
+    /// Video profile GPU list / volumes (config file only; spec v5).
+    pub video_gpu_types: Vec<String>,
+    pub video_volume_names: Vec<String>,
 }
 
 fn settings_response(core: &Core) -> SettingsResponse {
@@ -58,6 +61,8 @@ fn settings_response(core: &Core) -> SettingsResponse {
         fallback_cost_per_hr: pod::FALLBACK_COST_PER_HR,
         worker_ref: core.settings.worker_ref(),
         pod_image: core.settings.pod_image(),
+        video_gpu_types: core.settings.gpu_types_for(Profile::Video),
+        video_volume_names: core.settings.volume_names_for(Profile::Video),
     }
 }
 
@@ -90,30 +95,40 @@ pub fn save_settings(
     })?;
     if idle_minutes.is_some() {
         // Re-emit so the UI's GpuState.idleMinutes is current.
-        let s = pod::state(&core);
-        core.sink.gpu_update(&s);
+        for s in pod::states(&core) {
+            core.sink.gpu_update(&s);
+        }
     }
     Ok(settings_response(&core))
 }
 
 // ----- GPU pod -----
 
+/// `profile`: "image" (default) or "video".
 #[tauri::command]
-pub fn get_gpu_state(core: CoreState<'_>) -> GpuState {
-    pod::state(&core)
+pub fn get_gpu_state(core: CoreState<'_>, profile: Option<String>) -> Res<GpuState> {
+    Ok(pod::state_for(&core, Profile::parse(profile.as_deref())?))
+}
+
+/// Every profile's state: `[image, video]`.
+#[tauri::command]
+pub fn list_gpu_states(core: CoreState<'_>) -> Vec<GpuState> {
+    pod::states(&core)
 }
 
 #[tauri::command]
-pub async fn start_gpu(core: CoreState<'_>) -> Res<GpuState> {
-    if core.settings.backend() != Backend::Pod {
+pub async fn start_gpu(core: CoreState<'_>, profile: Option<String>) -> Res<GpuState> {
+    let p = Profile::parse(profile.as_deref())?;
+    if p == Profile::Image && core.settings.backend() != Backend::Pod {
         return Err("The app is set to use the serverless endpoint (Settings)".into());
     }
-    pod::start(&core)
+    pod::start_for(&core, p)
 }
 
 #[tauri::command]
-pub async fn stop_gpu(core: CoreState<'_>) -> Res<GpuState> {
-    pod::stop(&core, pod::StopReason::User).await
+pub async fn stop_gpu(core: CoreState<'_>, profile: Option<String>) -> Res<GpuState> {
+    let p = Profile::parse(profile.as_deref())?;
+    pod::stop_for(&core, p, pod::StopReason::User).await
 }
 
 /// Set once quitting is confirmed, so the exit isn't intercepted again.
@@ -126,8 +141,8 @@ impl QuitGuard {
     }
 }
 
-/// Answer to the `quit-requested` dialog. `stop_gpu`: stop the pod (and
-/// confirm it is gone) first; on failure nothing quits and the error is
+/// Answer to the `quit-requested` dialog. `stop_gpu`: stop EVERY profile's
+/// pod (and confirm each is gone) first; on failure nothing quits and the error is
 /// returned so the UI can offer "Try again" / "Quit anyway".
 #[tauri::command]
 pub async fn confirm_quit(
@@ -207,15 +222,17 @@ pub fn list_models(core: CoreState<'_>) -> Vec<Value> {
     status::model_views(&core)
 }
 
+/// `profile`: whose volume to check ("image" default, or "video").
 #[tauri::command]
-pub async fn refresh_status(core: CoreState<'_>) -> Res<StatusView> {
-    status::refresh_status(&core).await
+pub async fn refresh_status(core: CoreState<'_>, profile: Option<String>) -> Res<StatusView> {
+    let p = Profile::parse(profile.as_deref())?;
+    status::refresh_status_opts_for(&core, p, true).await
 }
 
 /// Additive: cached status (volume/checkedAt may be null) without a GPU call.
 #[tauri::command]
-pub fn get_status(core: CoreState<'_>) -> Res<StatusView> {
-    status::cached_view(&core)
+pub fn get_status(core: CoreState<'_>, profile: Option<String>) -> Res<StatusView> {
+    status::cached_view_for(&core, Profile::parse(profile.as_deref())?)
 }
 
 // ----- models -----
@@ -345,6 +362,42 @@ pub async fn generate(
     Ok(JobStarted { job_id })
 }
 
+/// Video generation (spec v5): one pod job on the video GPU profile.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn generate_video(
+    core: CoreState<'_>,
+    model: String,
+    prompt: String,
+    negative_prompt: Option<String>,
+    init_image_id: Option<String>,
+    init_image_gallery_id: Option<String>,
+    duration_s: f64,
+    fps: f64,
+    resolution: String,
+    seed: Option<u64>,
+    steps: Option<u32>,
+    cfg: Option<f64>,
+    audio: Option<bool>,
+) -> Res<JobStarted> {
+    let req = VideoRequest {
+        model,
+        prompt,
+        negative_prompt,
+        init_image_id,
+        init_image_gallery_id,
+        duration_s,
+        fps,
+        resolution,
+        seed,
+        steps,
+        cfg,
+        audio: audio.unwrap_or(false),
+    };
+    let job_id = jobs::generate_video(&core, req)?;
+    Ok(JobStarted { job_id })
+}
+
 #[tauri::command]
 pub fn cancel_job(core: CoreState<'_>, job_id: String) -> Res<()> {
     jobs::cancel_job(&core, &job_id)
@@ -378,15 +431,19 @@ pub fn delete_image(core: CoreState<'_>, id: String) -> Res<()> {
     let db = core.db.lock().unwrap();
     let rec = db.get_image(&id)?.ok_or("Image not found")?;
     db.delete_image(&id)?;
-    let images_dir = core.cfg.images_dir();
-    let p = PathBuf::from(&rec.path);
-    if p.starts_with(&images_dir) {
-        let _ = std::fs::remove_file(p);
+    // Only files the app wrote (images/, videos/) are removed.
+    let owned = [core.cfg.images_dir(), core.cfg.videos_dir()];
+    for f in std::iter::once(&rec.path).chain(rec.poster_path.as_ref()) {
+        let p = PathBuf::from(f);
+        if owned.iter().any(|d| p.starts_with(d)) {
+            let _ = std::fs::remove_file(p);
+        }
     }
     Ok(())
 }
 
-/// Additive: copy an image to a path chosen with the dialog plugin's save dialog.
+/// Additive: copy an image (or a video's .mp4) to a path chosen with the
+/// dialog plugin's save dialog.
 #[tauri::command]
 pub fn export_image(core: CoreState<'_>, id: String, dest_path: String) -> Res<()> {
     let rec = core
@@ -397,5 +454,8 @@ pub fn export_image(core: CoreState<'_>, id: String, dest_path: String) -> Res<(
         .ok_or("Image not found")?;
     std::fs::copy(&rec.path, &dest_path)
         .map(|_| ())
-        .map_err(|e| format!("Could not save the image: {e}"))
+        .map_err(|e| {
+            let what = if rec.kind == crate::db::KIND_VIDEO { "video" } else { "image" };
+            format!("Could not save the {what}: {e}")
+        })
 }

@@ -79,6 +79,46 @@ export function ModelPicker({
   );
 }
 
+// ---------------- Image / Video switch ----------------
+
+export type CreateMode = "image" | "video";
+
+const MODES: { id: CreateMode; label: string; icon: "image" | "video" }[] = [
+  { id: "image", label: "Image", icon: "image" },
+  { id: "video", label: "Video", icon: "video" },
+];
+
+/** Segmented Image | Video switch with radio semantics (arrow keys move the selection). */
+export function ModeSwitch({ value, onChange }: { value: CreateMode; onChange: (m: CreateMode) => void }) {
+  return (
+    <div
+      className="mode-switch"
+      role="radiogroup"
+      aria-label="What to create"
+      onKeyDown={radioKeys(
+        MODES.map((m) => m.id),
+        value,
+        onChange,
+      )}
+    >
+      {MODES.map((m) => (
+        <button
+          key={m.id}
+          type="button"
+          role="radio"
+          aria-checked={m.id === value}
+          tabIndex={m.id === value ? 0 : -1}
+          className={m.id === value ? "is-selected" : ""}
+          onClick={() => onChange(m.id)}
+        >
+          <Icon name={m.icon} size={15} />
+          {m.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 // ---------------- References ----------------
 
 export function References({
@@ -145,18 +185,26 @@ export function StartImage({
   busy,
   dragActive,
   onDenoise,
+  note,
   onRemove,
   onFiles,
   onPick,
+  onPickGallery,
 }: {
-  image: RefItem | null;
-  denoise: number;
+  image: Pick<RefItem, "thumbPath"> | null;
+  /** img2img strength; omit (with `onDenoise`) for a plain start frame (video i2v). */
+  denoise?: number;
   busy: boolean;
   dragActive: boolean;
-  onDenoise: (v: number) => void;
+  onDenoise?: (v: number) => void;
+  /** Shown instead of the strength slider when there is no `denoise`. */
+  note?: string;
   onRemove: () => void;
   onFiles: (files: File[]) => void;
+  /** "Browse computer": the native/browser file picker. */
   onPick: () => void;
+  /** "From gallery": open the gallery picker (offered when given). */
+  onPickGallery?: () => void;
 }) {
   const [over, setOver] = useState(false);
   const id = useId();
@@ -176,6 +224,21 @@ export function StartImage({
   };
 
   if (!image) {
+    if (onPickGallery) {
+      return (
+        <div className={`dropzone dropzone--single start-sources ${over || dragActive ? "is-over" : ""}`} {...dragProps}>
+          <div className="start-sources__btns">
+            <button type="button" className="btn btn--sm" onClick={onPickGallery} disabled={busy}>
+              <Icon name="image" size={14} /> From gallery
+            </button>
+            <button type="button" className="btn btn--sm" onClick={onPick} disabled={busy}>
+              <Icon name={busy ? "refresh" : "upload"} size={14} className={busy ? "spin" : ""} /> Browse computer
+            </button>
+          </div>
+          <span className="hint">{busy ? "Adding…" : "or drop / paste (⌘V) an image"}</span>
+        </div>
+      );
+    }
     return (
       <div className={`dropzone dropzone--single ${over || dragActive ? "is-over" : ""}`} {...dragProps}>
         <button type="button" className="dropzone__add" onClick={onPick} disabled={busy}>
@@ -200,31 +263,52 @@ export function StartImage({
         )}
       </figure>
       <div className="strength">
-        <div className="strength__head">
-          <label className="field__label" htmlFor={`${id}-denoise`}>
-            How much to change
-          </label>
-          <output className="mono strength__value" htmlFor={`${id}-denoise`}>
-            {denoise.toFixed(2)}
-          </output>
-        </div>
-        <input
-          id={`${id}-denoise`}
-          type="range"
-          min={DENOISE_MIN}
-          max={DENOISE_MAX}
-          step={DENOISE_STEP}
-          value={denoise}
-          aria-valuetext={`${denoise.toFixed(2)} (${denoise < 0.35 ? "close to the start image" : denoise > 0.75 ? "mostly reimagined" : "balanced"})`}
-          onChange={(e) => onDenoise(Math.round(Number(e.target.value) * 100) / 100)}
-        />
-        <div className="strength__ends" aria-hidden>
-          <span>Keep close</span>
-          <span>Reimagine</span>
-        </div>
-        <button type="button" className="link-btn strength__replace" onClick={onPick} disabled={busy}>
-          Replace image
-        </button>
+        {denoise != null && onDenoise ? (
+          <>
+            <div className="strength__head">
+              <label className="field__label" htmlFor={`${id}-denoise`}>
+                How much to change
+              </label>
+              <output className="mono strength__value" htmlFor={`${id}-denoise`}>
+                {denoise.toFixed(2)}
+              </output>
+            </div>
+            <input
+              id={`${id}-denoise`}
+              type="range"
+              min={DENOISE_MIN}
+              max={DENOISE_MAX}
+              step={DENOISE_STEP}
+              value={denoise}
+              aria-valuetext={`${denoise.toFixed(2)} (${denoise < 0.35 ? "close to the start image" : denoise > 0.75 ? "mostly reimagined" : "balanced"})`}
+              onChange={(e) => onDenoise(Math.round(Number(e.target.value) * 100) / 100)}
+            />
+            <div className="strength__ends" aria-hidden>
+              <span>Keep close</span>
+              <span>Reimagine</span>
+            </div>
+          </>
+        ) : (
+          note && <p className="hint start-image__note">{note}</p>
+        )}
+        {onPickGallery ? (
+          <div className="start-image__replace" role="group" aria-label="Replace the start image">
+            <span className="hint">Replace:</span>
+            <button type="button" className="link-btn" onClick={onPickGallery} disabled={busy}>
+              From gallery
+            </button>
+            <button type="button" className="link-btn" onClick={onPick} disabled={busy}>
+              Browse computer
+            </button>
+            <button type="button" className="link-btn link-btn--danger" onClick={onRemove} disabled={busy}>
+              Remove
+            </button>
+          </div>
+        ) : (
+          <button type="button" className="link-btn strength__replace" onClick={onPick} disabled={busy}>
+            Replace image
+          </button>
+        )}
       </div>
     </div>
   );

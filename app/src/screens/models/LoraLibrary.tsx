@@ -136,7 +136,7 @@ export function LoraLibrary() {
                   <option value="" disabled>
                     Choose a model…
                   </option>
-                  {lib.models.map((m) => (
+                  {lib.imageModels.map((m) => (
                     <option key={m.id} value={m.id}>
                       {m.name}
                     </option>

@@ -20,6 +20,15 @@ Actions (docs/spec.md, "Worker job protocol"):
             -> {downloaded: [filename], skipped: [filename], elapsedMs, avgMBps}
             (up to 3 files in parallel; progress is aggregated, see _run_downloads)
   delete    {files: [{folder, filename}]} -> {deleted: [filename], missing: [filename]}
+  generate_video (spec "v5")
+            {model: "h3" | "ltx25", prompt, negativePrompt?, initImage?: {name, base64},
+             durationS, fps, resolution: "WxH", seed?, steps?, cfg?, audio: bool}
+            -> {video: {base64, mime: "video/mp4", width, height, fps, frames, durationS,
+                        hasAudio},
+                poster: {base64, mime: "image/jpeg", width, height},
+                seed, timings: {loadMs, sampleMs, encodeMs, totalMs}}
+            initImage makes it image->video; the output keeps its aspect ratio
+            at the preset's pixel count. See worker/README.md.
 
 Failures are returned as {"error": "<CODE>: <detail>"}; the RunPod SDK then
 marks the job FAILED with that message.
@@ -54,17 +63,19 @@ import runpod
 
 from comfy_client import ComfyClient, ComfyError
 from downloader import DownloadConfig, DownloadError, download_file
-from registry import get_model, load_registry, model_ids
+from registry import get_model, get_video_model, load_registry, model_ids, video_model_ids
 from safe_paths import PathError, resolve, validate_filename, validate_folder
 from workflows import (DEFAULT_DENOISE, LOADER_STAGES, MAX_DENOISE, MIN_DENOISE, STAGE_PHASE,
-                       WorkflowError, build_workflow, graph_node_stages, graph_stages,
-                       init_image_size, sampler_node_ids)
+                       WorkflowError, build_video_workflow, build_workflow, graph_node_stages,
+                       graph_stages, init_image_size, sampler_node_ids)
 
 VOLUME_ROOT = Path(os.environ.get("VOLUME_ROOT", "/runpod-volume"))
 MODELS_ROOT = Path(os.environ.get("MODELS_ROOT", str(VOLUME_ROOT / "models")))
 COMFYUI_PATH = Path(os.environ.get("COMFYUI_PATH", "/comfyui"))
 COMFY_READY_TIMEOUT_S = float(os.environ.get("COMFY_READY_TIMEOUT_S", "300"))
 GENERATE_TIMEOUT_S = float(os.environ.get("GENERATE_TIMEOUT_S", "590"))
+# Video sampling + decode + encode of a 15-20 s clip can take well over 10 min.
+VIDEO_TIMEOUT_S = float(os.environ.get("VIDEO_TIMEOUT_S", "3000"))
 PROGRESS_MIN_INTERVAL_S = 0.5   # <= 2 progress updates per second
 DOWNLOAD_CONCURRENCY = int(os.environ.get("DOWNLOAD_CONCURRENCY", "3"))
 
@@ -72,7 +83,7 @@ MAX_LORAS = 3
 MAX_SEED = 2**64 - 1
 MIN_SIDE, MAX_SIDE = 64, 4096
 MAX_STEPS = 200
-LISTED_FOLDERS = ("unet", "clip", "vae")
+LISTED_FOLDERS = ("unet", "clip", "vae", "latent_upscale_models")
 
 PROGRESS_HOOK = "_progress"
 CANCEL_EVENT = "_cancel"
@@ -403,7 +414,7 @@ class StageTracker:
         now = clock()
         self.times[self.stage] = self.times.get(self.stage, 0) + _ms(now - self.stage_start)
         self.stage, self.stage_start = stage, now
-        if stage in ("decoding", "saving"):
+        if stage in ("decoding", "video_decoding", "audio_decoding", "encoding_video", "saving"):
             self.step = self.total
         self.send(force=True)
 
@@ -431,16 +442,22 @@ class StageTracker:
 
 
 def _watch(client: ComfyClient, ws, prompt_id: str, samplers: set[str], total_steps: int,
-           progress: Throttle, t_queued: float, tracker: StageTracker | None = None) -> dict:
+           progress: Throttle, t_queued: float, tracker: StageTracker | None = None,
+           step_offsets: dict[str, int] | None = None,
+           timeout_s: float | None = None) -> dict:
     """Follows the ComfyUI websocket until the prompt finishes.
 
     Returns {"error": str} or {"sample_start": t|None, "sample_end": t|None}.
     loadMs = first sampler progress event - queue time (model loading happens
     lazily inside the sampler node, so "executing" is too early a marker).
+    step_offsets (video, several samplers in a row): {sampler node: steps of
+    the samplers before it}, so step/totalSteps count across all of them; a
+    later sampler's progress also moves sample_end past the nodes in between.
     """
     if tracker is None:
         tracker = StageTracker(progress, {}, total_steps, t_queued)
-    deadline = t_queued + GENERATE_TIMEOUT_S
+    timeout_s = GENERATE_TIMEOUT_S if timeout_s is None else timeout_s
+    deadline = t_queued + timeout_s
     sample_start = sample_end = None
     interrupted = False
     for msg in client.iter_messages(ws):
@@ -451,7 +468,7 @@ def _watch(client: ComfyClient, ws, prompt_id: str, samplers: set[str], total_st
             client.interrupt()
         if msg is None:
             if now > deadline:
-                return {"error": f"COMFYUI_TIMEOUT: no result after {GENERATE_TIMEOUT_S:.0f}s"}
+                return {"error": f"COMFYUI_TIMEOUT: no result after {timeout_s:.0f}s"}
             hist = client.history(prompt_id)
             if hist.get("status", {}).get("completed"):
                 break
@@ -464,7 +481,13 @@ def _watch(client: ComfyClient, ws, prompt_id: str, samplers: set[str], total_st
         if mtype == "progress" and data.get("node") in samplers:
             if sample_start is None:
                 sample_start = now
-            tracker.on_progress(int(data.get("value", 0)), int(data.get("max", tracker.total)))
+            if step_offsets is not None:
+                sample_end = None  # still sampling (e.g. LTX stage 2 after the upscaler)
+                tracker.on_progress(step_offsets.get(data.get("node"), 0) + int(data.get("value", 0)),
+                                    total_steps)
+            else:
+                tracker.on_progress(int(data.get("value", 0)),
+                                    int(data.get("max", tracker.total)))
         elif mtype == "execution_cached":
             tracker.on_cached(data.get("nodes") or [])
         elif mtype == "executing":
@@ -594,6 +617,258 @@ def _cleanup(img: dict, ref_names: list[str]) -> None:
             t.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# generate_video (spec "v5")
+# ---------------------------------------------------------------------------
+MAX_VIDEO_STEPS = 100
+POSTER_JPEG_QUALITY = 90
+
+
+def validate_generate_video(inp: dict, registry: dict) -> dict:
+    mid = inp.get("model")
+    if mid not in video_model_ids(registry):
+        raise InputError(f"UNKNOWN_MODEL: {mid!r} (video models: "
+                         f"{', '.join(video_model_ids(registry))})")
+    model = get_video_model(registry, mid)
+    d, lim = model["defaults"], model["limits"]
+    prompt = inp.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise InputError("INVALID_INPUT: prompt is required")
+    neg = inp.get("negativePrompt")
+    if neg is not None and not isinstance(neg, str):
+        raise InputError("INVALID_INPUT: negativePrompt must be a string")
+    init = None
+    if inp.get("initImage") is not None:
+        if "i2v" not in model.get("modes", []):
+            raise InputError(f"I2V_NOT_SUPPORTED: {mid} does not accept a start image")
+        data, ext, mime = _decode_image(inp["initImage"], "INVALID_INIT_IMAGE", "initImage")
+        size = image_size(data, ext)
+        if size is None or size[0] <= 0 or size[1] <= 0:
+            raise InputError("INVALID_INIT_IMAGE: could not read the size of initImage")
+        init = {"data": data, "ext": ext, "mime": mime, "width": size[0], "height": size[1]}
+    duration = _number(inp, "durationS", float, float(lim.get("minDurationS", 0)),
+                       float(lim["maxDurationS"]), required=False)
+    fps = _number(inp, "fps", float, 1, 120, required=False)
+    if fps is not None and (not fps.is_integer() or int(fps) not in lim["fpsOptions"]):
+        raise InputError(f"INVALID_INPUT: fps must be one of {lim['fpsOptions']} for {mid}")
+    resolution = inp.get("resolution")
+    if resolution is not None:
+        if not isinstance(resolution, str) or resolution not in lim["resolutions"]:
+            raise InputError(f"INVALID_INPUT: resolution must be one of "
+                             f"{', '.join(lim['resolutions'])} for {mid}")
+    seed = _number(inp, "seed", int, 0, MAX_SEED, required=False)
+    if seed is None:
+        seed = random.randint(0, 2**53 - 1)
+    steps = _number(inp, "steps", int, 1, MAX_VIDEO_STEPS, required=False)
+    cfg = _number(inp, "cfg", float, 0.0, 30.0, required=False)
+    audio = inp.get("audio", True)
+    if not isinstance(audio, bool):
+        raise InputError("INVALID_INPUT: audio must be true or false")
+    return {
+        "model": mid, "prompt": prompt, "negativePrompt": neg,
+        "durationS": d["durationS"] if duration is None else duration,
+        "fps": int(d["fps"] if fps is None else fps),
+        "resolution": d["resolution"] if resolution is None else resolution,
+        "seed": seed, "steps": steps, "cfg": cfg, "audio": audio, "initImage": init,
+    }
+
+
+def mp4_info(data: bytes) -> dict | None:
+    """Reads an MP4's moov box: {width, height, frames, fps, durationS,
+    hasAudio} from the first video track (tkhd size, mdhd duration/timescale,
+    stsz sample count) and whether a sound track exists. None if unreadable.
+    Standard library only (ISO/IEC 14496-12 box layout)."""
+
+    def boxes(buf: bytes, start: int, end: int):
+        i = start
+        while i + 8 <= end:
+            size, kind = struct.unpack(">I4s", buf[i:i + 8])
+            hdr = 8
+            if size == 1:
+                if i + 16 > end:
+                    return
+                (size,) = struct.unpack(">Q", buf[i + 8:i + 16])
+                hdr = 16
+            elif size == 0:
+                size = end - i
+            if size < hdr or i + size > end:
+                return
+            yield kind, i + hdr, i + size
+            i += size
+
+    def child(buf, start, end, kind):
+        return next(((s, e) for k, s, e in boxes(buf, start, end) if k == kind), None)
+
+    try:
+        moov = child(data, 0, len(data), b"moov")
+        if moov is None:
+            return None
+        video, has_audio = None, False
+        for kind, s, e in boxes(data, *moov):
+            if kind != b"trak":
+                continue
+            mdia = child(data, s, e, b"mdia")
+            hdlr = mdia and child(data, *mdia, b"hdlr")
+            if not hdlr:
+                continue
+            handler_type = data[hdlr[0] + 8:hdlr[0] + 12]
+            if handler_type == b"soun":
+                has_audio = True
+            elif handler_type == b"vide" and video is None:
+                tkhd = child(data, s, e, b"tkhd")
+                mdhd = child(data, *mdia, b"mdhd")
+                minf = child(data, *mdia, b"minf")
+                stbl = minf and child(data, *minf, b"stbl")
+                stsz = stbl and child(data, *stbl, b"stsz")
+                if not (tkhd and mdhd and stsz):
+                    continue
+                w, h = struct.unpack(">II", data[tkhd[1] - 8:tkhd[1]])
+                ver = data[mdhd[0]]
+                if ver == 1:
+                    timescale, duration = struct.unpack(">IQ", data[mdhd[0] + 20:mdhd[0] + 32])
+                else:
+                    timescale, duration = struct.unpack(">II", data[mdhd[0] + 12:mdhd[0] + 20])
+                (frames,) = struct.unpack(">I", data[stsz[0] + 8:stsz[0] + 12])
+                video = {"width": w >> 16, "height": h >> 16, "frames": frames,
+                         "durationS": round(duration / timescale, 3) if timescale else None}
+        if video is None:
+            return None
+        video["hasAudio"] = has_audio
+        if video["durationS"]:
+            video["fps"] = round(video["frames"] / video["durationS"], 3)
+        return video
+    except (struct.error, IndexError, TypeError):
+        return None
+
+
+def poster_jpeg(png: bytes) -> tuple[bytes, str]:
+    """Frame-0 PNG -> JPEG (q90) with Pillow (installed with ComfyUI in the
+    image). Without Pillow the PNG is returned as is."""
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+    except ImportError:
+        return png, "image/png"
+    with Image.open(BytesIO(png)) as im:
+        out = BytesIO()
+        im.convert("RGB").save(out, "JPEG", quality=POSTER_JPEG_QUALITY)
+    return out.getvalue(), "image/jpeg"
+
+
+def missing_video_files(model: dict) -> list[str]:
+    return [f"{f['folder']}/{f['filename']}" for f in model["files"]
+            if not (MODELS_ROOT / f["folder"] / f["filename"]).is_file()]
+
+
+def _first_output(hist: dict, node: str) -> dict | None:
+    items = (hist.get("outputs", {}).get(node) or {}).get("images") or []
+    return items[0] if items else None
+
+
+def do_generate_video(job: dict, inp: dict) -> dict:
+    t0 = clock()
+    registry = load_registry()
+    params = validate_generate_video(inp, registry)
+    model = get_video_model(registry, params["model"])
+    missing = missing_video_files(model)
+    if missing:
+        return {"error": "MODEL_NOT_INSTALLED: " + ", ".join(missing)}
+
+    init = params["initImage"]
+
+    def graph_params(init_name: str | None) -> dict:
+        gi = None if init is None else {"name": init_name, "width": init["width"],
+                                        "height": init["height"]}
+        return {**params, "initImage": gi}
+
+    progress = Throttle(job)
+    preview, info = build_video_workflow(graph_params("init"), registry)
+    tracker = StageTracker(progress, preview, info["totalSteps"], t0)
+    tracker.send(force=True)
+
+    client = make_client()
+    client.wait_ready(COMFY_READY_TIMEOUT_S)
+    tag = uuid.uuid4().hex[:12]
+    uploads = []
+    init_name = None
+    if init is not None:
+        init_name = client.upload_image(f"is_{tag}_init.{init['ext']}", init["data"], init["mime"])
+        uploads.append(init_name)
+
+    graph, info = build_video_workflow(graph_params(init_name), registry)
+    tracker.set_graph(graph)
+    offsets, acc = {}, 0
+    for node, n in info["samplers"]:
+        offsets[node] = acc
+        acc += n
+
+    if cancelled(job):
+        return {"error": "CANCELLED: cancelled before the prompt was queued"}
+    ws = client.connect_ws()
+    try:
+        t_queued = clock()
+        prompt_id = client.queue_prompt(graph)
+        res = _watch(client, ws, prompt_id, set(offsets), info["totalSteps"], progress, t_queued,
+                     tracker, step_offsets=offsets, timeout_s=VIDEO_TIMEOUT_S)
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+    if "error" in res:
+        return res
+
+    tracker.enter("saving")
+    hist = client.history(prompt_id)
+    vid = _first_output(hist, info["videoNode"])
+    if vid is None:
+        if hist.get("status", {}).get("status_str") == "error":
+            return {"error": _history_error(hist)}
+        return {"error": "COMFYUI_NO_OUTPUT: the workflow produced no video"}
+    mp4 = client.view(vid["filename"], vid.get("subfolder", ""), vid.get("type", "output"))
+    poster = None
+    pst = _first_output(hist, info["posterNode"])
+    if pst is not None:
+        png = client.view(pst["filename"], pst.get("subfolder", ""), pst.get("type", "output"))
+        size = png_size(png) or (info["width"], info["height"])
+        try:
+            data, mime = poster_jpeg(png)
+        except Exception:  # a broken poster must not lose the video
+            traceback.print_exc()
+            data, mime = png, "image/png"
+        poster = {"base64": base64.b64encode(data).decode("ascii"), "mime": mime,
+                  "width": size[0], "height": size[1]}
+    _cleanup(vid, uploads)
+    if pst is not None:
+        _cleanup(pst, [])
+
+    probed = mp4_info(mp4) or {}
+    video = {
+        "base64": base64.b64encode(mp4).decode("ascii"),
+        "mime": "video/mp4",
+        "width": probed.get("width") or info["width"],
+        "height": probed.get("height") or info["height"],
+        "fps": info["fps"],
+        "frames": probed.get("frames") or info["frames"],
+        "durationS": probed.get("durationS") or info["durationS"],
+        "hasAudio": probed.get("hasAudio", info["hasAudio"]),
+        "sizeBytes": len(mp4),
+    }
+    t_end = clock()
+    s0, s1 = res["sample_start"], res["sample_end"]
+    load_ms = _ms((s0 if s0 is not None else t_end) - t0)
+    sample_ms = _ms(s1 - s0) if s0 is not None and s1 is not None else 0
+    return {
+        "video": video,
+        "poster": poster,
+        "seed": params["seed"],
+        "timings": {"loadMs": load_ms, "sampleMs": sample_ms,
+                    "encodeMs": _ms(t_end - s1) if s1 is not None else 0,
+                    "totalMs": _ms(t_end - t0)},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -783,6 +1058,7 @@ def do_delete(job: dict, inp: dict) -> dict:
 # ---------------------------------------------------------------------------
 ACTIONS = {
     "generate": do_generate,
+    "generate_video": do_generate_video,
     "status": do_status,
     "download": do_download,
     "delete": do_delete,

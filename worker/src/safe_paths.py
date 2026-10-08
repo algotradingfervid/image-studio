@@ -1,6 +1,8 @@
 """Path sanitising for every file the worker touches on the network volume.
 
-Spec: `folder` must be one of `unet`, `clip`, `vae`, `loras/<modelId>`.
+Spec: `folder` must be one of `unet`, `clip`, `vae`, `loras/<modelId>`, plus
+`latent_upscale_models` (v5 video: the LTX-2.5 spatial upscaler, loaded by
+ComfyUI's LatentUpscaleModelLoader from that folder name).
 Filenames: no `/`, no `..`, extension `.safetensors`. Anything else is rejected.
 """
 
@@ -10,7 +12,7 @@ import os
 import re
 from pathlib import Path
 
-BASE_FOLDERS = ("unet", "clip", "vae")
+BASE_FOLDERS = ("unet", "clip", "vae", "latent_upscale_models")
 EXTENSION = ".safetensors"
 MAX_FILENAME = 200
 

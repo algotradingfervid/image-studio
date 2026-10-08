@@ -27,7 +27,14 @@ const STAGE_LABEL: Record<string, string> = {
   sampling: "Generating",
   decoding: "Decoding",
   saving: "Saving",
+  // video (spec v5)
+  video_decoding: "Decoding video",
+  audio_decoding: "Decoding audio",
+  encoding_video: "Encoding MP4",
 };
+
+/** Stages after sampling: the bar sits at 100%. */
+const POST_STAGES = new Set(["decoding", "saving", "video_decoding", "audio_decoding", "encoding_video"]);
 
 const LOADER_STAGES = new Set(["loading_text_encoder", "loading_model"]);
 
@@ -69,6 +76,7 @@ function etaText(seconds: number): string {
 export function JobCard({
   job,
   podMode,
+  gpuNote,
   onCancel,
   onDismiss,
   onOpenImage,
@@ -76,6 +84,8 @@ export function JobCard({
   job: JobView;
   /** Dedicated GPU pod backend (vs legacy serverless): changes what "starting" means. */
   podMode: boolean;
+  /** Video jobs: the cost note while the video GPU is off/starting. */
+  gpuNote?: string | null;
   onCancel: () => void;
   onDismiss: () => void;
   onOpenImage: (id: string) => void;
@@ -95,6 +105,8 @@ export function JobCard({
   }, [job.completed, job.modelName]);
 
   const k = Math.min(job.completed + 1, job.total);
+  const video = job.kind === "video";
+  const noun = video ? "video" : "image";
   const p = job.progress;
   const staged = job.status === "running" && !!p?.stage;
   const podPhase = job.status === "starting" && p?.phase ? p.phase : null;
@@ -126,10 +138,10 @@ export function JobCard({
       break;
     case "starting":
       if (podPhase) {
-        title = "Starting GPU";
+        title = video ? "Starting the video GPU" : "Starting GPU";
         steps = podSteps(podPhase, podSeen.current, now);
         bar = null;
-        hint = "First start on a new machine downloads the image (~3–8 min).";
+        hint = "First start on a new machine downloads the container image (~3–8 min).";
       } else {
         title = podMode ? "Queued on the GPU…" : "Starting GPU… (cold start can take a minute)";
         bar = { value: 0, indeterminate: true, tone: podMode ? "muted" : "warn" };
@@ -138,7 +150,7 @@ export function JobCard({
     case "running":
       if (staged) {
         const prog = p!;
-        title = job.total > 1 ? `Generating image ${k} of ${job.total}` : "Generating image";
+        title = job.total > 1 ? `Generating ${noun} ${k} of ${job.total}` : `Generating ${noun}`;
         steps = stageSteps(prog, sinceUpdate);
         const step = prog.step ?? 0;
         const total = prog.totalSteps ?? 0;
@@ -149,7 +161,7 @@ export function JobCard({
             left: `Step ${step} of ${total} · ${Math.round(percent)}%`,
             right: eta == null ? "estimating…" : etaText(eta),
           };
-        } else if (prog.stage === "decoding" || prog.stage === "saving") {
+        } else if (POST_STAGES.has(String(prog.stage))) {
           bar = { value: 100, indeterminate: false };
         } else {
           bar = { value: 0, indeterminate: true };
@@ -171,7 +183,7 @@ export function JobCard({
       }
       break;
     case "completed":
-      title = `Done — ${job.total} image${job.total > 1 ? "s" : ""}`;
+      title = `Done — ${job.total} ${noun}${job.total > 1 ? "s" : ""}`;
       bar = { value: 100, indeterminate: false };
       break;
     case "cancelled":
@@ -183,11 +195,13 @@ export function JobCard({
       bar = { value: 100, indeterminate: false, tone: "warn" };
   }
 
+  if (gpuNote && (job.status === "queued" || job.status === "starting")) hint = gpuNote;
+
   const showCountTag = job.total > 1 && active && !staged;
   const promptLine = `${job.modelName}${job.prompt ? ` · ${job.prompt}` : ""}`;
 
   return (
-    <article className={`job-card job-card--${job.status}`} aria-label={`Generation: ${job.prompt}`}>
+    <article className={`job-card job-card--${job.status}`} aria-label={`${video ? "Video" : "Generation"}: ${job.prompt}`}>
       <div className="job-card__head">
         <div className="job-card__status">
           {active ? <span className="pulse" aria-hidden /> : <Icon name={job.status === "completed" ? "check" : job.status === "failed" ? "alert" : "stop"} />}
@@ -198,7 +212,7 @@ export function JobCard({
         <div className="job-card__meta">
           {showCountTag && (
             <span className="tag mono">
-              image {k} of {job.total}
+              {noun} {k} of {job.total}
             </span>
           )}
           {active && (
@@ -235,7 +249,7 @@ export function JobCard({
 
       {bar && (
         <div className="job-card__progress">
-          <ProgressBar label="Generation progress" value={bar.value} indeterminate={bar.indeterminate} tone={bar.tone} />
+          <ProgressBar label={video ? "Video progress" : "Generation progress"} value={bar.value} indeterminate={bar.indeterminate} tone={bar.tone} />
           {caption && (
             <div className="job-card__caption mono">
               <span>{caption.left}</span>
@@ -259,8 +273,8 @@ export function JobCard({
         {job.images.length > 0 && (
           <div className="job-card__thumbs">
             {job.images.map((im) => (
-              <button key={im.id} type="button" className="job-thumb" onClick={() => onOpenImage(im.id)} aria-label={`Open image seed ${im.seed}`}>
-                <img src={fileSrc(im.path)} alt="" />
+              <button key={im.id} type="button" className="job-thumb" onClick={() => onOpenImage(im.id)} aria-label={`Open ${im.kind === "video" ? "video" : "image"} seed ${im.seed}`}>
+                <img src={fileSrc(im.kind === "video" ? (im.posterPath ?? "") : im.path)} alt="" />
               </button>
             ))}
           </div>

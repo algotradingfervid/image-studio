@@ -3,23 +3,35 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import * as api from "../api";
-import type { Lora, ModelView, Settings, StatusSnapshot, Task } from "../api";
+import type { GpuProfile, Lora, ModelView, Settings, StatusSnapshot, Task } from "../api";
+
+type VolumeStatus = Pick<StatusSnapshot, "volume" | "checkedAt">;
 import { useToast } from "./toast";
 
 interface Library {
   settings: Settings | null;
+  /** All models (image and video). Image-only consumers use `imageModels`. */
   models: ModelView[];
+  /** `kind !== "video"`. */
+  imageModels: ModelView[];
+  /** `kind === "video"` (spec v5). */
+  videoModels: ModelView[];
   loras: Lora[];
-  status: Pick<StatusSnapshot, "volume" | "checkedAt"> | null;
+  /** The image volume's status. */
+  status: VolumeStatus | null;
+  /** The video volume's status (spec v5). */
+  videoStatus: VolumeStatus | null;
   loaded: boolean;
+  /** The image volume refresh is running. */
   refreshing: boolean;
+  videoRefreshing: boolean;
   reloadSettings(): Promise<void>;
   reloadModels(): Promise<void>;
   reloadLoras(): Promise<void>;
-  /** Re-read the cached status (no GPU). */
-  reloadStatus(): Promise<void>;
-  /** Ask the worker for fresh status (starts a GPU). */
-  refreshStatus(): Promise<void>;
+  /** Re-read the cached status of one profile's volume, or both (no GPU). */
+  reloadStatus(profile?: GpuProfile): Promise<void>;
+  /** Ask the worker for fresh status (starts that profile's GPU). */
+  refreshStatus(profile?: GpuProfile): Promise<void>;
   /** Apply a task returned by a command before its first event arrives. */
   applyTask(task: Task): void;
 }
@@ -39,9 +51,11 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [models, setModels] = useState<ModelView[]>([]);
   const [loras, setLoras] = useState<Lora[]>([]);
-  const [status, setStatus] = useState<Library["status"]>(null);
+  const [status, setStatus] = useState<VolumeStatus | null>(null);
+  const [videoStatus, setVideoStatus] = useState<VolumeStatus | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [videoRefreshing, setVideoRefreshing] = useState(false);
   const modelsRef = useRef(models);
   modelsRef.current = models;
   const lorasRef = useRef(loras);
@@ -73,27 +87,43 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
 
   const applyStatus = useCallback((s: StatusSnapshot) => {
     if (s.models?.length) setModels(s.models);
-    setStatus({ volume: s.volume, checkedAt: s.checkedAt });
+    // The snapshot's volume/checkedAt describe one profile's volume (older cores: the image one).
+    const v = { volume: s.volume, checkedAt: s.checkedAt };
+    if (s.profile === "video") setVideoStatus(v);
+    else setStatus(v);
   }, []);
 
-  const reloadStatus = useCallback(async () => {
-    try {
-      applyStatus(await api.getStatus());
-    } catch (e) {
-      toast.error("Couldn't load the volume status", e);
-    }
-  }, [applyStatus, toast]);
+  const reloadStatus = useCallback(
+    async (profile?: GpuProfile) => {
+      const profiles: GpuProfile[] = profile ? [profile] : ["image", "video"];
+      try {
+        // Sequential so the models list from the last one wins consistently.
+        for (const p of profiles) {
+          const snap = await api.getStatus(p);
+          applyStatus({ ...snap, profile: snap.profile ?? p });
+        }
+      } catch (e) {
+        toast.error("Couldn't load the volume status", e);
+      }
+    },
+    [applyStatus, toast],
+  );
 
-  const refreshStatus = useCallback(async () => {
-    setRefreshing(true);
-    try {
-      applyStatus(await api.refreshStatus());
-    } catch (e) {
-      toast.error("Refresh failed", e);
-    } finally {
-      setRefreshing(false);
-    }
-  }, [applyStatus, toast]);
+  const refreshStatus = useCallback(
+    async (profile: GpuProfile = "image") => {
+      const setBusy = profile === "video" ? setVideoRefreshing : setRefreshing;
+      setBusy(true);
+      try {
+        const snap = await api.refreshStatus(profile);
+        applyStatus({ ...snap, profile: snap.profile ?? profile });
+      } catch (e) {
+        toast.error(profile === "video" ? "Video volume refresh failed" : "Refresh failed", e);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [applyStatus, toast],
+  );
 
   const applyTask = useCallback((t: Task) => {
     const live = terminal(t) ? null : t;
@@ -103,7 +133,7 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let alive = true;
-    Promise.all([reloadSettings(), reloadModels().then(reloadStatus), reloadLoras()]).finally(() => alive && setLoaded(true));
+    Promise.all([reloadSettings(), reloadModels().then(() => reloadStatus()), reloadLoras()]).finally(() => alive && setLoaded(true));
     const un = api.onEvent("task-update", (t) => {
       applyTask(t);
       if (!terminal(t)) return;
@@ -129,9 +159,29 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
     };
   }, [applyStatus, applyTask, reloadLoras, reloadModels, reloadSettings, reloadStatus, toast]);
 
+  const imageModels = useMemo(() => models.filter((m) => m.kind !== "video"), [models]);
+  const videoModels = useMemo(() => models.filter((m) => m.kind === "video"), [models]);
+
   const value = useMemo<Library>(
-    () => ({ settings, models, loras, status, loaded, refreshing, reloadSettings, reloadModels, reloadLoras, reloadStatus, refreshStatus, applyTask }),
-    [settings, models, loras, status, loaded, refreshing, reloadSettings, reloadModels, reloadLoras, reloadStatus, refreshStatus, applyTask],
+    () => ({
+      settings,
+      models,
+      imageModels,
+      videoModels,
+      loras,
+      status,
+      videoStatus,
+      loaded,
+      refreshing,
+      videoRefreshing,
+      reloadSettings,
+      reloadModels,
+      reloadLoras,
+      reloadStatus,
+      refreshStatus,
+      applyTask,
+    }),
+    [settings, models, imageModels, videoModels, loras, status, videoStatus, loaded, refreshing, videoRefreshing, reloadSettings, reloadModels, reloadLoras, reloadStatus, refreshStatus, applyTask],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

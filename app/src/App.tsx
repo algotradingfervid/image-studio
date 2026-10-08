@@ -1,13 +1,13 @@
 import { useEffect, useState } from "react";
 import { inTauri, isConfigured } from "./api";
 import { ErrorBoundary } from "./components/ErrorBoundary";
-import { GpuPill } from "./components/GpuPill";
+import { GpuPills } from "./components/GpuPill";
 import { Icon, type IconName } from "./components/Icon";
 import { radioKeys } from "./components/radio";
 import { CreateScreen } from "./screens/create/CreateScreen";
 import { ModelsScreen } from "./screens/models/ModelsScreen";
 import { SettingsScreen } from "./screens/settings/SettingsScreen";
-import { GpuProvider, useGpu } from "./state/gpu";
+import { GpuProvider, PROFILE_LABEL, PROFILES, useGpu } from "./state/gpu";
 import { LibraryProvider, useLibrary } from "./state/library";
 import { ToastProvider } from "./state/toast";
 
@@ -25,9 +25,14 @@ function Shell() {
   const s = lib.settings;
   const needsSetup = !!s && !isConfigured(s);
   const gpu = useGpu();
-  const [keepPod, setKeepPod] = useState(false);
-  const g = gpu.state;
-  const leftRunning = gpu.podMode && !keepPod && !!g?.leftRunning && (g.status === "running" || g.status === "starting");
+  // Startup banner: a pod of either profile was found running at launch and re-adopted.
+  const [keptPods, setKeptPods] = useState<Set<string>>(() => new Set());
+  const leftRunning = gpu.podMode
+    ? PROFILES.map((p) => gpu.profiles[p]).filter((x) => {
+        const g = x.state;
+        return !keptPods.has(x.profile) && !!g?.leftRunning && (g.status === "running" || g.status === "starting");
+      })
+    : [];
   const activeDownloads = lib.models.filter((m) => m.task && (m.task.status === "running" || m.task.status === "queued")).length;
 
   useEffect(() => {
@@ -93,7 +98,7 @@ function Shell() {
           ))}
         </nav>
         <div className="toolbar__end" data-tauri-drag-region>
-          <GpuPill />
+          <GpuPills />
         </div>
       </header>
 
@@ -111,19 +116,30 @@ function Shell() {
         </div>
       )}
 
-      {leftRunning && (
+      {leftRunning.length > 0 && (
         <div className="banner banner--warn" role="status">
           <Icon name="alert" />
           <span>
-            A GPU pod is still running ({gpu.state?.gpuType ? `${gpu.gpuName}, ` : ""}
-            {gpu.costLabel}).
+            {leftRunning.length > 1 ? "GPU pods are still running: " : "A GPU pod is still running: "}
+            {leftRunning
+              .map((x) => `${PROFILE_LABEL[x.profile]}${x.state?.gpuType ? ` (${x.gpuName}, ${x.costLabel})` : ` (${x.costLabel})`}`)
+              .join(" and ")}
+            .
           </span>
           <span className="banner__actions">
-            <button type="button" className="btn btn--sm" onClick={gpu.stop}>
-              <Icon name="stop" size={13} /> Stop it
+            <button
+              type="button"
+              className="btn btn--sm"
+              onClick={() => leftRunning.forEach((x) => gpu.stop(x.profile))}
+            >
+              <Icon name="stop" size={13} /> {leftRunning.length > 1 ? "Stop them" : "Stop it"}
             </button>
-            <button type="button" className="btn btn--sm btn--ghost" onClick={() => setKeepPod(true)}>
-              Keep it
+            <button
+              type="button"
+              className="btn btn--sm btn--ghost"
+              onClick={() => setKeptPods((k) => new Set([...k, ...leftRunning.map((x) => x.profile)]))}
+            >
+              {leftRunning.length > 1 ? "Keep them" : "Keep it"}
             </button>
           </span>
         </div>

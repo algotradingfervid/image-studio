@@ -274,6 +274,39 @@ export function SettingsScreen() {
                   </p>
                 </div>
               </div>
+              <div className="field-row">
+                <div className="field">
+                  <label className="field__label" htmlFor="video-gpu-types">
+                    Video GPU priority
+                  </label>
+                  <input
+                    id="video-gpu-types"
+                    className="input"
+                    value={(s?.videoGpuTypes ?? []).map(shortGpuName).join(" → ") || "—"}
+                    title={(s?.videoGpuTypes ?? []).join("\n")}
+                    readOnly
+                    aria-describedby="video-gpu-help"
+                  />
+                  <p id="video-gpu-help" className="hint">
+                    The video pod (Canada) gets the first one available.
+                  </p>
+                </div>
+                <div className="field">
+                  <label className="field__label" htmlFor="video-volumes">
+                    Video volume
+                  </label>
+                  <input
+                    id="video-volumes"
+                    className="input mono"
+                    value={(s?.videoVolumeNames ?? []).join(", ") || "—"}
+                    readOnly
+                    aria-describedby="video-volumes-help"
+                  />
+                  <p id="video-volumes-help" className="hint">
+                    Image volume: <span className="mono">{(s?.volumeNames ?? []).join(", ") || "—"}</span>. Change both lists in the settings file.
+                  </p>
+                </div>
+              </div>
               <div className="field">
                 <label className="field__label" htmlFor="worker-ref">
                   Worker code

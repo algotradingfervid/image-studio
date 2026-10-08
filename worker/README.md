@@ -144,6 +144,7 @@ Docker Hub. The published image config shows:
 | `DOWNLOAD_CONCURRENCY` | Files downloaded in parallel. Default 3. |
 | `COMFY_READY_TIMEOUT_S` | How long `generate` waits for ComfyUI to boot. Default 300. |
 | `GENERATE_TIMEOUT_S` | Generation watchdog. Default 590, just under the 600 s job policy. |
+| `VIDEO_TIMEOUT_S` | `generate_video` watchdog. Default 3000 s; send `policy.executionTimeout` ≥ 3 000 000 ms. |
 
 The image and boot script set these; you normally don't change them: `REGISTRY_PATH`, `VOLUME_ROOT=/runpod-volume`, `COMFYUI_PATH=/comfyui`, `PYTHONPATH`, `IMAGE_STUDIO_CODE_INFO`.
 
@@ -199,7 +200,7 @@ Every route also answers under `/v2/<anything>/…`, so the serverless URL shape
 
 **Execution:**
 
-- `generate` jobs run one at a time in FIFO order on a dedicated thread.
+- `generate` and `generate_video` jobs share one FIFO queue and run one at a time on a dedicated thread. Cancelling a running video job interrupts ComfyUI, as for `generate`.
 - `status`, `download` and `delete` jobs, and any unknown action, run on a separate pool of 4 threads, concurrently with generation.
 - Both paths call `handler.handler(job)` unchanged. The server passes a progress hook (`job["_progress"]`) and a cancel event (`job["_cancel"]`) in the job dict. In serverless mode these keys are absent, so `progress_update` is used as before.
 - `policy.executionTimeout` (ms) is honoured. A job running longer than that is cancelled and reported as `TIMED_OUT`.
@@ -253,7 +254,11 @@ Terminating releases the GPU and detaches the network volume without deleting it
   clip/               text encoders      (ComfyUI: text_encoders / clip)
   vae/
   loras/<modelId>/    LoRAs; ComfyUI lora_name = "<modelId>/<filename>"
+  latent_upscale_models/   video (v5): the LTX-2.5 x2 spatial latent upscaler
 ```
+
+The video models live on their own volume, `image-studio-video` (CA-MTL-3), with the
+same layout. `extra_model_paths.yaml` maps every folder to `/runpod-volume/models/<folder>`.
 
 ## Protocol
 
@@ -267,6 +272,7 @@ On any failure the handler returns `{"error": "<CODE>: <detail>"}`, and RunPod m
 | `status` | — | `{files: [{folder, filename, sizeBytes}], volume: {totalBytes, freeBytes}, comfyuiVersion}` |
 | `download` | `files: [{folder, filename, url, sizeBytes?, sha256?}]` | `{downloaded, skipped, elapsedMs, avgMBps}` |
 | `delete` | `files: [{folder, filename}]` | `{deleted, missing}`, then `POST /free` to ComfyUI |
+| `generate_video` | `model, prompt, negativePrompt?, initImage?: {name, base64}, durationS, fps, resolution, seed, steps?, cfg?, audio` | `{video: {base64 (MP4), mime, width, height, fps, frames, durationS, hasAudio, sizeBytes}, poster: {base64 (JPEG), mime, width, height}, seed, timings: {loadMs, sampleMs, encodeMs, totalMs}}` |
 
 ### `generate`
 
@@ -283,6 +289,56 @@ On any failure the handler returns `{"error": "<CODE>: <detail>"}`, and RunPod m
   - `sampleMs` runs from that event until the sampler finishes.
   - `totalMs` is the whole handler.
 
+### `generate_video` (v5)
+
+Video models come from `videoModels` in `shared/models.json` (`h3` MiniMax H3, `ltx25`
+LTX-2.5 distilled). Each has `modes`, `audio`, `volume`, `defaults {durationS, fps,
+resolution, steps, cfg, …}`, `limits {minDurationS, maxDurationS, resolutions, fpsOptions}`
+and `tunable {steps, cfg}`. Each file also has a `role` (`unet`, `clip`, `video_vae`,
+`audio_vae`, `spatial_upscaler`), which is how the graph builder picks it.
+
+| | `h3` | `ltx25` |
+|---|---|---|
+| defaults | 5 s, 24 fps, `864x480`, 20 steps | 5 s, 24 fps, `1280x704`, cfg 1.0 |
+| durationS | 2–15 | 2–20 |
+| fps | 24 (fixed by the model) | 24, 25 |
+| resolutions | `864x480` `480x864` `640x640` `1344x768` `768x1344` `768x768` | `1280x704` `704x1280` `1024x1024` `896x512` `512x896` `1920x1088` `1088x1920` |
+| frames | `max(5, round(d·24))` snapped **up** to 17k+5 (5 s → 124) | `d·fps` snapped to the nearest 8n, + 1 (5 s @ 24 → 121) |
+| steps | `steps` → BasicScheduler | fixed: the template's manual sigmas, 8 + 3 (`steps` ignored) |
+| cfg | ignored (BasicGuider, no negative prompt) | → `video_cfg` and `audio_cfg` of both LTXVDualCFGGuiders |
+
+- **Input:** `durationS`, `fps`, `resolution`, `steps`, `cfg` and `negativePrompt` may be
+  omitted or null; they then take the model's `defaults`. `resolution` (a string `"WxH"`)
+  and `fps` must be listed in `limits`; `durationS` must be within the limits. `audio`
+  defaults to `true`. Without `seed` the worker picks one and returns it.
+- **Image → video:** `initImage` (PNG, JPEG or WebP; uploaded like references) makes it
+  i2v. The output keeps the start image's aspect ratio at the preset's pixel count, rounded
+  to multiples of 32 (H3) or 64 (LTX). The templates instead stretch (H3) or centre-crop (LTX)
+  the image to a fixed canvas. Read the real size from `video.width/height`.
+- **Audio off:** both models still sample the joint audio+video latent, which is how they
+  are trained, but the audio is not decoded and the MP4 has no audio track.
+- **Output:** the MP4 is H.264 (`yuv420p`) with AAC audio, written by ComfyUI's
+  `CreateVideo` → `SaveVideo(format mp4, codec h264)` through PyAV, whose wheels bundle
+  FFmpeg with libx264. `width`, `height`, `frames`, `durationS` and `hasAudio` are read
+  from the MP4's `moov` box; if that fails they fall back to the graph's values.
+  `durationS` is `frames / fps` (5 s on H3 is 124 frames, 5.167 s). The poster is frame 0
+  (`ImageFromBatch` → `SaveImage`), re-encoded as JPEG q90 with Pillow (PNG with
+  `mime: image/png` if Pillow is missing, which it never is in the image).
+- **Errors:** `UNKNOWN_MODEL`, `INVALID_INPUT: …` (prompt, durationS, fps, resolution,
+  seed, steps 1–100, cfg 0–30, audio), `INVALID_INIT_IMAGE: …`,
+  `MODEL_NOT_INSTALLED: <folder/file>, …` (every file of the model's `videoModels` entry
+  must be on the volume), `COMFYUI_INVALID_PROMPT`, `COMFYUI_EXECUTION_ERROR`,
+  `COMFYUI_NO_OUTPUT: the workflow produced no video`, and `COMFYUI_TIMEOUT` after
+  `VIDEO_TIMEOUT_S` (default 3000 s; images keep `GENERATE_TIMEOUT_S` = 590 s). Send
+  `policy.executionTimeout` of at least 3 000 000 ms for video.
+- **Timings:** `loadMs` and `sampleMs` as for `generate`. With LTX, `sampleMs` covers both
+  samplers and the upscaler between them. `encodeMs` runs from the end of sampling to the
+  end of the handler (decode, mux, fetching the files).
+- **Size:** base64 makes the output about 1.33× the MP4. A 10–20 s 720p clip is typically
+  5–30 MB, so 7–40 MB of JSON. The pod server returns it whole: aiohttp's
+  `client_max_size` (32 MB) limits only request bodies. The serverless `/status` output
+  limit was not checked; video is meant for the pod.
+
 ### Progress (`runpod.serverless.progress_update`, at most 2 per second)
 
 - `generate`: `{phase: "loading" | "sampling" | "saving", stage, stages, step, totalSteps, elapsedMs, stageElapsedMs, cached, cachedStages, stageTimes}`. The final step and every stage change are always sent.
@@ -290,6 +346,14 @@ On any failure the handler returns `{"error": "<CODE>: <detail>"}`, and RunPod m
   - `stages` lists the stages of this graph in display order, known from the first update. ComfyUI may run them in another order, so use `stageTimes` (ms spent in each stage already left) and `cachedStages` to mark stages done.
   - `cachedStages` are stages whose nodes ComfyUI reported in `execution_cached` (they never run). `cached` is true when a loader stage is among them, meaning the weights were already in memory.
   - `elapsedMs` counts from the start of the job; `stageElapsedMs` from the start of the current stage.
+- `generate_video`: the same shape. Its stages are `loading_text_encoder`, `encoding_prompt`
+  (CLIPTextEncode, LTXVConditioning, MiniMaxH3ImageToVideo), `loading_model` (UNETLoader,
+  LatentUpscaleModelLoader), `preparing_init_image` (i2v: LoadImage, ResizeImageMaskNode,
+  LTXVPreprocess, LTXVImgToVideoInplace), `sampling` (SamplerCustomAdvanced, and for LTX the
+  upscaler and stage-2 image conditioning between the two samplers), `video_decoding`
+  (VAEDecode / VAEDecodeTiled), `audio_decoding` (VAEDecodeAudio / LTXVAudioVAEDecode; only
+  with audio), `encoding_video` (CreateVideo, SaveVideo, poster) and `saving` (fetching the
+  MP4). `step`/`totalSteps` count across all samplers: LTX reports 1–8, then 9–11 of 11.
 - `download`: `{phase: "downloading", file, bytes, totalBytes, files: [{filename, bytes, totalBytes, status}]}`.
   - `bytes` and `totalBytes` are summed across all files in the job.
   - `totalBytes` is null while any file's size is unknown.
@@ -310,7 +374,7 @@ On any failure the handler returns `{"error": "<CODE>: <detail>"}`, and RunPod m
 
 ### Paths
 
-- `folder` must be `unet`, `clip`, `vae` or `loras/<modelId>`, where `<modelId>` is in the registry.
+- `folder` must be `unet`, `clip`, `vae`, `latent_upscale_models` or `loras/<modelId>`, where `<modelId>` is in the registry. `status` lists `unet`, `clip`, `vae`, `latent_upscale_models` and `loras/*`.
 - Filenames must end in `.safetensors`. They cannot contain `/`, `\`, `..`, control characters or `:*?"<>|`, and cannot start with `.`, `-` or a space.
 - The resolved path must stay inside `/runpod-volume/models`, even through symlinks.
 - Every file in a request is validated before anything is touched.
@@ -333,6 +397,37 @@ Where we deliberately differ from the templates:
 - Output size always comes from the request. The edit templates instead size the output from the first reference: FLUX.2 via GetImageSize, Qwen via the encoder's latent output.
 - The Qwen prompt-enhancer branch, which is off by default in the templates, is out of scope.
 - We use `SaveImage` rather than `SaveImageAdvanced`.
+
+**Video (v5),** `build_video_workflow(params, registry) -> (graph, info)`, from the same
+templates commit:
+
+| model | template(s) | graph |
+|---|---|---|
+| h3 | `video_minimax_h3_t2v.json`, `video_minimax_h3_i2v.json` (subgraph "Image to Video (MiniMax H3)") | UNETLoader → BasicScheduler(simple, steps) + BasicGuider; CLIPLoader(minimax) + VAELoader(video) → MiniMaxH3ImageToVideo(prompt, W, H, length[, first_frame ← LoadImage]); RandomNoise + KSamplerSelect(res_multistep) → SamplerCustomAdvanced → VAEDecode + VAEDecodeAudio(audio VAE) → CreateVideo(24) → SaveVideo |
+| ltx25 | `video_ltx2_5_t2v.json`, `video_ltx2_5_i2v.json` | CLIPLoader(ltxv) → CLIPTextEncode ×2 → LTXVConditioning(fps). Stage 1 at W/2×H/2: EmptyLTXVLatentVideo [→ LTXVImgToVideoInplace 0.7] + LTXVEmptyLatentAudio → LTXVConcatAVLatent → SamplerCustomAdvanced(seed, LTXVDualCFGGuider, euler_ancestral, 8 manual sigmas) → LTXVSeparateAVLatent. Stage 2: LTXVLatentUpsampler(x2) [→ LTXVImgToVideoInplace 1.0] + stage-1 audio → Concat → SamplerCustomAdvanced(seed 42, 3 manual sigmas) → Separate → VAEDecodeTiled(512, 64, 64, 16) + LTXVAudioVAEDecode → CreateVideo(fps) → SaveVideo. i2v image: LoadImage → ResizeImageMaskNode(longer side 1536, lanczos) → LTXVPreprocess(18) |
+
+`fl2va` ("first/last frame → video + audio") is the only H3 diffusion model either template
+loads. With no keyframe it is text → video; with `first_frame` it is image → video. Both run
+on the same `MiniMaxH3ImageToVideo` node.
+
+Where the video graphs differ from the templates:
+
+- Model variants follow the registry. H3 uses the fp8-scaled diffusion model, the int8
+  text encoder and the fp16 video VAE; the templates use int8 / nvfp4 / int8. All of them
+  are variants in `Comfy-Org/MiniMax-H3`, and ComfyUI's loaders detect the format.
+- Left out because they are off by default: the H3 turbo-LoRA switch, and the LTX prompt
+  enhancer (`TextGenerateLTX2Prompt` + `gemma4_e2b`, about 5 GB more). Also left out: the
+  Math, Primitive and Switch helpers (computed in Python), notes, and `PreviewAny`.
+- i2v sizing follows the start image (see `generate_video`).
+- LTX stage 2 keeps the template's fixed noise seed 42; `seed` drives stage 1.
+- A frame-0 poster branch (`ImageFromBatch` → `SaveImage`) is added.
+- The LTX duration head (`model_patches/`), temporal upscaler and conv VAE are on the
+  volume, but no template uses them, so they are not in `videoModels`.
+
+The fixture `tests/fixtures/object_info_v0.39.0.json` had no video nodes. The 20 classes the
+video graphs use were transcribed from the ComfyUI v0.39.0 source (see its `_added`).
+`boot/check_comfy_nodes.py` also checks them against a real ComfyUI when the runtime image
+builds.
 
 ## VRAM (RTX 5090, 32 GB)
 
@@ -366,6 +461,8 @@ uv run pytest -q
 
 **What the tests cover:**
 
+- **Video graphs** (`tests/test_video_workflows.py`): both models × t2v/i2v × audio on/off, validated against the fixture, including DynamicCombo (`format.codec`) and MatchType inputs. Also covered: frame rules, sizes, seeds, steps and cfg, defaults and limits, rejections, stages, and that `videoModels` lists exactly the files the graphs load.
+- **`generate_video`** (`tests/test_video_handler.py`): a fake ComfyUI returns a real 9-frame H.264 + AAC MP4 (`tests/fixtures/tiny_h264_aac.mp4`, written with PyAV 19.0.1 / libx264) and a PNG poster. Covered: output and metadata, progress across two samplers, validation errors, `MODEL_NOT_INSTALLED`, the video timeout, cancel, `latent_upscale_models` status/download/delete, and a 40 MB output through the pod server.
 - **Graphs:** every model with and without references and LoRAs. Node input names, link types and output indexes are checked against `tests/fixtures/object_info_v0.39.0.json`, a trimmed `GET /object_info` from ComfyUI v0.39.0.
 - **Path sanitising.**
 - **Download manager**, against a local HTTP server: resume, Range ignored, sha and size mismatch, total stall and trickle stall, retry cap and backoff, auth per host, auth dropped on a cross-host redirect, redirect loops.

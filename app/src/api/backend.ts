@@ -29,11 +29,8 @@ async function createTauriBackend(): Promise<Backend> {
     listen: async (name, handler) => event.listen(name, (e) => handler(e.payload as never)),
     pickSavePath: async (defaultName) => {
       const { save } = await import("@tauri-apps/plugin-dialog");
-      return save({
-        title: "Save image",
-        defaultPath: defaultName,
-        filters: [{ name: "PNG image", extensions: ["png"] }],
-      });
+      const { title, filter } = saveFilter(defaultName);
+      return save({ title, defaultPath: defaultName, filters: [filter] });
     },
     pickImagePaths: async () => {
       const { open } = await import("@tauri-apps/plugin-dialog");
@@ -56,6 +53,22 @@ async function createTauriBackend(): Promise<Backend> {
       });
     },
   };
+}
+
+/** Save-dialog title and filter from the default name's extension (png/jpg/webp/mp4; default png). */
+export function saveFilter(defaultName: string): { title: string; filter: { name: string; extensions: string[] } } {
+  const ext = defaultName.match(/\.([a-z0-9]+)$/i)?.[1]?.toLowerCase() ?? "png";
+  switch (ext) {
+    case "mp4":
+      return { title: "Save video", filter: { name: "MP4 video", extensions: ["mp4"] } };
+    case "jpg":
+    case "jpeg":
+      return { title: "Save image", filter: { name: "JPEG image", extensions: ["jpg", "jpeg"] } };
+    case "webp":
+      return { title: "Save image", filter: { name: "WebP image", extensions: ["webp"] } };
+    default:
+      return { title: "Save image", filter: { name: "PNG image", extensions: ["png"] } };
+  }
 }
 
 let backendPromise: Promise<Backend> | null = null;

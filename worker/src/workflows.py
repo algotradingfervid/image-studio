@@ -42,7 +42,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from registry import get_model, model_file
+from registry import get_model, get_video_model, model_file, model_file_by_role, video_model_ids
 
 # Output indexes of the node classes we link from (verified against
 # /object_info of ComfyUI v0.39.0).
@@ -74,6 +74,27 @@ OUTPUT_TYPES: dict[str, list[str]] = {
     "LoadImage": ["IMAGE", "MASK"],
     "TextEncodeQwenImage21": ["CONDITIONING", "CONDITIONING", "LATENT"],
     "QwenImage21Cache": ["MODEL"],
+    # v5 video (transcribed from the v0.39.0 source; see the fixture's "_added")
+    "BasicGuider": ["GUIDER"],
+    "MiniMaxH3ImageToVideo": ["CONDITIONING", "LATENT"],
+    "VAEDecodeAudio": ["AUDIO"],
+    "VAEDecodeTiled": ["IMAGE"],
+    "CreateVideo": ["VIDEO"],
+    "SaveVideo": ["VIDEO"],
+    "ImageFromBatch": ["IMAGE"],
+    "EmptyLTXVLatentVideo": ["LATENT"],
+    "LTXVImgToVideoInplace": ["LATENT"],
+    "LTXVPreprocess": ["IMAGE"],
+    "LTXVConditioning": ["CONDITIONING", "CONDITIONING"],
+    "LTXVConcatAVLatent": ["LATENT"],
+    "LTXVSeparateAVLatent": ["LATENT", "LATENT"],
+    "LTXVEmptyLatentAudio": ["LATENT"],
+    "LTXVAudioVAEDecode": ["AUDIO"],
+    "LTXVDualCFGGuider": ["GUIDER"],
+    "ManualSigmas": ["SIGMAS"],
+    "LatentUpscaleModelLoader": ["LATENT_UPSCALE_MODEL"],
+    "LTXVLatentUpsampler": ["LATENT"],
+    "ResizeImageMaskNode": ["COMFY_MATCHTYPE_V3"],  # MatchType: IMAGE in, IMAGE out
 }
 
 # Node classes whose ComfyUI "progress" events are the sampling steps.
@@ -364,6 +385,312 @@ def sampler_node_ids(graph: dict) -> set[str]:
 
 
 # --------------------------------------------------------------------------
+# v5 video: MiniMax H3 + LTX-2.5 (docs/spec.md "v5")
+#
+# `build_video_workflow(params, registry) -> (graph, info)`
+#
+# API-format conversions of the official Comfy-Org templates
+# (https://github.com/Comfy-Org/workflow_templates, main @ 8be1f8c4):
+#   h3     templates/video_minimax_h3_t2v.json, templates/video_minimax_h3_i2v.json
+#          ("Image to Video (MiniMax H3)" subgraph; t2v = the same graph with
+#          no keyframe images: fl2va covers text->video and first-frame->video)
+#   ltx25  templates/video_ltx2_5_t2v.json, templates/video_ltx2_5_i2v.json
+#          ("Text/Image to Video (LTX-2.5)" subgraphs, two-stage with the x2
+#          latent spatial upscaler)
+# with our filenames (shared/models.json "videoModels", by file "role") and
+# the request parameters substituted. Left out (off by default in the
+# templates, or UI-only): the H3 turbo-LoRA switch, the LTX prompt enhancer
+# (TextGenerateLTX2Prompt + gemma4_e2b), Math/Primitive/Switch helper nodes
+# (computed here in Python), notes and PreviewAny.
+#
+# `params` (already validated by the handler):
+#   model, prompt, negativePrompt, durationS, fps, resolution ("WxH"), seed,
+#   steps, cfg, audio: bool,
+#   initImage: {name, width, height} | None   start image (i2v), uploaded
+# Missing durationS/fps/resolution/steps/cfg/negativePrompt fall back to the
+# registry defaults.
+#
+# Output: SaveVideo -> MP4 (H.264 + AAC when audio is on), plus a poster:
+# ImageFromBatch(frame 0) -> SaveImage (PNG; the handler re-encodes it as JPEG).
+# Audio off: both models still sample the joint audio+video latent (that is
+# how they are trained); the audio stream is just not decoded or muxed.
+#
+# i2v size: the output keeps the start image's aspect ratio at the preset's
+# pixel count (like img2img), rounded to the model's size multiple, instead
+# of the template's stretch (H3) / centre crop (LTX) to a fixed canvas.
+# --------------------------------------------------------------------------
+VIDEO_PREFIX = "image_studio_video"
+POSTER_PREFIX = "image_studio_poster"
+
+# MiniMax H3 (comfy_extras/nodes_minimax_h3.py @ v0.39.0: FPS = 24,
+# CANVAS_MULTIPLE = 32, align_frame_count: 17k+5 frames, min 5).
+H3_FPS = 24
+H3_MULTIPLE = 32
+H3_MIN_FRAMES = 5
+H3_SAMPLER = "res_multistep"     # KSamplerSelect
+H3_SCHEDULER = "simple"          # BasicScheduler(simple, steps, denoise 1)
+H3_CLIP_TYPE = "minimax"
+
+# LTX-2.5 (templates above; README: frames % 8 == 1, sides divisible by 32;
+# stage 1 runs at half size, so final sides are multiples of 64).
+LTX_MULTIPLE = 64
+LTX_CLIP_TYPE = "ltxv"
+LTX_SAMPLER = "euler_ancestral"
+LTX_SIGMAS_STAGE1 = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+LTX_SIGMAS_STAGE2 = "0.85, 0.7250, 0.4219, 0.0"
+LTX_STAGE2_SEED = 42             # template: stage-2 RandomNoise is fixed at 42
+LTX_I2V_STRENGTH_STAGE1 = 0.7    # LTXVImgToVideoInplace on the empty latent
+LTX_I2V_STRENGTH_STAGE2 = 1.0    # LTXVImgToVideoInplace on the upscaled latent
+LTX_IMG_COMPRESSION = 18         # LTXVPreprocess
+LTX_RESIZE_LONGER = 1536         # ResizeImageMaskNode "scale longer dimension"
+LTX_DECODE_TILES = {"tile_size": 512, "overlap": 64, "temporal_size": 64,
+                    "temporal_overlap": 16}
+
+VIDEO_SAMPLERS = frozenset({"SamplerCustomAdvanced"})
+
+
+def sigma_steps(sigmas: str) -> int:
+    return len([x for x in sigmas.split(",") if x.strip()]) - 1
+
+
+def parse_resolution(value: object) -> tuple[int, int]:
+    if isinstance(value, str):
+        parts = value.lower().split("x")
+        if len(parts) == 2 and all(x.strip().isdigit() for x in parts):
+            return int(parts[0]), int(parts[1])
+    raise WorkflowError(f"INVALID_INPUT: resolution {value!r} is not WIDTHxHEIGHT")
+
+
+def h3_frames(duration_s: float) -> int:
+    """Frame count for `duration_s` at 24 fps, snapped up to H3's 17k+5 grid
+    (the template's Math Expression: max(5, round(d*24)), then up to 17k+5)."""
+    n = max(H3_MIN_FRAMES, round(duration_s * H3_FPS))
+    return n + (5 - n % 17) % 17
+
+
+def ltx_frames(duration_s: float, fps: int) -> int:
+    """Frame count for LTX: the template's duration*fps+1, snapped to the
+    nearest 8n+1 (EmptyLTXVLatentVideo keeps (length-1)//8+1 latent frames)."""
+    return max(1, round(duration_s * fps / 8)) * 8 + 1
+
+
+def video_size(resolution: str, multiple: int, init: dict | None = None) -> tuple[int, int]:
+    """Output size: the preset, or with a start image its aspect ratio at the
+    preset's pixel count, both sides rounded to `multiple`."""
+    w, h = parse_resolution(resolution)
+    if not init:
+        return w, h
+    iw, ih = int(init["width"]), int(init["height"])
+    if iw <= 0 or ih <= 0:
+        raise WorkflowError("INVALID_INIT_IMAGE: the start image has no pixels")
+    area, ratio = w * h, iw / ih
+
+    def side(v: float) -> int:
+        return int(max(multiple, round(v / multiple) * multiple))
+
+    return side(math.sqrt(area * ratio)), side(math.sqrt(area / ratio))
+
+
+def _video_resolved(params: dict, model: dict) -> dict:
+    d, lim = model["defaults"], model["limits"]
+    p = dict(params)
+    for key in ("durationS", "fps", "resolution"):
+        if p.get(key) is None:
+            p[key] = d[key]
+    if p.get("steps") in (None, 0):
+        p["steps"] = d["steps"]
+    if p.get("cfg") is None:
+        p["cfg"] = d["cfg"]
+    if p.get("negativePrompt") is None:
+        p["negativePrompt"] = d.get("negativePrompt", "")
+    p["audio"] = bool(p.get("audio", True)) and bool(model.get("audio", False))
+    if p["resolution"] not in lim["resolutions"]:
+        raise WorkflowError(f"INVALID_INPUT: resolution {p['resolution']!r} not offered by "
+                            f"{model['id']} ({', '.join(lim['resolutions'])})")
+    if int(p["fps"]) not in lim["fpsOptions"] or float(p["fps"]) != int(p["fps"]):
+        raise WorkflowError(f"INVALID_INPUT: fps {p['fps']!r} not offered by {model['id']} "
+                            f"({', '.join(map(str, lim['fpsOptions']))})")
+    p["fps"] = int(p["fps"])
+    dur = float(p["durationS"])
+    if not lim.get("minDurationS", 0) <= dur <= lim["maxDurationS"]:
+        raise WorkflowError(f"INVALID_INPUT: durationS must be within "
+                            f"[{lim.get('minDurationS', 0)}, {lim['maxDurationS']}] for {model['id']}")
+    p["durationS"] = dur
+    if p.get("initImage") and "i2v" not in model.get("modes", []):
+        raise WorkflowError(f"I2V_NOT_SUPPORTED: {model['id']} does not accept a start image")
+    return p
+
+
+def _save_video(g: _Graph, images: list, fps: float, audio: list | None) -> tuple[str, str]:
+    """CreateVideo -> SaveVideo(mp4, h264) and a frame-0 poster (SaveImage)."""
+    inputs: dict[str, Any] = {"images": images, "fps": float(fps)}
+    if audio is not None:
+        inputs["audio"] = audio
+    video = g.add("CreateVideo", **inputs)
+    save = g.add("SaveVideo", "Save video", video=_out(video), filename_prefix=VIDEO_PREFIX,
+                 **{"format": "mp4", "format.codec": "h264"})
+    frame0 = g.add("ImageFromBatch", image=images, batch_index=0, length=1)
+    poster = g.add("SaveImage", "Poster", images=_out(frame0), filename_prefix=POSTER_PREFIX)
+    return save, poster
+
+
+# --------------------------------------------------------------------------
+# MiniMax H3 — templates/video_minimax_h3_{t2v,i2v}.json
+# UNETLoader -> BasicScheduler(simple) + BasicGuider ; CLIPLoader(minimax) +
+# VAELoader(video) -> MiniMaxH3ImageToVideo(prompt, W, H, length[, first_frame
+# <- LoadImage]) -> conditioning + AV latent ; RandomNoise + KSamplerSelect
+# (res_multistep) -> SamplerCustomAdvanced -> VAEDecode (video) and
+# VAEDecodeAudio(audio VAE) -> CreateVideo(24 fps) -> SaveVideo
+# --------------------------------------------------------------------------
+def _h3(p: dict, model: dict) -> tuple[dict, dict]:
+    w, h = video_size(p["resolution"], H3_MULTIPLE, p.get("initImage"))
+    frames = h3_frames(p["durationS"])
+    g = _Graph()
+    unet = g.add("UNETLoader", unet_name=model_file_by_role(model, "unet")["filename"],
+                 weight_dtype="default")
+    clip = g.add("CLIPLoader", clip_name=model_file_by_role(model, "clip")["filename"],
+                 type=H3_CLIP_TYPE, device="default")
+    vae = g.add("VAELoader", vae_name=model_file_by_role(model, "video_vae")["filename"])
+    cond_inputs: dict[str, Any] = {"clip": _out(clip), "vae": _out(vae), "prompt": p["prompt"],
+                                   "width": w, "height": h, "length": frames}
+    if p.get("initImage"):
+        first = g.add("LoadImage", "Start image", image=p["initImage"]["name"])
+        cond_inputs["first_frame"] = _out(first)
+    cond = g.add("MiniMaxH3ImageToVideo", **cond_inputs)
+    noise = g.add("RandomNoise", noise_seed=int(p["seed"]))
+    sampler = g.add("KSamplerSelect", sampler_name=H3_SAMPLER)
+    sched = g.add("BasicScheduler", model=_out(unet), scheduler=H3_SCHEDULER,
+                  steps=int(p["steps"]), denoise=1.0)
+    guider = g.add("BasicGuider", model=_out(unet), conditioning=_out(cond, 0))
+    sca = g.add("SamplerCustomAdvanced", noise=_out(noise), guider=_out(guider),
+                sampler=_out(sampler), sigmas=_out(sched), latent_image=_out(cond, 1))
+    dec = g.add("VAEDecode", samples=_out(sca, 0), vae=_out(vae))
+    audio = None
+    if p["audio"]:
+        avae = g.add("VAELoader", vae_name=model_file_by_role(model, "audio_vae")["filename"])
+        audio = _out(g.add("VAEDecodeAudio", samples=_out(sca, 0), vae=_out(avae)))
+    save, poster = _save_video(g, _out(dec), H3_FPS, audio)
+    return g.nodes, {"videoNode": save, "posterNode": poster, "width": w, "height": h,
+                     "fps": H3_FPS, "frames": frames, "hasAudio": p["audio"],
+                     "samplers": [[sca, int(p["steps"])]]}
+
+
+# --------------------------------------------------------------------------
+# LTX-2.5 distilled — templates/video_ltx2_5_{t2v,i2v}.json
+# Stage 1 at half size: EmptyLTXVLatentVideo(W/2, H/2, length) [i2v:
+#   LTXVImgToVideoInplace(strength 0.7)] + LTXVEmptyLatentAudio -> Concat ->
+#   SamplerCustomAdvanced(seed, LTXVDualCFGGuider, euler_ancestral, 8 manual
+#   sigmas) -> Separate.
+# Stage 2: LTXVLatentUpsampler(x2 spatial) [i2v: LTXVImgToVideoInplace
+#   (strength 1.0)] + stage-1 audio -> Concat -> SamplerCustomAdvanced(fixed
+#   seed 42, 3 manual sigmas) -> Separate -> VAEDecodeTiled (video) and
+#   LTXVAudioVAEDecode -> CreateVideo(fps) -> SaveVideo.
+# Text: CLIPLoader(ltxv) -> CLIPTextEncode(prompt / negative) ->
+#   LTXVConditioning(frame_rate). i2v image: LoadImage -> ResizeImageMaskNode
+#   (longer side 1536, lanczos) -> LTXVPreprocess(18).
+# --------------------------------------------------------------------------
+def _ltx25(p: dict, model: dict) -> tuple[dict, dict]:
+    w, h = video_size(p["resolution"], LTX_MULTIPLE, p.get("initImage"))
+    fps = int(p["fps"])
+    frames = ltx_frames(p["durationS"], fps)
+    cfg = float(p["cfg"])
+    g = _Graph()
+    unet = g.add("UNETLoader", unet_name=model_file_by_role(model, "unet")["filename"],
+                 weight_dtype="default")
+    clip = g.add("CLIPLoader", clip_name=model_file_by_role(model, "clip")["filename"],
+                 type=LTX_CLIP_TYPE, device="default")
+    vae = g.add("VAELoader", vae_name=model_file_by_role(model, "video_vae")["filename"])
+    avae = g.add("VAELoader", vae_name=model_file_by_role(model, "audio_vae")["filename"])
+    upscaler = g.add("LatentUpscaleModelLoader",
+                     model_name=model_file_by_role(model, "spatial_upscaler")["filename"])
+    pos = g.add("CLIPTextEncode", "Positive", text=p["prompt"], clip=_out(clip))
+    neg = g.add("CLIPTextEncode", "Negative", text=p["negativePrompt"], clip=_out(clip))
+    cond = g.add("LTXVConditioning", positive=_out(pos), negative=_out(neg),
+                 frame_rate=float(fps))
+    image = None
+    if p.get("initImage"):
+        load = g.add("LoadImage", "Start image", image=p["initImage"]["name"])
+        resized = g.add("ResizeImageMaskNode", input=_out(load),
+                        **{"resize_type": "scale longer dimension",
+                           "resize_type.longer_size": LTX_RESIZE_LONGER},
+                        scale_method="lanczos")
+        image = _out(g.add("LTXVPreprocess", image=_out(resized),
+                           img_compression=LTX_IMG_COMPRESSION))
+
+    # stage 1 (half resolution)
+    video1 = _out(g.add("EmptyLTXVLatentVideo", width=w // 2, height=h // 2, length=frames,
+                        batch_size=1))
+    if image is not None:
+        video1 = _out(g.add("LTXVImgToVideoInplace", vae=_out(vae), image=image, latent=video1,
+                            strength=LTX_I2V_STRENGTH_STAGE1, bypass=False))
+    audio1 = g.add("LTXVEmptyLatentAudio", frames_number=frames, frame_rate=fps, batch_size=1,
+                   audio_vae=_out(avae))
+    av1 = g.add("LTXVConcatAVLatent", video_latent=video1, audio_latent=_out(audio1))
+    noise1 = g.add("RandomNoise", noise_seed=int(p["seed"]))
+    sampler1 = g.add("KSamplerSelect", sampler_name=LTX_SAMPLER)
+    sigmas1 = g.add("ManualSigmas", sigmas=LTX_SIGMAS_STAGE1)
+    guider1 = g.add("LTXVDualCFGGuider", model=_out(unet), positive=_out(cond, 0),
+                    negative=_out(cond, 1), video_cfg=cfg, audio_cfg=cfg)
+    sca1 = g.add("SamplerCustomAdvanced", "Stage 1", noise=_out(noise1), guider=_out(guider1),
+                 sampler=_out(sampler1), sigmas=_out(sigmas1), latent_image=_out(av1))
+    sep1 = g.add("LTXVSeparateAVLatent", av_latent=_out(sca1, 0))
+
+    # stage 2 (x2 latent upscale, refine)
+    video2 = _out(g.add("LTXVLatentUpsampler", samples=_out(sep1, 0),
+                        upscale_model=_out(upscaler), vae=_out(vae)))
+    if image is not None:
+        video2 = _out(g.add("LTXVImgToVideoInplace", vae=_out(vae), image=image, latent=video2,
+                            strength=LTX_I2V_STRENGTH_STAGE2, bypass=False))
+    av2 = g.add("LTXVConcatAVLatent", video_latent=video2, audio_latent=_out(sep1, 1))
+    noise2 = g.add("RandomNoise", noise_seed=LTX_STAGE2_SEED)
+    sampler2 = g.add("KSamplerSelect", sampler_name=LTX_SAMPLER)
+    sigmas2 = g.add("ManualSigmas", sigmas=LTX_SIGMAS_STAGE2)
+    guider2 = g.add("LTXVDualCFGGuider", model=_out(unet), positive=_out(cond, 0),
+                    negative=_out(cond, 1), video_cfg=cfg, audio_cfg=cfg)
+    sca2 = g.add("SamplerCustomAdvanced", "Stage 2", noise=_out(noise2), guider=_out(guider2),
+                 sampler=_out(sampler2), sigmas=_out(sigmas2), latent_image=_out(av2))
+    sep2 = g.add("LTXVSeparateAVLatent", av_latent=_out(sca2, 0))
+
+    dec = g.add("VAEDecodeTiled", samples=_out(sep2, 0), vae=_out(vae), **LTX_DECODE_TILES)
+    audio = None
+    if p["audio"]:
+        audio = _out(g.add("LTXVAudioVAEDecode", samples=_out(sep2, 1), audio_vae=_out(avae)))
+    save, poster = _save_video(g, _out(dec), fps, audio)
+    # EmptyLTXVLatentVideo keeps side // 32 latent pixels at half size, x2 upscaled.
+    out_w, out_h = (w // 2 // 32) * 64, (h // 2 // 32) * 64
+    return g.nodes, {"videoNode": save, "posterNode": poster, "width": out_w, "height": out_h,
+                     "fps": fps, "frames": frames, "hasAudio": p["audio"],
+                     "samplers": [[sca1, sigma_steps(LTX_SIGMAS_STAGE1)],
+                                  [sca2, sigma_steps(LTX_SIGMAS_STAGE2)]]}
+
+
+_VIDEO_BUILDERS = {"h3": _h3, "ltx25": _ltx25}
+
+
+def build_video_workflow(params: dict, registry: dict) -> tuple[dict, dict]:
+    """Pure: the ComfyUI API graph of a video job and what it will produce.
+
+    Returns (graph, info) with info = {videoNode, posterNode, width, height,
+    fps, frames, durationS, hasAudio, samplers: [[node_id, steps], ...] in
+    execution order, totalSteps, seed}.
+    """
+    model_id = params.get("model")
+    if model_id not in _VIDEO_BUILDERS or model_id not in video_model_ids(registry):
+        raise WorkflowError(f"UNKNOWN_MODEL: {model_id!r}")
+    model = get_video_model(registry, model_id)
+    p = _video_resolved(params, model)
+    graph, info = _VIDEO_BUILDERS[model_id](p, model)
+    info["durationS"] = round(info["frames"] / info["fps"], 3)
+    info["totalSteps"] = sum(n for _, n in info["samplers"])
+    info["seed"] = int(p["seed"])
+    return graph, info
+
+
+def is_video_graph(graph: dict) -> bool:
+    return any(n.get("class_type") == "SaveVideo" for n in graph.values())
+
+
+# --------------------------------------------------------------------------
 # Progress stages (handler progress payload "stage" / "stages")
 # --------------------------------------------------------------------------
 # Display order of the generation stages. ComfyUI's actual execution order
@@ -377,6 +704,9 @@ STAGES: tuple[str, ...] = (
     "preparing_references",
     "sampling",
     "decoding",
+    "video_decoding",
+    "audio_decoding",
+    "encoding_video",
     "saving",
 )
 
@@ -389,6 +719,9 @@ STAGE_PHASE: dict[str, str] = {
     "preparing_references": "loading",
     "sampling": "sampling",
     "decoding": "saving",
+    "video_decoding": "saving",
+    "audio_decoding": "saving",
+    "encoding_video": "saving",
     "saving": "saving",
 }
 
@@ -459,8 +792,52 @@ def init_image_node_ids(graph: dict) -> set[str]:
     return out
 
 
+# Video graphs (SaveVideo present). The start image chain is preparing_init_image;
+# the stage-2 LTX nodes between the two samplers (LTXVLatentUpsampler and the
+# LTXVImgToVideoInplace on its output) stay in "sampling".
+_VIDEO_STAGE_OF_CLASS: dict[str, str] = {
+    "CLIPLoader": "loading_text_encoder",
+    "CLIPTextEncode": "encoding_prompt",
+    "LTXVConditioning": "encoding_prompt",
+    "MiniMaxH3ImageToVideo": "encoding_prompt",  # prompt encode (+ first-frame VAE encode)
+    "UNETLoader": "loading_model",
+    "LatentUpscaleModelLoader": "loading_model",
+    "LoadImage": "preparing_init_image",
+    "ResizeImageMaskNode": "preparing_init_image",
+    "LTXVPreprocess": "preparing_init_image",
+    "LTXVImgToVideoInplace": "preparing_init_image",
+    "SamplerCustomAdvanced": "sampling",
+    "LTXVLatentUpsampler": "sampling",
+    "VAEDecode": "video_decoding",
+    "VAEDecodeTiled": "video_decoding",
+    "VAEDecodeAudio": "audio_decoding",
+    "LTXVAudioVAEDecode": "audio_decoding",
+    "CreateVideo": "encoding_video",
+    "SaveVideo": "encoding_video",
+    "ImageFromBatch": "encoding_video",
+    "SaveImage": "encoding_video",
+}
+
+
+def _video_node_stages(graph: dict) -> dict[str, str]:
+    out = {}
+    for nid, node in graph.items():
+        cls = node.get("class_type", "")
+        stage = _VIDEO_STAGE_OF_CLASS.get(cls)
+        if cls == "LTXVImgToVideoInplace":
+            src = node.get("inputs", {}).get("latent")
+            if isinstance(src, list) and graph.get(src[0], {}).get("class_type") == \
+                    "LTXVLatentUpsampler":
+                stage = "sampling"
+        if stage is not None:
+            out[nid] = stage
+    return out
+
+
 def graph_node_stages(graph: dict) -> dict[str, str]:
     """{node_id: stage} for every node of `graph` that maps to a stage."""
+    if is_video_graph(graph):
+        return _video_node_stages(graph)
     init_nodes = init_image_node_ids(graph)
     out = {}
     for nid, node in graph.items():
@@ -474,4 +851,8 @@ def graph_node_stages(graph: dict) -> dict[str, str]:
 def graph_stages(graph: dict) -> list[str]:
     """The stages that apply to `graph`, in display order (sampling always)."""
     present = set(graph_node_stages(graph).values()) | {"sampling"}
+    if is_video_graph(graph):
+        # The handler fetching the MP4 + poster. (Not set.add with a string:
+        # boot/check_comfy_nodes.py reads those as node class names.)
+        present |= {"saving"}
     return [s for s in STAGES if s in present]

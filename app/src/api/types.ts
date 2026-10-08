@@ -28,6 +28,8 @@ export interface ModelFileView extends ModelFile {
 
 /** `ModelView` = registry fields + `{installed, files: [{...file, present}], presentBytes, totalBytes, task}`. */
 export interface ModelView {
+  /** "image" (registry `models`) or "video" (registry `videoModels`, spec v5). */
+  kind: "image" | "video";
   id: ModelId;
   name: string;
   description: string;
@@ -44,7 +46,42 @@ export interface ModelView {
   presentBytes: number;
   totalBytes: number;
   task: Task | null;
+  // ----- video models only (kind === "video") -----
+  /** "t2v" (text→video) and/or "i2v" (start image→video). */
+  modes?: ("t2v" | "i2v" | string)[];
+  /** Generates an audio track. */
+  audio?: boolean;
+  /** Network volume holding the files, e.g. "image-studio-video". */
+  volume?: string;
+  limits?: VideoLimits;
+  /** For video models `defaults` also carries durationS, fps, resolution (see VideoDefaults). */
 }
+
+/** A resolution option: a plain id ("1280x720", "720p") or an object with an id/label and size. */
+export type VideoResolutionOption = string | { id?: string; label?: string; width?: number; height?: number };
+
+export interface VideoLimits {
+  minDurationS?: number;
+  maxDurationS: number;
+  resolutions: VideoResolutionOption[];
+  fpsOptions: number[];
+}
+
+export interface VideoDefaults {
+  durationS?: number;
+  fps?: number;
+  resolution?: string;
+  steps?: number;
+  cfg?: number;
+}
+
+/** Id of a resolution option (string as-is; object → id, label, or "WxH"). Matches the backend. */
+export function resolutionId(r: VideoResolutionOption): string {
+  if (typeof r === "string") return r;
+  return r.id ?? r.label ?? `${r.width ?? 0}x${r.height ?? 0}`;
+}
+
+export type GpuProfile = "image" | "video";
 
 // ---------- Settings ----------
 
@@ -73,6 +110,9 @@ export interface Settings {
   workerRef: string;
   /** Pod container image (settings file `podImage`; default the runtime image). */
   podImage: string;
+  /** Video profile (spec v5): GPU priority list and volume names (settings file `videoGpuTypes` / `videoVolumeNames`). */
+  videoGpuTypes: string[];
+  videoVolumeNames: string[];
 }
 
 export interface SaveSettingsInput {
@@ -102,6 +142,8 @@ export interface ConnectionTest {
 export type GpuStatus = "stopped" | "starting" | "running" | "stopping" | "error";
 
 export interface GpuState {
+  /** Which pod this is: "image" (image-studio-gpu) or "video" (image-studio-video-gpu). */
+  profile: GpuProfile;
   status: GpuStatus;
   podId?: string | null;
   /** e.g. "NVIDIA RTX PRO 6000 Blackwell Server Edition" */
@@ -133,6 +175,9 @@ export interface VolumeInfo {
 
 /** Returned by `refresh_status`, `get_status` and the `status-update` event. */
 export interface StatusSnapshot {
+  /** Which volume this snapshot's `volume`/`checkedAt` describe (image or video volume). */
+  profile: GpuProfile;
+  /** All models (image and video), with presence from each one's own volume cache. */
   models: ModelView[];
   /** null until the volume has been checked once. */
   volume: VolumeInfo | null;
@@ -221,6 +266,28 @@ export interface GenerateInput {
   denoise?: number;
 }
 
+/** `generate_video` (spec v5). One pod job per video; runs on the video GPU profile (auto-started). */
+export interface GenerateVideoInput {
+  model: ModelId;
+  prompt: string;
+  negativePrompt?: string;
+  /** i2v start image: an id from `import_reference(_bytes)` ("Browse computer"); omit for text→video. */
+  initImageId?: string;
+  /**
+   * i2v start image picked "From gallery": an ImageRecord id (kind "image" only). The backend reads
+   * the gallery file in place (no copy). Mutually exclusive with `initImageId`.
+   */
+  initImageGalleryId?: string;
+  durationS: number;
+  fps: number;
+  /** A resolution id from the model's `limits.resolutions` (see `resolutionId`). */
+  resolution: string;
+  seed?: number;
+  steps?: number;
+  cfg?: number;
+  audio: boolean;
+}
+
 /** img2img strength slider ("How much to change"). */
 export const DENOISE_MIN = 0.05;
 export const DENOISE_MAX = 1;
@@ -249,6 +316,13 @@ export interface ImageRecord {
   initImage?: string | null;
   /** img2img strength (denoise); null/absent for text-to-image. */
   denoise?: number | null;
+  /** "video" records (spec v5): `path` is the .mp4; `aspectRatio` holds the resolution id. Absent → "image". */
+  kind?: "image" | "video";
+  durationS?: number | null;
+  fps?: number | null;
+  hasAudio?: boolean | null;
+  /** JPEG poster frame for video tiles. */
+  posterPath?: string | null;
 }
 
 export interface ImagePage {
@@ -271,7 +345,11 @@ export type JobStage =
   | "preparing_references"
   | "sampling"
   | "decoding"
-  | "saving";
+  | "saving"
+  // video (spec v5)
+  | "video_decoding"
+  | "audio_decoding"
+  | "encoding_video";
 
 export interface JobProgress {
   /** v1 phase ("loading" | "sampling" | "saving"), or the pod start phase while `starting`. */
@@ -296,6 +374,8 @@ export interface JobProgress {
 
 export interface Job {
   jobId: string;
+  /** "video" for `generate_video` jobs; absent/"image" otherwise. */
+  kind?: "image" | "video";
   status: JobStatus;
   total: number;
   completed: number;
@@ -322,9 +402,13 @@ export interface EventMap {
   "job-update": Job;
   "task-update": Task;
   "status-update": StatusSnapshot;
+  /** One profile's state (see `profile`). */
   "gpu-update": GpuState;
-  /** The user is quitting while a GPU pod may be billing; answer with `confirm_quit`. */
-  "quit-requested": GpuState;
+  /**
+   * The user is quitting while a GPU pod may be billing; answer with `confirm_quit`.
+   * Payload: the state of EVERY profile (image, video); list the ones not stopped.
+   */
+  "quit-requested": GpuState[];
 }
 
 export const isTaskActive = (t: Task | null | undefined): t is Task =>

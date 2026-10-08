@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import * as api from "../../api";
-import { gpuIsOff, isTaskActive, type DeletePreview, type ModelView } from "../../api";
+import { gpuIsOff, isTaskActive, type DeletePreview, type GpuProfile, type ModelView } from "../../api";
 import { Dialog, ProgressBar } from "../../components/Dialog";
 import { Icon } from "../../components/Icon";
 import { formatBytes, formatRelative, pct, toDate } from "../../lib/format";
@@ -11,11 +11,7 @@ import { LoraLibrary } from "./LoraLibrary";
 
 export function ModelsScreen({ active }: { active: boolean }) {
   const lib = useLibrary();
-  const gpu = useGpu();
   const { reloadStatus } = lib;
-  const refresh = async () => {
-    if (await gpu.confirmStart("refresh the volume status")) void lib.refreshStatus();
-  };
   // Cached status only (no GPU) each time the tab opens.
   useEffect(() => {
     if (active) void reloadStatus();
@@ -25,9 +21,8 @@ export function ModelsScreen({ active }: { active: boolean }) {
     const h = window.setInterval(() => tick((n) => n + 1), 30_000);
     return () => window.clearInterval(h);
   }, []);
-  const vol = lib.status?.volume;
-  const used = vol ? vol.totalBytes - vol.freeBytes : 0;
-  const checked = toDate(lib.status?.checkedAt);
+
+  const videoVolume = lib.videoModels.find((m) => m.volume)?.volume ?? lib.settings?.videoVolumeNames?.[0] ?? "image-studio-video";
 
   return (
     <div className="page">
@@ -35,62 +30,120 @@ export function ModelsScreen({ active }: { active: boolean }) {
         <header className="page__head">
           <div>
             <h1 className="page__title">Models</h1>
-            <p className="page__lede">Weights live on your RunPod network volume, not on this Mac.</p>
+            <p className="page__lede">Weights live on your RunPod network volumes, not on this Mac.</p>
           </div>
         </header>
 
-        <section className="card volume" aria-labelledby="vol-title">
-          <div className="volume__top">
-            <div>
-              <h2 id="vol-title" className="card__title">
-                <Icon name="cloud" /> Network volume
-              </h2>
-              <p className="volume__numbers">
-                {vol ? (
-                  <>
-                    <strong className="mono">{formatBytes(used)}</strong> used of <span className="mono">{formatBytes(vol.totalBytes)}</span> ·{" "}
-                    <span className="mono">{formatBytes(vol.freeBytes)}</span> free
-                  </>
-                ) : (
-                  "Not checked yet"
-                )}
-              </p>
-            </div>
-            <div className="volume__actions">
-              <span className="hint" title={checked ? checked.toLocaleString() : undefined}>
-                Last checked {formatRelative(lib.status?.checkedAt)}
-              </span>
-              <button type="button" className="btn" onClick={() => void refresh()} disabled={lib.refreshing} aria-describedby="refresh-note">
-                <Icon name="refresh" className={lib.refreshing ? "spin" : ""} />
-                {lib.refreshing ? "Checking…" : "Refresh"}
-              </button>
-            </div>
-          </div>
-          <ProgressBar label="Volume usage" value={vol ? pct(used, vol.totalBytes) : 0} tone={vol && vol.freeBytes < 10 * 1024 ** 3 ? "warn" : undefined} />
-          <p id="refresh-note" className="hint">
-            <Icon name="bolt" size={12} />{" "}
-            {gpu.podMode
-              ? "Refresh lists the volume on the GPU pod — it starts the pod first if it's stopped. It also runs after every download or delete."
-              : "Refresh briefly starts a GPU worker to list the volume (a few cents). It also runs after every download or delete."}
-          </p>
-        </section>
+        <VolumeCard profile="image" />
 
         <div className="model-list">
-          {lib.models.map((m) => (
-            <ModelCard key={m.id} model={m} all={lib.models} />
+          {lib.imageModels.map((m) => (
+            <ModelCard key={m.id} model={m} all={lib.models} profile="image" />
           ))}
-          {lib.models.length === 0 && <div className="skeleton skeleton--block" aria-label="Loading models" />}
+          {lib.imageModels.length === 0 && <div className="skeleton skeleton--block" aria-label="Loading models" />}
         </div>
 
         <LoraLibrary />
+
+        <section className="video-models" aria-labelledby="video-models-title">
+          <header className="video-models__head">
+            <h2 id="video-models-title" className="page__subtitle">
+              <Icon name="video" /> Video models (Canada)
+            </h2>
+            <p className="page__lede">
+              On their own volume <span className="mono">{videoVolume}</span> in <strong>{VIDEO_REGION}</strong>, with their own GPU pod. MiniMax H3's
+              licence excludes running it in the EU, UK, South Korea and USA.
+            </p>
+          </header>
+          <VolumeCard profile="video" />
+          <div className="model-list">
+            {lib.videoModels.map((m) => (
+              <ModelCard key={m.id} model={m} all={lib.models} profile="video" />
+            ))}
+            {lib.loaded && lib.videoModels.length === 0 && (
+              <p className="notice notice--inline">
+                <Icon name="info" /> No video models in this build — they appear here once the model registry lists them.
+              </p>
+            )}
+          </div>
+        </section>
       </div>
     </div>
   );
 }
 
-function ModelCard({ model: m, all }: { model: ModelView; all: ModelView[] }) {
+const VIDEO_REGION = "CA-MTL-3 (Canada)";
+
+/** One profile's network volume: usage, last checked, Refresh (starts that profile's GPU). */
+function VolumeCard({ profile }: { profile: GpuProfile }) {
   const lib = useLibrary();
   const gpu = useGpu();
+  const isVideo = profile === "video";
+  const status = isVideo ? lib.videoStatus : lib.status;
+  const refreshing = isVideo ? lib.videoRefreshing : lib.refreshing;
+  const vol = status?.volume;
+  const used = vol ? vol.totalBytes - vol.freeBytes : 0;
+  const checked = toDate(status?.checkedAt);
+  const name = isVideo
+    ? (lib.videoModels.find((m) => m.volume)?.volume ?? lib.settings?.videoVolumeNames?.[0] ?? "image-studio-video")
+    : (lib.settings?.volumeNames?.[0] ?? null);
+  const refresh = async () => {
+    if (await gpu.confirmStart(isVideo ? "refresh the video volume status" : "refresh the volume status", profile)) void lib.refreshStatus(profile);
+  };
+  const titleId = `vol-title-${profile}`;
+  const noteId = `refresh-note-${profile}`;
+  return (
+    <section className="card volume" aria-labelledby={titleId}>
+      <div className="volume__top">
+        <div>
+          <h2 id={titleId} className="card__title">
+            <Icon name="cloud" /> {isVideo ? "Video volume" : "Network volume"}
+            {name && <span className="mono hint volume__name">{name}</span>}
+            {isVideo && <span className="badge badge--muted">{VIDEO_REGION}</span>}
+          </h2>
+          <p className="volume__numbers">
+            {vol ? (
+              <>
+                <strong className="mono">{formatBytes(used)}</strong> used of <span className="mono">{formatBytes(vol.totalBytes)}</span> ·{" "}
+                <span className="mono">{formatBytes(vol.freeBytes)}</span> free
+              </>
+            ) : (
+              "Not checked yet"
+            )}
+          </p>
+        </div>
+        <div className="volume__actions">
+          <span className="hint" title={checked ? checked.toLocaleString() : undefined}>
+            Last checked {formatRelative(status?.checkedAt)}
+          </span>
+          <button type="button" className="btn" onClick={() => void refresh()} disabled={refreshing} aria-describedby={noteId}>
+            <Icon name="refresh" className={refreshing ? "spin" : ""} />
+            {refreshing ? "Checking…" : "Refresh"}
+          </button>
+        </div>
+      </div>
+      <ProgressBar
+        label={isVideo ? "Video volume usage" : "Volume usage"}
+        value={vol ? pct(used, vol.totalBytes) : 0}
+        tone={vol && vol.freeBytes < 10 * 1024 ** 3 ? "warn" : undefined}
+      />
+      <p id={noteId} className="hint">
+        <Icon name="bolt" size={12} />{" "}
+        {isVideo
+          ? `Refresh lists the video volume on the video GPU pod (${gpu.profiles.video.startTarget}, ${gpu.profiles.video.costLabel}) — it starts that pod first if it's stopped. It also runs after every video-model download or delete.`
+          : gpu.podMode
+            ? "Refresh lists the volume on the GPU pod — it starts the pod first if it's stopped. It also runs after every download or delete."
+            : "Refresh briefly starts a GPU worker to list the volume (a few cents). It also runs after every download or delete."}
+      </p>
+    </section>
+  );
+}
+
+function ModelCard({ model: m, all, profile }: { model: ModelView; all: ModelView[]; profile: GpuProfile }) {
+  const lib = useLibrary();
+  const gpu = useGpu();
+  const pg = gpu.profiles[profile];
+  const isVideo = profile === "video";
   const toast = useToast();
   const task = isTaskActive(m.task) ? m.task : null;
   const [starting, setStarting] = useState(false);
@@ -103,7 +156,7 @@ function ModelCard({ model: m, all }: { model: ModelView; all: ModelView[] }) {
   const nameOf = (id: string) => all.find((o) => o.id === id)?.name ?? id;
 
   const download = async () => {
-    if (!(await gpu.confirmStart(`download ${m.name}`))) return;
+    if (!(await gpu.confirmStart(`download ${m.name}`, profile))) return;
     setStarting(true);
     try {
       const t = await api.downloadModel(m.id);
@@ -147,9 +200,24 @@ function ModelCard({ model: m, all }: { model: ModelView; all: ModelView[] }) {
             <li>
               <span className="meta-row__k">Size</span> <span className="mono">{formatBytes(m.totalBytes)}</span>
             </li>
-            <li>
-              <span className="meta-row__k">References</span> {m.maxReferences || "—"}
-            </li>
+            {isVideo ? (
+              <>
+                <li>
+                  <span className="meta-row__k">Modes</span> {(m.modes ?? []).map((x) => (x === "t2v" ? "text → video" : x === "i2v" ? "image → video" : x)).join(", ") || "—"}
+                </li>
+                <li>
+                  <span className="meta-row__k">Audio</span> {m.audio ? "yes" : "no"}
+                </li>
+                <li>
+                  <span className="meta-row__k">Region</span> {VIDEO_REGION}
+                  {m.volume ? <span className="mono hint"> · {m.volume}</span> : null}
+                </li>
+              </>
+            ) : (
+              <li>
+                <span className="meta-row__k">References</span> {m.maxReferences || "—"}
+              </li>
+            )}
           </ul>
         </div>
         <div className="model-panel__actions">
@@ -191,8 +259,8 @@ function ModelCard({ model: m, all }: { model: ModelView; all: ModelView[] }) {
                   ? "Queued to delete"
                   : "Deleting"
                 : task.status === "queued"
-                  ? gpu.podMode && gpu.state?.status === "starting"
-                    ? `Queued — starting the GPU${gpu.state.phase ? ` · ${gpu.state.phase}` : ""}`
+                  ? gpu.podMode && pg.state?.status === "starting"
+                    ? `Queued — starting the ${isVideo ? "video " : ""}GPU${pg.state.phase ? ` · ${pg.state.phase}` : ""}`
                     : "Queued — waiting for a worker"
                   : "Downloading"}
               {task.file ? <span className="mono hint"> · {task.file}</span> : null}
@@ -226,16 +294,23 @@ function ModelCard({ model: m, all }: { model: ModelView; all: ModelView[] }) {
         })}
       </ul>
 
-      <DeleteDialog model={m} open={deleteOpen} onClose={() => setDeleteOpen(false)} />
+      {isVideo && m.id === "h3" && (
+        <p className="notice notice--warn">
+          <Icon name="globe" /> Runs in Canada — license excludes EU/UK/KR/US. Commercial UIs must display “MiniMax H3”.
+        </p>
+      )}
+
+      <DeleteDialog model={m} profile={profile} open={deleteOpen} onClose={() => setDeleteOpen(false)} />
     </article>
   );
 }
 
-function DeleteDialog({ model: m, open, onClose }: { model: ModelView; open: boolean; onClose: () => void }) {
+function DeleteDialog({ model: m, profile, open, onClose }: { model: ModelView; profile: GpuProfile; open: boolean; onClose: () => void }) {
   const lib = useLibrary();
   const gpu = useGpu();
+  const pg = gpu.profiles[profile];
   // This dialog is already a confirmation, so the GPU-start notice lives inside it.
-  const startsGpu = gpu.podMode && gpuIsOff(gpu.state);
+  const startsGpu = gpu.podMode && gpuIsOff(pg.state);
   const toast = useToast();
   const [preview, setPreview] = useState<DeletePreview | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -298,7 +373,8 @@ function DeleteDialog({ model: m, open, onClose }: { model: ModelView; open: boo
     >
       {startsGpu && preview && !nothing && (
         <p className="notice notice--warn">
-          <Icon name="bolt" /> This starts the GPU pod ({gpu.startTarget}, {gpu.costLabel}). It auto-stops after {gpu.idleMinutes} idle minutes.
+          <Icon name="bolt" /> This starts the {profile === "video" ? "video GPU in Canada" : "GPU pod"} ({pg.startTarget}, {pg.costLabel}) if it isn't running. It
+          auto-stops after {pg.idleMinutes} idle minutes.
         </p>
       )}
       {error && <p className="notice notice--error">{error}</p>}

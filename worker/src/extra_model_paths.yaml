@@ -6,6 +6,7 @@
 #   /runpod-volume/models/clip/            text encoders
 #   /runpod-volume/models/vae/
 #   /runpod-volume/models/loras/<modelId>/ LoRAs (lora_name "<modelId>/<file>")
+#   /runpod-volume/models/latent_upscale_models/  LTX-2.5 latent upscaler (video)
 #
 # ComfyUI treats "unet" as a legacy alias of "diffusion_models" and "clip" as a
 # legacy alias of "text_encoders" (folder_paths.map_legacy), so both spellings
@@ -18,3 +19,4 @@ image_studio:
   clip: clip/
   vae: vae/
   loras: loras/
+  latent_upscale_models: latent_upscale_models/

@@ -3,6 +3,7 @@
 
 use crate::db::{LoraRow, StatusSnapshot, Volume};
 use crate::delete_rule::FileKey;
+use crate::pod::Profile;
 use crate::registry::Model;
 use crate::runpod::{failure_message, RunStatus, RunpodClient, GENERATE_TIMEOUT_MS};
 use crate::state::{now_rfc3339, Core};
@@ -15,6 +16,9 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusView {
+    /// Which volume `volume` / `checked_at` describe (spec v5).
+    pub profile: Profile,
+    /// Every model (image and video), each with presence from its own volume.
     pub models: Vec<Value>,
     pub volume: Option<Volume>,
     pub checked_at: Option<String>,
@@ -39,12 +43,17 @@ pub fn lora_folder(model_id: &str) -> String {
     format!("loras/{model_id}")
 }
 
-/// Files on the volume according to the cache (empty if never checked).
+/// Files on the image volume according to the cache (empty if never checked).
 pub fn present_set(core: &Core) -> HashSet<FileKey> {
+    present_set_for(core, Profile::Image)
+}
+
+/// Files on profile `p`'s volume according to its cache.
+pub fn present_set_for(core: &Core, p: Profile) -> HashSet<FileKey> {
     core.db
         .lock()
         .unwrap()
-        .load_status()
+        .load_status_for(p.as_str())
         .ok()
         .flatten()
         .map(|(s, _)| {
@@ -57,11 +66,17 @@ pub fn present_set(core: &Core) -> HashSet<FileKey> {
 }
 
 pub fn has_cache(core: &Core) -> bool {
-    matches!(core.db.lock().unwrap().load_status(), Ok(Some(_)))
+    has_cache_for(core, Profile::Image)
+}
+
+pub fn has_cache_for(core: &Core, p: Profile) -> bool {
+    matches!(core.db.lock().unwrap().load_status_for(p.as_str()), Ok(Some(_)))
 }
 
 pub fn model_view(core: &Core, m: &Model, present: &HashSet<FileKey>) -> Value {
     let mut v = serde_json::to_value(m).expect("model serialises");
+    let video = core.registry.is_video_model(&m.id);
+    v["kind"] = json!(if video { "video" } else { "image" });
     let files: Vec<Value> = m
         .files
         .iter()
@@ -95,12 +110,21 @@ pub fn model_view(core: &Core, m: &Model, present: &HashSet<FileKey>) -> Value {
     v
 }
 
+/// Image models then video models (`kind: "video"`), each against its own
+/// volume's cache.
 pub fn model_views(core: &Core) -> Vec<Value> {
     let present = present_set(core);
+    let present_video = present_set_for(core, Profile::Video);
     core.registry
         .models
         .iter()
         .map(|m| model_view(core, m, &present))
+        .chain(
+            core.registry
+                .video_models
+                .iter()
+                .map(|m| model_view(core, m, &present_video)),
+        )
         .collect()
 }
 
@@ -121,8 +145,15 @@ pub fn lora_view(core: &Core, l: &LoraRow, present: &HashSet<FileKey>) -> LoraVi
 
 pub fn lora_views(core: &Core) -> Result<Vec<LoraView>, String> {
     let present = present_set(core);
+    let present_video = present_set_for(core, Profile::Video);
     let rows = core.db.lock().unwrap().list_loras()?;
-    Ok(rows.iter().map(|l| lora_view(core, l, &present)).collect())
+    Ok(rows
+        .iter()
+        .map(|l| {
+            let p = crate::worker::profile_for_model(core, &l.model_id);
+            lora_view(core, l, if p == Profile::Video { &present_video } else { &present })
+        })
+        .collect())
 }
 
 pub const GIB: u64 = 1024 * 1024 * 1024;
@@ -147,11 +178,17 @@ pub fn volume_usage(snap: &StatusSnapshot, volume_size_gb: Option<u64>) -> Optio
     })
 }
 
-/// Current cached status without contacting RunPod.
+/// Current cached image-volume status without contacting RunPod.
 pub fn cached_view(core: &Core) -> Result<StatusView, String> {
-    let cache = core.db.lock().unwrap().load_status()?;
-    let size = crate::pod::cached_volume_size_gb(core);
+    cached_view_for(core, Profile::Image)
+}
+
+/// Current cached status of profile `p`'s volume without contacting RunPod.
+pub fn cached_view_for(core: &Core, p: Profile) -> Result<StatusView, String> {
+    let cache = core.db.lock().unwrap().load_status_for(p.as_str())?;
+    let size = crate::pod::cached_volume_size_gb_for(core, p);
     Ok(StatusView {
+        profile: p,
         models: model_views(core),
         volume: cache.as_ref().and_then(|(s, _)| volume_usage(s, size)),
         checked_at: cache.map(|(_, at)| at),
@@ -204,21 +241,34 @@ pub async fn refresh_status(core: &Arc<Core>) -> Result<StatusView, String> {
 /// `allow_start = false` skips the refresh (returning the cached view) when
 /// the GPU pod is not running, instead of starting it.
 pub async fn refresh_status_opts(core: &Arc<Core>, allow_start: bool) -> Result<StatusView, String> {
-    if !allow_start && crate::worker::ready_client(core).is_none() {
-        return cached_view(core);
+    refresh_status_opts_for(core, Profile::Image, allow_start).await
+}
+
+/// Refresh profile `p`'s volume status (its own pod and cache).
+pub async fn refresh_status_opts_for(
+    core: &Arc<Core>,
+    p: Profile,
+    allow_start: bool,
+) -> Result<StatusView, String> {
+    if !allow_start && crate::worker::ready_client_for(core, p).is_none() {
+        return cached_view_for(core, p);
     }
     let requested_at = now_rfc3339();
-    let _guard = core.refresh_lock.lock().await;
-    if let Some((_, at)) = core.db.lock().unwrap().load_status()? {
+    let lock = match p {
+        Profile::Image => &core.refresh_lock,
+        Profile::Video => &core.video_refresh_lock,
+    };
+    let _guard = lock.lock().await;
+    if let Some((_, at)) = core.db.lock().unwrap().load_status_for(p.as_str())? {
         if at >= requested_at {
             drop(_guard);
-            return cached_view(core);
+            return cached_view_for(core, p);
         }
     }
-    let client = crate::worker::client(core, &mut |_| {}, &|| false).await?;
-    if client.is_pod() && crate::pod::cached_volume_size_gb(core).is_none() {
+    let client = crate::worker::client_for(core, p, &mut |_| {}, &|| false).await?;
+    if client.is_pod() && crate::pod::cached_volume_size_gb_for(core, p).is_none() {
         if let Ok(rest) = crate::pod::rest(core) {
-            let _ = crate::pod::lookup_volume(core, &rest).await;
+            let _ = crate::pod::lookup_volume_for(core, &rest, p).await;
         }
     }
     let output = run_to_completion(
@@ -231,8 +281,8 @@ pub async fn refresh_status_opts(core: &Arc<Core>, allow_start: bool) -> Result<
     let snap: StatusSnapshot = serde_json::from_value(output)
         .map_err(|e| format!("The worker returned an unexpected status: {e}"))?;
     let at = now_rfc3339();
-    core.db.lock().unwrap().save_status(&snap, &at)?;
-    let view = cached_view(core)?;
+    core.db.lock().unwrap().save_status_for(p.as_str(), &snap, &at)?;
+    let view = cached_view_for(core, p)?;
     core.sink.status_update(&view);
     Ok(view)
 }

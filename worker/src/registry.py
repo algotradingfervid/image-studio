@@ -48,6 +48,26 @@ def get_model(registry: dict, model_id: str) -> dict:
     raise KeyError(model_id)
 
 
+def video_model_ids(registry: dict) -> list[str]:
+    return [m["id"] for m in registry.get("videoModels", [])]
+
+
+def get_video_model(registry: dict, model_id: str) -> dict:
+    for m in registry.get("videoModels", []):
+        if m["id"] == model_id:
+            return m
+    raise KeyError(model_id)
+
+
+def model_file_by_role(model: dict, role: str) -> dict:
+    """The registry file of a video model with `role` (unet, clip, video_vae,
+    audio_vae, spatial_upscaler)."""
+    for f in model["files"]:
+        if f.get("role") == role:
+            return f
+    raise KeyError(f"{model['id']} has no {role} file")
+
+
 def model_file(model: dict, folder: str) -> dict:
     """The single registry file of a model in `folder` (unet, clip or vae)."""
     for f in model["files"]:
