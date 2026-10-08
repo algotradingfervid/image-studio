@@ -12,14 +12,16 @@ use app_lib::tasks::Task;
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const GIB: u64 = 1024 * 1024 * 1024;
+/// RunPod REST timeout in tests (a delayed mock response simulates a timeout).
+const REST_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 struct Collect {
@@ -67,6 +69,7 @@ fn harness(server: &MockServer, pod_token: Option<&str>, start_timeout: Duration
         pod_poll_interval: Duration::from_millis(10),
         pod_start_timeout: start_timeout,
         pod_stop_timeout: Duration::from_secs(2),
+        rest_timeout: REST_TIMEOUT,
         clock,
     };
     let core = Core::new(
@@ -107,7 +110,18 @@ fn pod_json(id: &str, status: &str) -> Value {
            "startedAt": "2026-10-09T10:00:05Z", "env": {}})
 }
 
+/// Default `GET /v2/pods`: no pods (low priority, so a test's own list wins).
+async fn mount_no_pods(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v2/pods"))
+        .respond_with(ok(json!({"pods": [], "pagination": {"hasNextPage": false}})))
+        .with_priority(10)
+        .mount(server)
+        .await;
+}
+
 async fn mount_volumes(server: &MockServer) {
+    mount_no_pods(server).await;
     Mock::given(method("GET"))
         .and(path("/v2/network-volumes"))
         .and(header("authorization", "Bearer test-key"))
@@ -350,26 +364,19 @@ async fn start_falls_back_to_next_gpu_on_capacity_error() {
 async fn start_timeout_errors_and_terminates() {
     let server = MockServer::start().await;
     mount_volumes(&server).await;
-    mount_create(&server, "pod1").await;
-    Mock::given(method("GET"))
-        .and(path("/v2/pods/pod1"))
-        .respond_with(ok(pod_json("pod1", "PROVISIONING")))
-        .mount(&server)
-        .await;
-    Mock::given(method("DELETE"))
-        .and(path("/v2/pods/pod1"))
-        .respond_with(ResponseTemplate::new(204))
-        .expect(1)
-        .mount(&server)
-        .await;
+    // The pod stays PROVISIONING until deleted (then 404: confirmed gone).
+    let sim = Sim::new(&["pod1"], "PROVISIONING");
+    sim.mount(&server).await;
     let h = harness(&server, Some("t"), Duration::from_millis(150));
     pod::start(&h.core).unwrap();
     let s = wait_for(&h.core, GpuStatus::Error).await;
     let e = s.error.unwrap();
     assert!(e.contains("did not become ready"), "{e}");
     assert!(e.contains("Waiting for machine"), "{e}");
+    assert!(e.contains("terminated"), "{e}");
+    assert_eq!(s.pod_id, None, "confirmed gone, so no longer tracked");
     assert_eq!(stored_pod_id(&h.core), None);
-    server.verify().await;
+    assert_eq!(sim.deletes(), vec!["pod1"]);
 }
 
 /// Start → running, used by several tests.
@@ -652,4 +659,435 @@ async fn task_finish_does_not_start_gpu_for_refresh() {
     assert!(v.checked_at.is_none());
     assert_eq!(pod::state(&h.core).status, GpuStatus::Stopped);
     assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Billing safety: orphan/duplicate pods, checked cleanups, Error auto-stop.
+
+/// Stateful fake of the RunPod REST pod endpoints: `GET /v2/pods`,
+/// `POST /v2/pods`, `GET`/`DELETE /v2/pods/{id}`. A deleted pod is gone
+/// (404) unless its delete is set to fail.
+#[derive(Clone)]
+struct Sim(Arc<Mutex<SimState>>);
+
+struct SimState {
+    pods: Vec<Value>,
+    next_ids: Vec<String>,
+    create_status: String,
+    /// Reply to POST instead of 201 (e.g. a 503 or a delayed reply).
+    create_reply: Option<ResponseTemplate>,
+    /// Whether a POST creates the pod (true even when `create_reply` errs).
+    create_creates: bool,
+    fail_delete: HashSet<String>,
+    deletes: Vec<String>,
+    posts: usize,
+    lists: usize,
+}
+
+impl Sim {
+    fn new(next_ids: &[&str], create_status: &str) -> Sim {
+        Sim(Arc::new(Mutex::new(SimState {
+            pods: vec![],
+            next_ids: next_ids.iter().map(|s| s.to_string()).collect(),
+            create_status: create_status.into(),
+            create_reply: None,
+            create_creates: true,
+            fail_delete: HashSet::new(),
+            deletes: vec![],
+            posts: 0,
+            lists: 0,
+        })))
+    }
+    fn with(&self, f: impl FnOnce(&mut SimState)) -> &Sim {
+        f(&mut self.0.lock().unwrap());
+        self
+    }
+    fn add_pod(&self, id: &str, status: &str) {
+        self.0.lock().unwrap().pods.push(pod_json(id, status));
+    }
+    fn set_status(&self, id: &str, status: &str) {
+        let mut s = self.0.lock().unwrap();
+        let p = s.pods.iter_mut().find(|p| p["id"] == id).unwrap();
+        p["status"] = json!(status);
+    }
+    fn deletes(&self) -> Vec<String> {
+        self.0.lock().unwrap().deletes.clone()
+    }
+    fn posts(&self) -> usize {
+        self.0.lock().unwrap().posts
+    }
+    fn pod_ids(&self) -> Vec<String> {
+        let s = self.0.lock().unwrap();
+        s.pods.iter().map(|p| p["id"].as_str().unwrap().to_string()).collect()
+    }
+    async fn mount(&self, server: &MockServer) {
+        Mock::given(path_regex(r"^/v2/pods(/[^/]+)?$"))
+            .respond_with(self.clone())
+            .mount(server)
+            .await;
+    }
+}
+
+impl Respond for Sim {
+    fn respond(&self, r: &Request) -> ResponseTemplate {
+        let mut s = self.0.lock().unwrap();
+        let p = r.url.path();
+        let id = p.strip_prefix("/v2/pods/").map(str::to_string);
+        match (r.method.as_str(), id) {
+            ("GET", None) => {
+                s.lists += 1;
+                ok(json!({"pods": s.pods, "pagination": {"hasNextPage": false}}))
+            }
+            ("POST", None) => {
+                s.posts += 1;
+                let id = s.next_ids.remove(0);
+                let pod = pod_json(&id, &s.create_status.clone());
+                if s.create_creates {
+                    s.pods.push(pod.clone());
+                }
+                s.create_reply
+                    .clone()
+                    .unwrap_or_else(|| ResponseTemplate::new(201).set_body_json(pod))
+            }
+            ("GET", Some(id)) => match s.pods.iter().find(|p| p["id"] == id.as_str()) {
+                Some(p) => ok(p.clone()),
+                None => ResponseTemplate::new(404)
+                    .set_body_json(json!({"title": "Not Found", "status": 404, "detail": "pod not found"})),
+            },
+            ("DELETE", Some(id)) => {
+                s.deletes.push(id.clone());
+                if s.fail_delete.contains(&id) {
+                    return ResponseTemplate::new(500)
+                        .set_body_json(json!({"title": "Internal Server Error", "status": 500, "detail": "boom"}));
+                }
+                let before = s.pods.len();
+                s.pods.retain(|p| p["id"] != id.as_str());
+                if s.pods.len() == before {
+                    ResponseTemplate::new(404)
+                } else {
+                    ResponseTemplate::new(204)
+                }
+            }
+            _ => ResponseTemplate::new(405),
+        }
+    }
+}
+
+fn advance(h: &Harness, d: chrono::Duration) {
+    *h.now.lock().unwrap() += d;
+}
+
+#[tokio::test]
+async fn ambiguous_create_timeout_adopts_the_created_pod_without_a_second_post() {
+    let server = MockServer::start().await;
+    mount_volumes(&server).await;
+    // The create times out client-side, but RunPod created the pod.
+    let sim = Sim::new(&["pod7", "dup"], "RUNNING");
+    sim.with(|s| {
+        s.create_reply = Some(
+            ResponseTemplate::new(201)
+                .set_body_json(pod_json("pod7", "RUNNING"))
+                .set_delay(REST_TIMEOUT * 2),
+        )
+    });
+    sim.mount(&server).await;
+    mount_ready_pod_server(&server, "pod7").await;
+    let h = harness(&server, Some("t"), Duration::from_secs(5));
+    pod::start(&h.core).unwrap();
+    let s = wait_for(&h.core, GpuStatus::Running).await;
+    assert_eq!(s.pod_id.as_deref(), Some("pod7"));
+    assert_eq!(stored_pod_id(&h.core).as_deref(), Some("pod7"));
+    assert_eq!(sim.posts(), 1, "no second create");
+    assert_eq!(sim.pod_ids(), vec!["pod7"]);
+}
+
+#[tokio::test]
+async fn ambiguous_create_error_without_a_pod_returns_the_error() {
+    let server = MockServer::start().await;
+    mount_volumes(&server).await;
+    let sim = Sim::new(&["x"], "RUNNING");
+    sim.with(|s| {
+        s.create_creates = false;
+        s.create_reply = Some(
+            ResponseTemplate::new(503)
+                .set_body_json(json!({"title": "Service Unavailable", "status": 503, "detail": "try later"})),
+        );
+    });
+    sim.mount(&server).await;
+    let h = harness(&server, Some("t"), Duration::from_secs(5));
+    pod::start(&h.core).unwrap();
+    let s = wait_for(&h.core, GpuStatus::Error).await;
+    assert!(s.error.unwrap().contains("503"));
+    assert_eq!(s.pod_id, None);
+    assert_eq!(sim.posts(), 1, "a 5xx is not retried on the next GPU");
+    // One list before creating, three re-lists after the ambiguous error.
+    assert_eq!(sim.0.lock().unwrap().lists, 4);
+}
+
+#[tokio::test]
+async fn existing_named_pod_at_start_is_adopted_not_duplicated() {
+    let server = MockServer::start().await;
+    mount_volumes(&server).await;
+    let sim = Sim::new(&["new"], "RUNNING");
+    sim.add_pod("old1", "STARTING");
+    sim.mount(&server).await;
+    mount_ready_pod_server(&server, "old1").await;
+    let h = harness(&server, Some("t"), Duration::from_secs(5));
+    pod::start(&h.core).unwrap();
+    // STARTING → (the fake keeps it STARTING) flip it to RUNNING.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    sim.set_status("old1", "RUNNING");
+    let s = wait_for(&h.core, GpuStatus::Running).await;
+    assert_eq!(s.pod_id.as_deref(), Some("old1"));
+    assert_eq!(stored_pod_id(&h.core).as_deref(), Some("old1"));
+    assert_eq!(sim.posts(), 0, "no POST when a named pod exists");
+}
+
+#[tokio::test]
+async fn exited_named_pod_at_start_is_terminated_before_creating() {
+    let server = MockServer::start().await;
+    mount_volumes(&server).await;
+    let sim = Sim::new(&["pod2"], "RUNNING");
+    sim.add_pod("dead", "EXITED");
+    sim.mount(&server).await;
+    mount_ready_pod_server(&server, "pod2").await;
+    let h = harness(&server, Some("t"), Duration::from_secs(5));
+    pod::start(&h.core).unwrap();
+    let s = wait_for(&h.core, GpuStatus::Running).await;
+    assert_eq!(s.pod_id.as_deref(), Some("pod2"));
+    assert_eq!(sim.deletes(), vec!["dead"]);
+    assert_eq!(sim.pod_ids(), vec!["pod2"]);
+}
+
+/// Start → timeout → the cleanup delete fails: Error with the pod kept.
+async fn failed_cleanup_harness(server: &MockServer) -> (Harness, Sim) {
+    mount_volumes(server).await;
+    let sim = Sim::new(&["pod1", "dup"], "PROVISIONING");
+    sim.with(|s| {
+        s.fail_delete.insert("pod1".into());
+    });
+    sim.mount(server).await;
+    let h = harness(server, Some("t"), Duration::from_millis(150));
+    pod::start(&h.core).unwrap();
+    wait_for(&h.core, GpuStatus::Error).await;
+    (h, sim)
+}
+
+#[tokio::test]
+async fn failed_cleanup_keeps_the_pod_id_and_shows_error() {
+    let server = MockServer::start().await;
+    let (h, sim) = failed_cleanup_harness(&server).await;
+    let s = pod::state(&h.core);
+    let e = s.error.clone().unwrap();
+    assert!(e.contains("Couldn't stop the GPU pod automatically"), "{e}");
+    assert!(e.contains("may still be billing"), "{e}");
+    assert_eq!(s.pod_id.as_deref(), Some("pod1"));
+    assert_eq!(stored_pod_id(&h.core).as_deref(), Some("pod1"));
+    assert_eq!(sim.deletes(), vec!["pod1"]);
+    assert!(pod::needs_quit_confirm(&h.core));
+}
+
+#[tokio::test]
+async fn start_after_error_with_orphan_does_not_create_a_duplicate() {
+    let server = MockServer::start().await;
+    mount_volumes(&server).await;
+    // The create fails with a 502 and the pod only shows up later.
+    let sim = Sim::new(&["orphan", "dup"], "RUNNING");
+    sim.with(|s| {
+        s.create_creates = false;
+        s.create_reply = Some(ResponseTemplate::new(502));
+    });
+    sim.mount(&server).await;
+    mount_ready_pod_server(&server, "orphan").await;
+    let h = harness(&server, Some("t"), Duration::from_secs(5));
+    pod::start(&h.core).unwrap();
+    let s = wait_for(&h.core, GpuStatus::Error).await;
+    assert_eq!(s.pod_id, None);
+    sim.add_pod("orphan", "RUNNING");
+    // Retry: the orphan is adopted, nothing new is created.
+    pod::start(&h.core).unwrap();
+    let s = wait_for(&h.core, GpuStatus::Running).await;
+    assert_eq!(s.pod_id.as_deref(), Some("orphan"));
+    assert_eq!(sim.posts(), 1);
+    assert_eq!(sim.pod_ids(), vec!["orphan"]);
+}
+
+/// Adopts `ids[0]` (Running) with every id in `ids` listed as a named pod.
+async fn adopted_harness(server: &MockServer, ids: &[&str]) -> (Harness, Sim) {
+    let sim = Sim::new(&[], "RUNNING");
+    for id in ids {
+        sim.add_pod(id, "RUNNING");
+    }
+    sim.mount(server).await;
+    mount_ready_pod_server(server, ids[0]).await;
+    let h = harness(server, Some("t"), Duration::from_secs(5));
+    h.core.db.lock().unwrap().set_setting(pod::DB_POD_ID, ids[0]).unwrap();
+    pod::adopt(&h.core).await.unwrap();
+    wait_for(&h.core, GpuStatus::Running).await;
+    (h, sim)
+}
+
+#[tokio::test]
+async fn stop_terminates_every_named_pod_and_confirms() {
+    let server = MockServer::start().await;
+    let (h, sim) = adopted_harness(&server, &["podA", "podB"]).await;
+    assert_eq!(pod::state(&h.core).pod_id.as_deref(), Some("podA"));
+    let s = pod::stop(&h.core, StopReason::User).await.unwrap();
+    assert_eq!(s.status, GpuStatus::Stopped);
+    let mut d = sim.deletes();
+    d.sort();
+    assert_eq!(d, vec!["podA", "podB"]);
+    assert!(sim.pod_ids().is_empty(), "both confirmed gone");
+    assert_eq!(stored_pod_id(&h.core), None);
+    assert!(!pod::needs_quit_confirm(&h.core));
+}
+
+#[tokio::test]
+async fn stop_with_partial_failure_errors_and_keeps_ids() {
+    let server = MockServer::start().await;
+    let (h, sim) = adopted_harness(&server, &["podA", "podB"]).await;
+    sim.with(|s| {
+        s.fail_delete.insert("podB".into());
+    });
+    let e = pod::stop(&h.core, StopReason::User).await.unwrap_err();
+    assert!(e.contains("podB") && e.contains("may still be billing"), "{e}");
+    let s = pod::state(&h.core);
+    assert_eq!(s.status, GpuStatus::Error);
+    assert_eq!(s.pod_id.as_deref(), Some("podB"));
+    assert_eq!(stored_pod_id(&h.core).as_deref(), Some("podB"));
+    assert_eq!(sim.pod_ids(), vec!["podB"]);
+    // Once RunPod cooperates, Stop clears everything.
+    sim.with(|s| s.fail_delete.clear());
+    let s = pod::stop(&h.core, StopReason::User).await.unwrap();
+    assert_eq!(s.status, GpuStatus::Stopped);
+    assert!(sim.pod_ids().is_empty());
+    assert_eq!(stored_pod_id(&h.core), None);
+}
+
+#[tokio::test]
+async fn auto_stops_from_error_after_a_failed_start() {
+    let server = MockServer::start().await;
+    let (h, sim) = failed_cleanup_harness(&server).await;
+    sim.with(|s| s.fail_delete.clear());
+    advance(&h, chrono::Duration::seconds(90));
+    assert!(pod::idle_check(&h.core).await.is_none(), "within the 2 min grace");
+    advance(&h, chrono::Duration::seconds(40));
+    let s = pod::idle_check(&h.core).await.expect("auto-stopped");
+    assert_eq!(s.status, GpuStatus::Stopped);
+    assert_eq!(s.stop_reason, Some(StopReason::Idle));
+    assert!(sim.pod_ids().is_empty());
+    assert_eq!(stored_pod_id(&h.core), None);
+}
+
+#[tokio::test]
+async fn auto_stops_from_other_error_after_idle_minutes() {
+    let server = MockServer::start().await;
+    // Adopted at launch in a non-running state → Error (not a failed start).
+    let sim = Sim::new(&[], "RUNNING");
+    sim.add_pod("odd", "UNKNOWN");
+    sim.mount(&server).await;
+    let h = harness(&server, Some("t"), Duration::from_secs(5));
+    let s = pod::adopt(&h.core).await.unwrap();
+    assert_eq!(s.status, GpuStatus::Error);
+    advance(&h, chrono::Duration::minutes(29));
+    assert!(pod::idle_check(&h.core).await.is_none());
+    advance(&h, chrono::Duration::minutes(2));
+    let s = pod::idle_check(&h.core).await.expect("auto-stopped");
+    assert_eq!(s.status, GpuStatus::Stopped);
+    assert_eq!(sim.deletes(), vec!["odd"]);
+}
+
+#[tokio::test]
+async fn liveness_terminates_an_exited_pod() {
+    let server = MockServer::start().await;
+    let (h, sim) = adopted_harness(&server, &["pod1"]).await;
+    sim.set_status("pod1", "EXITED");
+    pod::liveness_check(&h.core).await;
+    let s = pod::state(&h.core);
+    assert_eq!(s.status, GpuStatus::Stopped);
+    assert_eq!(s.stop_reason, Some(StopReason::External));
+    assert_eq!(sim.deletes(), vec!["pod1"]);
+    assert!(sim.pod_ids().is_empty());
+    assert_eq!(stored_pod_id(&h.core), None);
+}
+
+#[tokio::test]
+async fn liveness_notices_external_termination_in_error_state() {
+    let server = MockServer::start().await;
+    let (h, sim) = failed_cleanup_harness(&server).await;
+    // Someone terminates it in the RunPod console.
+    sim.with(|s| s.pods.clear());
+    pod::liveness_check(&h.core).await;
+    let s = pod::state(&h.core);
+    assert_eq!(s.status, GpuStatus::Stopped);
+    assert_eq!(s.stop_reason, Some(StopReason::External));
+    assert_eq!(stored_pod_id(&h.core), None);
+}
+
+#[tokio::test]
+async fn watchdog_status_is_exposed() {
+    let server = MockServer::start().await;
+    let sim = Sim::new(&[], "RUNNING");
+    sim.add_pod("wd1", "RUNNING");
+    sim.mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/proxy/wd1/ping"))
+        .respond_with(ok(json!({"status": "ok"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/proxy/wd1/health"))
+        .respond_with(ok(json!({"ready": true, "jobs": {}, "workers": {},
+            "watchdog": {"armed": false, "check": "read", "idleMinutes": 30, "idleForS": 4, "lastError": "403 Forbidden"}})))
+        .mount(&server)
+        .await;
+    let h = harness(&server, Some("t"), Duration::from_secs(5));
+    pod::adopt(&h.core).await.unwrap();
+    let s = wait_for(&h.core, GpuStatus::Running).await;
+    assert_eq!(s.watchdog_armed, Some(false));
+    assert_eq!(serde_json::to_value(&s).unwrap()["watchdogArmed"], false);
+}
+
+#[tokio::test]
+async fn stop_for_quit_fails_when_the_pod_survives() {
+    let server = MockServer::start().await;
+    let (h, sim) = adopted_harness(&server, &["pod1"]).await;
+    sim.with(|s| {
+        s.fail_delete.insert("pod1".into());
+    });
+    assert!(pod::needs_quit_confirm(&h.core));
+    assert!(pod::stop_for_quit(&h.core).await.is_err());
+    assert!(pod::needs_quit_confirm(&h.core), "still billing: keep asking");
+    sim.with(|s| s.fail_delete.clear());
+    pod::stop_for_quit(&h.core).await.unwrap();
+    assert!(!pod::needs_quit_confirm(&h.core));
+}
+
+#[tokio::test]
+async fn stop_during_an_ambiguous_create_still_catches_a_late_pod() {
+    let server = MockServer::start().await;
+    mount_volumes(&server).await;
+    // The create times out and the pod is not listed yet.
+    let sim = Sim::new(&["late"], "RUNNING");
+    sim.with(|s| {
+        s.create_creates = false;
+        s.create_reply = Some(ResponseTemplate::new(201).set_delay(REST_TIMEOUT * 2));
+    });
+    sim.mount(&server).await;
+    let h = harness(&server, Some("t"), Duration::from_secs(5));
+    pod::start(&h.core).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let s = pod::stop(&h.core, StopReason::User).await.unwrap();
+    assert_eq!(s.status, GpuStatus::Stopped);
+    // The create's outcome is unknown: not hidden behind "Stopped".
+    let s = wait_for(&h.core, GpuStatus::Error).await;
+    assert!(s.error.unwrap().contains("didn't confirm"));
+    // The pod shows up later; the monitor stops it after the grace period.
+    sim.add_pod("late", "RUNNING");
+    advance(&h, chrono::Duration::minutes(3));
+    let s = pod::idle_check(&h.core).await.expect("auto-stopped");
+    assert_eq!(s.status, GpuStatus::Stopped);
+    assert_eq!(sim.deletes(), vec!["late"]);
+    assert!(sim.pod_ids().is_empty());
+    assert_eq!(sim.posts(), 1);
 }

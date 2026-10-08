@@ -5,7 +5,13 @@
 // URL flags: ?unconfigured (no API key / endpoint), ?empty (empty gallery),
 // ?gpuRunning (a re-adopted pod is already running, shows the launch banner),
 // ?fastIdle (an auto-stop "minute" lasts 2 s), ?gpuFail (starting the GPU ends in an error),
-// ?serverless (legacy serverless backend selected).
+// ?serverless (legacy serverless backend selected), ?noWatchdog (the running pod can't
+// auto-stop itself), ?stopFail (stopping the GPU fails, e.g. to try the quit dialog's
+// "Try again / Quit anyway").
+//
+// Quit flow: a browser tab can't intercept closing with an in-app dialog, so call
+// `window.mockQuit()` from the console to simulate ⌘Q (`quit-requested` when a pod
+// may be billing); `confirm_quit` then logs instead of exiting.
 
 import registry from "../../../shared/models.json";
 import type { Backend, Unlisten } from "./backend";
@@ -78,7 +84,7 @@ window.setInterval(() => {
   const busy =
     activeJobs.size > 0 || [...modelTasks.values(), ...loraTasks.values()].some((t) => t.status === "queued" || t.status === "running");
   if (busy) lastActivity = Date.now();
-  else if (Date.now() - lastActivity >= gpu.idleMinutes * MINUTE_MS) void stopGpuInternal("idle");
+  else if (Date.now() - lastActivity >= gpu.idleMinutes * MINUTE_MS) stopGpuInternal("idle").catch(() => {});
 }, 1000);
 
 let checkedAt = Date.now() - 1000 * 60 * 60 * 5;
@@ -138,6 +144,7 @@ let gpu: GpuState = params.has("gpuRunning")
       idleMinutes: settings.idleMinutes,
       leftRunning: true,
       stopReason: null,
+      watchdogArmed: params.has("noWatchdog") ? false : true,
     }
   : {
       status: "stopped",
@@ -185,7 +192,7 @@ function startGpuInternal() {
         setGpu({ status: "error", phase: null, error: "ComfyUI didn't become healthy within 10 minutes (simulated by ?gpuFail). The pod is still there." });
       } else {
         lastActivity = Date.now();
-        setGpu({ status: "running", phase: null, startedAt: new Date().toISOString() });
+        setGpu({ status: "running", phase: null, startedAt: new Date().toISOString(), watchdogArmed: !params.has("noWatchdog") });
       }
     }
   })();
@@ -200,11 +207,25 @@ async function stopGpuInternal(reason: "user" | "idle" | "external") {
   gpuRun++;
   setGpu({ status: "stopping", phase: null });
   await sleep(1500);
+  if (params.has("stopFail")) {
+    const error = "Couldn't stop the GPU pod — it may still be billing. Press Stop to try again. (simulated by ?stopFail)";
+    setGpu({ status: "error", error });
+    throw new Error(error);
+  }
   // Terminating the pod ends whatever was running on it.
   activeJobs.forEach((j) => jobCancel.add(j.jobId));
   for (const t of [...modelTasks.values(), ...loraTasks.values()]) if (t.status === "queued" || t.status === "running") taskCancel.add(t.taskId);
-  setGpu({ status: "stopped", podId: null, gpuType: null, costPerHr: null, startedAt: null, phase: null, error: null, leftRunning: false, stopReason: reason });
+  setGpu({ status: "stopped", podId: null, gpuType: null, costPerHr: null, startedAt: null, phase: null, error: null, leftRunning: false, stopReason: reason, watchdogArmed: null });
 }
+
+/** Like the Rust core: quitting must be confirmed while a pod may be billing. */
+const quitNeedsConfirm = () =>
+  podMode() && (gpu.status === "starting" || gpu.status === "running" || gpu.status === "stopping" || (gpu.status === "error" && !!gpu.podId));
+
+(window as unknown as { mockQuit: () => void }).mockQuit = () => {
+  if (quitNeedsConfirm()) emit("quit-requested", gpu);
+  else console.info("[mock] No GPU pod is billing — the app would quit now.");
+};
 
 /**
  * Pod backend: make sure the GPU is running, auto-starting it when stopped (like the Rust core).
@@ -575,6 +596,14 @@ const commands: Record<string, Handler> = {
   stop_gpu: async () => {
     await stopGpuInternal("user");
     return { ...gpu };
+  },
+  confirm_quit: async (a) => {
+    if (a.stopGpu) {
+      await stopGpuInternal("user");
+      while (gpu.status === "stopping") await sleep(100);
+      if (gpu.status !== "stopped") throw new Error(gpu.error ?? "The GPU pod could not be stopped; it may still be billing");
+    }
+    console.info(`[mock] The app would quit now${a.stopGpu ? " (GPU stopped)" : " (GPU left running)"}.`);
   },
   list_models: () => models.map(modelView),
   refresh_status: async () => {

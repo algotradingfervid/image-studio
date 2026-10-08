@@ -17,6 +17,7 @@ use base64::Engine;
 use serde::Serialize;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::State;
 
@@ -106,6 +107,34 @@ pub async fn start_gpu(core: CoreState<'_>) -> Res<GpuState> {
 #[tauri::command]
 pub async fn stop_gpu(core: CoreState<'_>) -> Res<GpuState> {
     pod::stop(&core, pod::StopReason::User).await
+}
+
+/// Set once quitting is confirmed, so the exit isn't intercepted again.
+#[derive(Default)]
+pub struct QuitGuard(pub AtomicBool);
+
+impl QuitGuard {
+    pub fn confirmed(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Answer to the `quit-requested` dialog. `stop_gpu`: stop the pod (and
+/// confirm it is gone) first; on failure nothing quits and the error is
+/// returned so the UI can offer "Try again" / "Quit anyway".
+#[tauri::command]
+pub async fn confirm_quit(
+    app: tauri::AppHandle,
+    core: CoreState<'_>,
+    guard: State<'_, QuitGuard>,
+    stop_gpu: bool,
+) -> Res<()> {
+    if stop_gpu {
+        pod::stop_for_quit(&core).await?;
+    }
+    guard.0.store(true, Ordering::SeqCst);
+    app.exit(0);
+    Ok(())
 }
 
 #[tauri::command]

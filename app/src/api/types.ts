@@ -113,6 +113,11 @@ export interface GpuState {
   leftRunning: boolean;
   /** Set on "stopped": user pressed Stop, the app auto-stopped it, or the pod vanished. */
   stopReason?: "user" | "idle" | "external" | null;
+  /**
+   * From the pod's /health watchdog: false means the pod can't terminate itself when
+   * idle (only the app's auto-stop protects it). Absent when the pod doesn't report it.
+   */
+  watchdogArmed?: boolean | null;
 }
 
 export interface VolumeInfo {
@@ -266,6 +271,8 @@ export interface EventMap {
   "task-update": Task;
   "status-update": StatusSnapshot;
   "gpu-update": GpuState;
+  /** The user is quitting while a GPU pod may be billing; answer with `confirm_quit`. */
+  "quit-requested": GpuState;
 }
 
 export const isTaskActive = (t: Task | null | undefined): t is Task =>

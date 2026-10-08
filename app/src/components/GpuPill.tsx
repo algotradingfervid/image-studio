@@ -58,6 +58,8 @@ export function GpuPill() {
       const started = toDate(g.startedAt);
       const ms = started ? now - started.getTime() : 0;
       const cost = (Math.max(0, ms) / 3_600_000) * gpu.costPerHr;
+      const noWatchdog = g.watchdogArmed === false;
+      const watchdogMsg = `Pod can't auto-stop itself — the app will stop it after ${gpu.idleMinutes} idle min; keep the app open or stop manually.`;
       return (
         <div className="gpu-pill gpu-pill--running" role="status" aria-label="GPU status">
           <span className="gpu-pill__dot" aria-hidden />
@@ -70,6 +72,11 @@ export function GpuPill() {
               </>
             )}
           </span>
+          {noWatchdog && (
+            <span className="gpu-pill__warn" title={watchdogMsg} tabIndex={0}>
+              <Icon name="alert" size={13} label={watchdogMsg} />
+            </span>
+          )}
           <button type="button" className="btn btn--sm gpu-pill__btn" onClick={gpu.stop}>
             <Icon name="stop" size={13} /> Stop
           </button>
@@ -84,6 +91,23 @@ export function GpuPill() {
         </div>
       );
     default:
+      // A pod may still exist (and bill): Stop comes first and is prominent.
+      if (g.podId) {
+        return (
+          <div className="gpu-pill gpu-pill--error" role="status" aria-label="GPU status">
+            <Icon name="alert" size={13} />
+            <span className="gpu-pill__text" title={g.error ?? undefined}>
+              Error · <strong>may still be billing</strong>
+            </span>
+            <button type="button" className="btn btn--sm btn--danger gpu-pill__btn" onClick={gpu.stop} title={g.error ? `${g.error}\n\nStop terminates the pod.` : "Stop terminates the pod."}>
+              <Icon name="stop" size={13} /> Stop
+            </button>
+            <button type="button" className="btn btn--sm btn--ghost gpu-pill__btn" onClick={start} disabled={busy}>
+              <Icon name="refresh" size={13} /> Retry
+            </button>
+          </div>
+        );
+      }
       return (
         <div className="gpu-pill gpu-pill--error" role="status" aria-label="GPU status">
           <Icon name="alert" size={13} />
@@ -96,11 +120,6 @@ export function GpuPill() {
           <button type="button" className="btn btn--sm gpu-pill__btn" onClick={start} disabled={busy}>
             <Icon name="refresh" size={13} /> Retry
           </button>
-          {g.podId && (
-            <button type="button" className="btn btn--sm btn--ghost gpu-pill__btn" onClick={gpu.stop}>
-              <Icon name="stop" size={13} /> Stop
-            </button>
-          )}
         </div>
       );
   }

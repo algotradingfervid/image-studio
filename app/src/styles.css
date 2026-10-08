@@ -367,6 +367,17 @@ kbd {
   font-weight: 450;
 }
 
+.gpu-pill__warn {
+  display: inline-flex;
+  flex: none;
+  color: var(--warn);
+  cursor: help;
+}
+
+.gpu-pill--error strong {
+  font-weight: 650;
+}
+
 .gpu-pill--starting {
   color: var(--warn);
   border-color: rgba(243, 197, 82, 0.3);

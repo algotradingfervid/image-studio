@@ -56,6 +56,8 @@ pub struct CoreConfig {
     pub pod_poll_interval: Duration,
     pub pod_start_timeout: Duration,
     pub pod_stop_timeout: Duration,
+    /// Per-request timeout for the RunPod REST API.
+    pub rest_timeout: Duration,
     pub clock: Clock,
 }
 
@@ -72,6 +74,7 @@ impl CoreConfig {
             pod_poll_interval: Duration::from_secs(3),
             pod_start_timeout: Duration::from_secs(15 * 60),
             pod_stop_timeout: Duration::from_secs(3 * 60),
+            rest_timeout: Duration::from_secs(60),
             clock: system_clock(),
         }
     }

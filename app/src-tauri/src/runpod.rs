@@ -112,6 +112,40 @@ pub struct Health {
     pub ready: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu: Option<String>,
+    /// Pod only: the pod's self-terminate watchdog (absent on older images).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watchdog: Option<Watchdog>,
+}
+
+/// `watchdog` from the pod's `/health`:
+/// `{armed, check, idleMinutes, idleForS, lastError}`. Every field is optional
+/// so an older or newer pod image never breaks parsing.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Watchdog {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub armed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_minutes: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_for_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// Parses `watchdog` defensively: `None` unless it is an object.
+pub fn parse_watchdog(v: &Value) -> Option<Watchdog> {
+    let w = v.get("watchdog")?.as_object()?;
+    let s = |k: &str| w.get(k).and_then(Value::as_str).map(str::to_string);
+    Some(Watchdog {
+        armed: w.get("armed").and_then(Value::as_bool),
+        check: s("check"),
+        idle_minutes: w.get("idleMinutes").and_then(Value::as_f64),
+        idle_for_s: w.get("idleForS").and_then(Value::as_f64),
+        last_error: s("lastError"),
+    })
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
@@ -307,6 +341,7 @@ impl RunpodClient {
             message: None,
             ready: v.get("ready").and_then(Value::as_bool),
             gpu: v.get("gpu").and_then(Value::as_str).map(str::to_string),
+            watchdog: parse_watchdog(&v),
         })
     }
 }
@@ -355,6 +390,22 @@ mod tests {
         assert!(parse_progress(&json!({"progress": {"phase":"loading"}})).is_some());
         assert!(parse_progress(&json!("Update 1/3")).is_none());
         assert!(parse_progress(&json!(42)).is_none());
+    }
+
+    #[test]
+    fn watchdog_parsed_defensively() {
+        let w = parse_watchdog(&json!({"watchdog": {"armed": false, "check": "read",
+            "idleMinutes": 30, "idleForS": 12.5, "lastError": "403"}}))
+        .unwrap();
+        assert_eq!(w.armed, Some(false));
+        assert_eq!(w.check.as_deref(), Some("read"));
+        assert_eq!(w.idle_minutes, Some(30.0));
+        assert_eq!(w.idle_for_s, Some(12.5));
+        assert_eq!(w.last_error.as_deref(), Some("403"));
+        assert!(parse_watchdog(&json!({"ready": true})).is_none());
+        assert!(parse_watchdog(&json!({"watchdog": "on"})).is_none());
+        let w = parse_watchdog(&json!({"watchdog": {"armed": "yes"}})).unwrap();
+        assert_eq!(w.armed, None);
     }
 
     #[test]

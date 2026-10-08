@@ -73,6 +73,11 @@ export const getGpuState = () => call<GpuState>("get_gpu_state");
 export const startGpu = () => call<GpuState>("start_gpu");
 /** Resolves after the pod is gone (emits "stopping" then "stopped"). */
 export const stopGpu = () => call<GpuState>("stop_gpu");
+/**
+ * Answer to `quit-requested`. stopGpu: stop the pod (confirmed gone) and then quit —
+ * rejects (and does not quit) when the pod couldn't be stopped. false: quit now.
+ */
+export const confirmQuit = (stopGpu: boolean) => call<void>("confirm_quit", { stopGpu });
 
 // ---------- Models ----------
 

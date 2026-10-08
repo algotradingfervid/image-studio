@@ -13,8 +13,14 @@ pub mod status;
 pub mod tasks;
 pub mod worker;
 
+use commands::QuitGuard;
 use std::sync::Arc;
-use tauri::{Emitter, Manager};
+use tauri::menu::{Menu, MenuItem};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime, WindowEvent};
+
+/// Asks the UI to confirm quitting while a GPU pod may be billing.
+pub const EVENT_QUIT_REQUESTED: &str = "quit-requested";
+const QUIT_MENU_ID: &str = "image-studio-quit";
 
 /// Forwards core events to the webview.
 struct TauriSink(tauri::AppHandle);
@@ -55,17 +61,98 @@ fn build_core(app: &tauri::App) -> Result<Arc<state::Core>, String> {
     )
 }
 
+/// True when quitting now must be confirmed: not yet confirmed, and a GPU
+/// pod is starting, running, stopping, or in error with a pod.
+fn must_confirm_quit<R: Runtime>(app: &AppHandle<R>) -> bool {
+    if app.state::<QuitGuard>().confirmed() {
+        return false;
+    }
+    app.try_state::<Arc<state::Core>>()
+        .is_some_and(|core| pod::needs_quit_confirm(&core))
+}
+
+/// Shows the in-app quit dialog (window raised), or — with no window left
+/// to ask in — stops the GPU (confirmed) and then exits.
+fn ask_quit<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+        let core = app.state::<Arc<state::Core>>();
+        let _ = app.emit(EVENT_QUIT_REQUESTED, pod::state(&core));
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let core = app.state::<Arc<state::Core>>().inner().clone();
+        if let Err(e) = pod::stop_for_quit(&core).await {
+            eprintln!("[quit] could not stop the GPU pod before quitting: {e}");
+        }
+        app.state::<QuitGuard>().0.store(true, std::sync::atomic::Ordering::SeqCst);
+        app.exit(0);
+    });
+}
+
+/// The quit menu item (⌘Q): confirm first when a pod may be billing.
+fn request_quit<R: Runtime>(app: &AppHandle<R>) {
+    if must_confirm_quit(app) {
+        ask_quit(app);
+    } else {
+        app.state::<QuitGuard>().0.store(true, std::sync::atomic::Ordering::SeqCst);
+        app.exit(0);
+    }
+}
+
+/// The default menu, with the macOS "Quit" item replaced by one the app
+/// handles: the predefined item sends `terminate:`, which quits without an
+/// `ExitRequested` event and so could not be intercepted.
+fn app_menu<R: Runtime>(h: &AppHandle<R>) -> tauri::Result<Menu<R>> {
+    let menu = Menu::default(h)?;
+    if cfg!(target_os = "macos") {
+        for sub in menu.items()?.iter().filter_map(|i| i.as_submenu().cloned()) {
+            let items = sub.items()?;
+            let quit = items.iter().enumerate().find_map(|(pos, i)| {
+                let text = i.as_predefined_menuitem()?.text().ok()?;
+                text.starts_with("Quit").then_some((pos, text))
+            });
+            if let Some((pos, text)) = quit {
+                sub.remove_at(pos)?;
+                let item = MenuItem::with_id(h, QUIT_MENU_ID, text, true, Some("CmdOrCtrl+Q"))?;
+                sub.insert(&item, pos)?;
+            }
+        }
+    }
+    Ok(menu)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .manage(QuitGuard::default())
+        .menu(app_menu)
+        .on_menu_event(|app, event| {
+            if event.id() == QUIT_MENU_ID {
+                request_quit(app);
+            }
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let app = window.app_handle();
+                if must_confirm_quit(app) {
+                    api.prevent_close();
+                    ask_quit(app);
+                }
+            }
+        })
         .setup(|app| {
             let core = build_core(app)?;
             app.manage(core.clone());
             // GPU pod: re-adopt a pod left running, cache the volume size,
-            // and run the idle auto-stop / liveness monitor.
+            // and run the idle/error auto-stop and liveness monitor (it
+            // never creates pods).
             let pod_core = core.clone();
             tauri::async_runtime::spawn(async move {
                 pod::run_monitor(pod_core, std::time::Duration::from_secs(30)).await
@@ -118,6 +205,7 @@ pub fn run() {
             commands::get_gpu_state,
             commands::start_gpu,
             commands::stop_gpu,
+            commands::confirm_quit,
             commands::list_models,
             commands::refresh_status,
             commands::get_status,
@@ -138,6 +226,16 @@ pub fn run() {
             commands::delete_image,
             commands::export_image,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Last window closed or a programmatic exit: confirm first while
+            // a pod may be billing (`QuitGuard` lets a confirmed exit through).
+            if let RunEvent::ExitRequested { api, .. } = event {
+                if must_confirm_quit(app) {
+                    api.prevent_exit();
+                    ask_quit(app);
+                }
+            }
+        });
 }

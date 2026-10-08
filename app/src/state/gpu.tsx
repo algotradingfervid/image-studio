@@ -1,6 +1,6 @@
-// The dedicated GPU pod: live state from `gpu-update`, Start/Stop, and the two
+// The dedicated GPU pod: live state from `gpu-update`, Start/Stop, and the
 // confirmations that go with it (stopping while work runs, starting a billed pod
-// for a Models-screen action).
+// for a Models-screen action, quitting while a pod may still be billing).
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import * as api from "../api";
@@ -59,6 +59,10 @@ export function GpuProvider({ children }: { children: ReactNode }) {
   const [stopAsk, setStopAsk] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [startAsk, setStartAsk] = useState<{ action?: string; resolve: (ok: boolean) => void } | null>(null);
+  // Quit confirmation (the backend emits `quit-requested` on ⌘Q / window close).
+  const [quitAsk, setQuitAsk] = useState(false);
+  const [quitBusy, setQuitBusy] = useState<null | "stop" | "quit">(null);
+  const [quitError, setQuitError] = useState<string | null>(null);
 
   const podMode = (lib.settings?.backend ?? "pod") === "pod";
   const knownCost = state?.costPerHr ?? null;
@@ -78,7 +82,9 @@ export function GpuProvider({ children }: { children: ReactNode }) {
       prev.current = g;
       setState(g);
       if (!before || before.status === g.status) return;
-      if (g.status === "stopped" && g.stopReason === "idle") {
+      if (g.status === "stopped" && g.stopReason === "idle" && before.status === "error") {
+        toast.info("GPU pod stopped automatically", "It was left over from a GPU problem, so the app stopped it to end billing.");
+      } else if (g.status === "stopped" && g.stopReason === "idle") {
         toast.info(`GPU stopped after ${g.idleMinutes} idle minutes`, "Start it again any time — generating starts it too.");
       } else if (g.status === "stopped" && g.stopReason === "external") {
         toast.info("The GPU pod stopped", "It was stopped outside the app — by its own idle watchdog or in the RunPod console.");
@@ -107,6 +113,31 @@ export function GpuProvider({ children }: { children: ReactNode }) {
       void un.then((f) => f());
     };
   }, [apply, toast]);
+
+  useEffect(() => {
+    const un = api.onEvent("quit-requested", (g) => {
+      apply(g);
+      setQuitError(null);
+      setQuitAsk(true);
+    });
+    return () => {
+      void un.then((f) => f());
+    };
+  }, [apply]);
+
+  const quit = async (stopGpu: boolean) => {
+    setQuitBusy(stopGpu ? "stop" : "quit");
+    setQuitError(null);
+    try {
+      await api.confirmQuit(stopGpu);
+      // The app exits; in the browser mock nothing happens, so just close.
+      setQuitAsk(false);
+    } catch (e) {
+      setQuitError(api.errorMessage(e));
+    } finally {
+      setQuitBusy(null);
+    }
+  };
 
   // Track active generation jobs (for the Stop confirmation).
   useEffect(() => {
@@ -189,6 +220,15 @@ export function GpuProvider({ children }: { children: ReactNode }) {
     .filter(Boolean)
     .join(" and ");
 
+  const quitWhat =
+    state?.status === "starting"
+      ? `A GPU pod is starting (${costLabel})`
+      : state?.status === "stopping"
+        ? `The GPU pod is still stopping (${costLabel})`
+        : state?.status === "error"
+          ? `A GPU pod may still be billing (${costLabel})`
+          : `A GPU pod is running (${costLabel})`;
+
   return (
     <Ctx.Provider value={value}>
       {children}
@@ -212,6 +252,57 @@ export function GpuProvider({ children }: { children: ReactNode }) {
           {work || "Work"} {activeWork === 1 ? "is" : "are"} still running on the GPU. Stopping the pod ends {activeWork === 1 ? "it" : "them"} now —
           unfinished images and downloads are lost.
         </p>
+      </Dialog>
+
+      <Dialog
+        open={quitAsk}
+        onClose={quitBusy ? () => {} : () => setQuitAsk(false)}
+        title="Quit Image Studio?"
+        footer={
+          quitError ? (
+            <>
+              <button type="button" className="btn" onClick={() => setQuitAsk(false)} disabled={!!quitBusy}>
+                Cancel
+              </button>
+              <button type="button" className="btn btn--danger-text" onClick={() => void quit(false)} disabled={!!quitBusy}>
+                Quit anyway
+              </button>
+              <button type="button" className="btn btn--primary" onClick={() => void quit(true)} disabled={!!quitBusy} autoFocus>
+                <Icon name="refresh" /> {quitBusy === "stop" ? "Stopping GPU…" : "Try again"}
+              </button>
+            </>
+          ) : (
+            <>
+              <button type="button" className="btn" onClick={() => setQuitAsk(false)} disabled={!!quitBusy}>
+                Cancel
+              </button>
+              <button type="button" className="btn" onClick={() => void quit(false)} disabled={!!quitBusy}>
+                Quit and keep it running
+              </button>
+              <button type="button" className="btn btn--primary" onClick={() => void quit(true)} disabled={!!quitBusy} autoFocus>
+                <Icon name="stop" /> {quitBusy === "stop" ? "Stopping GPU…" : "Stop GPU & Quit"}
+              </button>
+            </>
+          )
+        }
+      >
+        <p className="gpu-dialog__lede">
+          {quitWhat}. {activeWork > 0 ? `${work || "Work"} ${activeWork === 1 ? "is" : "are"} still running on it. ` : ""}
+          Stop it before quitting so it doesn't keep billing?
+        </p>
+        {quitError ? (
+          <p className="notice notice--error" role="alert">
+            <Icon name="alert" /> Couldn't stop the GPU, so the app is still open: {quitError}
+          </p>
+        ) : (
+          <p className="hint">
+            {state?.watchdogArmed === true
+              ? `If you keep it running, the pod stops itself after ${idleMinutes} idle minutes.`
+              : state?.watchdogArmed === false
+                ? "If you keep it running, nothing stops it while the app is closed — the pod can't stop itself. Stop it later from the app or the RunPod console."
+                : `If you keep it running, the pod's own watchdog may stop it after ${idleMinutes} idle minutes; otherwise stop it later from the app or the RunPod console.`}
+          </p>
+        )}
       </Dialog>
 
       <Dialog
