@@ -92,8 +92,11 @@ jobs:
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Inline cache: layer metadata travels inside the pushed image, so the next
+          # build reuses unchanged layers without exporting ~15 GB to the GHA cache
+          # (which exceeds its 10 GB limit and took longer than the build itself).
+          cache-from: type=registry,ref=${{ steps.img.outputs.name }}:latest
+          cache-to: type=inline
 
       - name: Disk after
         if: always()
