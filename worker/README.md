@@ -182,7 +182,11 @@ On any failure the handler returns `{"error": "<CODE>: <detail>"}`, and RunPod m
 
 ### Progress (`runpod.serverless.progress_update`, at most 2 per second)
 
-- `generate`: `{phase: "loading" | "sampling" | "saving", step, totalSteps}`. The final step and every phase change are always sent.
+- `generate`: `{phase: "loading" | "sampling" | "saving", stage, stages, step, totalSteps, elapsedMs, stageElapsedMs, cached, cachedStages, stageTimes}`. The final step and every stage change are always sent.
+  - `stage` comes from the class of the node ComfyUI reports as `executing`: `loading_text_encoder` (CLIPLoader*), `encoding_prompt` (CLIPTextEncode*, TextEncodeQwenImage21, T5TokenizerOptions), `loading_model` (UNETLoader, UnetLoaderGGUF, LoraLoaderModelOnly, ModelSampling*, QwenImage21Cache), `preparing_references` (LoadImage, ImageScaleToTotalPixels, VAEEncode, ReferenceLatent), `sampling`, `decoding`, `saving`. Other nodes keep the current stage. `phase` is the v1 value of the stage.
+  - `stages` lists the stages of this graph in display order, known from the first update. ComfyUI may run them in another order, so use `stageTimes` (ms spent in each stage already left) and `cachedStages` to mark stages done.
+  - `cachedStages` are stages whose nodes ComfyUI reported in `execution_cached` (they never run). `cached` is true when a loader stage is among them, meaning the weights were already in memory.
+  - `elapsedMs` counts from the start of the job; `stageElapsedMs` from the start of the current stage.
 - `download`: `{phase: "downloading", file, bytes, totalBytes, files: [{filename, bytes, totalBytes, status}]}`.
   - `bytes` and `totalBytes` are summed across all files in the job.
   - `totalBytes` is null while any file's size is unknown.

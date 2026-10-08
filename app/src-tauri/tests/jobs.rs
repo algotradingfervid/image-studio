@@ -437,3 +437,44 @@ async fn download_task_refreshes_status() {
     assert_eq!(p.delete_files.len(), 3);
     assert!(p.kept_files.is_empty());
 }
+
+#[tokio::test]
+async fn generate_passes_stage_progress_through() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/ep1/run"))
+        .respond_with(RunIds(AtomicUsize::new(0)))
+        .mount(&server)
+        .await;
+    let progress = json!({
+        "phase": "loading", "stage": "loading_model",
+        "stages": ["loading_text_encoder", "encoding_prompt", "loading_model", "sampling", "decoding", "saving"],
+        "step": 0, "totalSteps": 8, "elapsedMs": 12500, "stageElapsedMs": 4100,
+        "cached": true, "cachedStages": ["loading_text_encoder"],
+        "stageTimes": {"loading_text_encoder": 0, "encoding_prompt": 1800}
+    });
+    Mock::given(method("GET"))
+        .and(path("/v2/ep1/status/rp-0"))
+        .respond_with(seq(vec![
+            json!({"id": "rp-0", "status": "IN_PROGRESS", "output": progress.clone()}),
+            completed(42),
+        ]))
+        .mount(&server)
+        .await;
+    let h = harness(&server);
+    jobs::generate(&h.core, req(1, Some(42))).unwrap();
+    let job = wait_job(&h.sink).await;
+    assert_eq!(job.status, JobState::Completed);
+    let running = h
+        .sink
+        .jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|j| j.status == JobState::Running)
+        .cloned()
+        .unwrap();
+    // The UI sees the worker payload verbatim (camelCase, same keys).
+    let sent = serde_json::to_value(running.progress.unwrap()).unwrap();
+    assert_eq!(sent, progress);
+}

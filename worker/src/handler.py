@@ -50,7 +50,8 @@ from comfy_client import ComfyClient, ComfyError
 from downloader import DownloadConfig, DownloadError, download_file
 from registry import get_model, load_registry, model_ids
 from safe_paths import PathError, resolve, validate_filename, validate_folder
-from workflows import WorkflowError, build_workflow, sampler_node_ids
+from workflows import (LOADER_STAGES, STAGE_PHASE, WorkflowError, build_workflow,
+                       graph_node_stages, graph_stages, sampler_node_ids)
 
 VOLUME_ROOT = Path(os.environ.get("VOLUME_ROOT", "/runpod-volume"))
 MODELS_ROOT = Path(os.environ.get("MODELS_ROOT", str(VOLUME_ROOT / "models")))
@@ -242,20 +243,108 @@ def missing_files(model: dict, loras: list[dict]) -> list[str]:
 # ---------------------------------------------------------------------------
 # generate
 # ---------------------------------------------------------------------------
+class StageTracker:
+    """Turns ComfyUI websocket events into the generate progress payload.
+
+    Payload (every field always present):
+      phase           "loading" | "sampling" | "saving" (v1 back-compat)
+      stage           current stage, one of workflows.STAGES
+      stages          the stages that apply to this graph, in display order
+      step, totalSteps
+      elapsedMs       since the job started
+      stageElapsedMs  since the current stage started
+      cached          True once ComfyUI reported a loader stage as cached
+                      (weights already in memory)
+      cachedStages    the stages whose nodes were all cached (instant)
+      stageTimes      {stage: ms} accumulated time of the stages already left
+
+    Stage transitions are sent immediately (forced); step updates go through
+    the Throttle (<= 2/s) except the final step.
+    """
+
+    def __init__(self, progress: Throttle, graph: dict, total_steps: int, t0: float):
+        self.progress = progress
+        self.job = progress.job
+        self.t0 = t0
+        self.total = total_steps
+        self.step = 0
+        self.cached_stages: set[str] = set()
+        self.times: dict[str, int] = {}
+        self.set_graph(graph)
+        self.stage = self.stages[0]
+        self.stage_start = clock()
+
+    def set_graph(self, graph: dict) -> None:
+        self.node_stages = graph_node_stages(graph)
+        self.stages = graph_stages(graph)
+
+    def payload(self) -> dict:
+        now = clock()
+        return {
+            "phase": STAGE_PHASE[self.stage],
+            "stage": self.stage,
+            "stages": list(self.stages),
+            "step": self.step,
+            "totalSteps": self.total,
+            "elapsedMs": _ms(now - self.t0),
+            "stageElapsedMs": _ms(now - self.stage_start),
+            "cached": bool(self.cached_stages & LOADER_STAGES),
+            "cachedStages": [s for s in self.stages if s in self.cached_stages],
+            "stageTimes": dict(self.times),
+        }
+
+    def send(self, force: bool = False) -> None:
+        self.progress(self.payload(), force=force)
+
+    def enter(self, stage: str) -> None:
+        if stage == self.stage:
+            return
+        now = clock()
+        self.times[self.stage] = self.times.get(self.stage, 0) + _ms(now - self.stage_start)
+        self.stage, self.stage_start = stage, now
+        if stage in ("decoding", "saving"):
+            self.step = self.total
+        self.send(force=True)
+
+    def on_executing(self, node: str) -> None:
+        stage = self.node_stages.get(node)
+        if stage is not None:
+            self.enter(stage)
+
+    def on_progress(self, step: int, total: int) -> None:
+        self.step, self.total = step, total
+        if self.stage != "sampling":
+            self.enter("sampling")
+        else:
+            self.send(force=step >= total)
+
+    def on_cached(self, nodes: list) -> None:
+        cached = {str(n) for n in nodes or []}
+        before = set(self.cached_stages)
+        for stage in self.stages:
+            members = [n for n, s in self.node_stages.items() if s == stage]
+            if members and all(n in cached for n in members):
+                self.cached_stages.add(stage)
+        if self.cached_stages != before:
+            self.send(force=True)
+
+
 def _watch(client: ComfyClient, ws, prompt_id: str, samplers: set[str], total_steps: int,
-           progress: Throttle, t_queued: float) -> dict:
+           progress: Throttle, t_queued: float, tracker: StageTracker | None = None) -> dict:
     """Follows the ComfyUI websocket until the prompt finishes.
 
     Returns {"error": str} or {"sample_start": t|None, "sample_end": t|None}.
     loadMs = first sampler progress event - queue time (model loading happens
     lazily inside the sampler node, so "executing" is too early a marker).
     """
+    if tracker is None:
+        tracker = StageTracker(progress, {}, total_steps, t_queued)
     deadline = t_queued + GENERATE_TIMEOUT_S
     sample_start = sample_end = None
     interrupted = False
     for msg in client.iter_messages(ws):
         now = clock()
-        if not interrupted and cancelled(progress.job):
+        if not interrupted and cancelled(tracker.job):
             # Pod mode: covers a cancel that raced queue_prompt.
             interrupted = True
             client.interrupt()
@@ -274,18 +363,18 @@ def _watch(client: ComfyClient, ws, prompt_id: str, samplers: set[str], total_st
         if mtype == "progress" and data.get("node") in samplers:
             if sample_start is None:
                 sample_start = now
-            step, mx = int(data.get("value", 0)), int(data.get("max", total_steps))
-            progress({"phase": "sampling", "step": step, "totalSteps": mx},
-                     force=step >= mx)
+            tracker.on_progress(int(data.get("value", 0)), int(data.get("max", tracker.total)))
+        elif mtype == "execution_cached":
+            tracker.on_cached(data.get("nodes") or [])
         elif mtype == "executing":
             node = data.get("node")
             if node is None:
                 if data.get("prompt_id") == prompt_id:
                     break
-            elif node not in samplers and sample_start is not None and sample_end is None:
+                continue
+            if node not in samplers and sample_start is not None and sample_end is None:
                 sample_end = now
-                progress({"phase": "saving", "step": total_steps, "totalSteps": total_steps},
-                         force=True)
+            tracker.on_executing(str(node))
         elif mtype == "execution_error" and data.get("prompt_id") == prompt_id:
             return {"error": format_execution_error(data)}
         elif mtype == "execution_interrupted" and data.get("prompt_id") == prompt_id:
@@ -323,7 +412,13 @@ def do_generate(job: dict, inp: dict) -> dict:
 
     steps = params["steps"] or model["defaults"]["steps"]
     progress = Throttle(job)
-    progress({"phase": "loading", "step": 0, "totalSteps": steps}, force=True)
+    # The stage list only depends on the graph's shape, so a preview graph with
+    # placeholder reference names gives it before anything is uploaded.
+    preview, _ = build_workflow(
+        {**params, "references": [f"ref{i}" for i in range(len(params["references"]))]},
+        registry)
+    tracker = StageTracker(progress, preview, steps, t0)
+    tracker.send(force=True)
 
     client = make_client()
     client.wait_ready(COMFY_READY_TIMEOUT_S)
@@ -335,6 +430,7 @@ def do_generate(job: dict, inp: dict) -> dict:
 
     graph, out_node = build_workflow({**params, "references": ref_names}, registry)
     samplers = sampler_node_ids(graph)
+    tracker.set_graph(graph)
 
     if cancelled(job):
         return {"error": "CANCELLED: cancelled before the prompt was queued"}
@@ -342,7 +438,7 @@ def do_generate(job: dict, inp: dict) -> dict:
     try:
         t_queued = clock()
         prompt_id = client.queue_prompt(graph)
-        res = _watch(client, ws, prompt_id, samplers, steps, progress, t_queued)
+        res = _watch(client, ws, prompt_id, samplers, steps, progress, t_queued, tracker)
     finally:
         try:
             ws.close()
@@ -351,7 +447,7 @@ def do_generate(job: dict, inp: dict) -> dict:
     if "error" in res:
         return res
 
-    progress({"phase": "saving", "step": steps, "totalSteps": steps}, force=True)
+    tracker.enter("saving")
     hist = client.history(prompt_id)
     images = (hist.get("outputs", {}).get(out_node) or {}).get("images") or []
     if not images:

@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 pub const DEFAULT_API_ROOT: &str = "https://api.runpod.ai";
@@ -68,6 +69,24 @@ pub struct Progress {
     pub bytes: Option<u64>,
     #[serde(default)]
     pub total_bytes: Option<u64>,
+    /// Fine-grained generate stage (worker v2), e.g. "loading_model".
+    #[serde(default)]
+    pub stage: Option<String>,
+    /// The stages that apply to this generation, in display order.
+    #[serde(default)]
+    pub stages: Option<Vec<String>>,
+    #[serde(default)]
+    pub elapsed_ms: Option<u64>,
+    #[serde(default)]
+    pub stage_elapsed_ms: Option<u64>,
+    /// True when ComfyUI reported a loader stage as cached (weights in memory).
+    #[serde(default)]
+    pub cached: Option<bool>,
+    #[serde(default)]
+    pub cached_stages: Option<Vec<String>>,
+    /// Milliseconds spent in each stage already left.
+    #[serde(default)]
+    pub stage_times: Option<BTreeMap<String, u64>>,
 }
 
 /// runpod-python's `progress_update` posts `{"status":"IN_PROGRESS","output":<progress>}`,
@@ -390,6 +409,27 @@ mod tests {
         assert!(parse_progress(&json!({"progress": {"phase":"loading"}})).is_some());
         assert!(parse_progress(&json!("Update 1/3")).is_none());
         assert!(parse_progress(&json!(42)).is_none());
+    }
+
+    #[test]
+    fn progress_stage_fields() {
+        let p = parse_progress(&json!({
+            "phase": "loading", "stage": "loading_model",
+            "stages": ["loading_text_encoder", "loading_model", "sampling"],
+            "step": 0, "totalSteps": 26, "elapsedMs": 31200, "stageElapsedMs": 8100,
+            "cached": true, "cachedStages": ["loading_text_encoder"],
+            "stageTimes": {"loading_text_encoder": 0, "encoding_prompt": 2300}
+        }))
+        .unwrap();
+        assert_eq!(p.stage.as_deref(), Some("loading_model"));
+        assert_eq!(p.stages.as_ref().map(Vec::len), Some(3));
+        assert_eq!((p.elapsed_ms, p.stage_elapsed_ms), (Some(31200), Some(8100)));
+        assert_eq!(p.cached, Some(true));
+        assert_eq!(p.cached_stages.unwrap(), vec!["loading_text_encoder"]);
+        assert_eq!(p.stage_times.unwrap()["encoding_prompt"], 2300);
+        // v1 payloads still parse, without the new fields
+        let p = parse_progress(&json!({"phase":"sampling","step":3,"totalSteps":8})).unwrap();
+        assert!(p.stage.is_none() && p.stages.is_none() && p.cached.is_none());
     }
 
     #[test]

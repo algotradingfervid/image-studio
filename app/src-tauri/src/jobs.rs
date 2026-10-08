@@ -3,7 +3,7 @@
 
 use crate::db::{ImageRecord, LoraRef, RunpodTimes};
 use crate::runpod::{
-    failure_message, parse_progress, RunStatus, RunpodClient, GENERATE_TIMEOUT_MS,
+    failure_message, parse_progress, Progress, RunStatus, RunpodClient, GENERATE_TIMEOUT_MS,
 };
 use crate::state::{now_rfc3339, Core};
 use crate::status::{has_cache, lora_folder, present_set};
@@ -11,6 +11,7 @@ use base64::Engine;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// ComfyUI accepts seeds up to 2^64-1, but JS numbers are only exact up to
@@ -36,6 +37,57 @@ pub struct JobProgress {
     pub phase: Option<String>,
     pub step: Option<u64>,
     pub total_steps: Option<u64>,
+    /// Worker v2 stage fields, passed through unchanged (absent from v1 workers
+    /// and from the pod start phases).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stages: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_stages: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_times: Option<BTreeMap<String, u64>>,
+}
+
+impl JobProgress {
+    /// A pod start phase ("Creating pod", ...) shown while the job is starting.
+    pub fn pod_phase(phase: &str) -> Self {
+        JobProgress {
+            phase: Some(phase.to_string()),
+            step: None,
+            total_steps: None,
+            stage: None,
+            stages: None,
+            elapsed_ms: None,
+            stage_elapsed_ms: None,
+            cached: None,
+            cached_stages: None,
+            stage_times: None,
+        }
+    }
+}
+
+impl From<Progress> for JobProgress {
+    fn from(p: Progress) -> Self {
+        JobProgress {
+            phase: p.phase,
+            step: p.step,
+            total_steps: p.total_steps,
+            stage: p.stage,
+            stages: p.stages,
+            elapsed_ms: p.elapsed_ms,
+            stage_elapsed_ms: p.stage_elapsed_ms,
+            cached: p.cached,
+            cached_stages: p.cached_stages,
+            stage_times: p.stage_times,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -259,11 +311,7 @@ pub fn generate(core: &Arc<Core>, req: GenerateRequest) -> Result<String, String
             let mut on_phase = move |phase: &str| {
                 update(&c, &i, |j| {
                     j.status = JobState::Starting;
-                    j.progress = Some(JobProgress {
-                        phase: Some(phase.to_string()),
-                        step: None,
-                        total_steps: None,
-                    });
+                    j.progress = Some(JobProgress::pod_phase(phase));
                 })
             };
             let (c, i) = (core2.clone(), id2.clone());
@@ -463,11 +511,7 @@ async fn run_job(core: Arc<Core>, id: String, client: RunpodClient, plan: Plan) 
                 RunStatus::InProgress | RunStatus::Unknown => {
                     sub.state = RunStatus::InProgress;
                     if let Some(p) = s.output.as_ref().and_then(parse_progress) {
-                        sub.progress = Some(JobProgress {
-                            phase: p.phase,
-                            step: p.step,
-                            total_steps: p.total_steps,
-                        });
+                        sub.progress = Some(JobProgress::from(p));
                     }
                 }
                 RunStatus::InQueue => sub.state = RunStatus::InQueue,

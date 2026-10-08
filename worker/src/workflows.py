@@ -296,3 +296,86 @@ def build_workflow(params: dict, registry: dict) -> tuple[dict, str]:
 
 def sampler_node_ids(graph: dict) -> set[str]:
     return {nid for nid, n in graph.items() if n["class_type"] in SAMPLER_CLASSES}
+
+
+# --------------------------------------------------------------------------
+# Progress stages (handler progress payload "stage" / "stages")
+# --------------------------------------------------------------------------
+# Display order of the generation stages. ComfyUI's actual execution order
+# depends on the graph, so consumers should mark stages done from the
+# reported stage times rather than from their position in this list.
+STAGES: tuple[str, ...] = (
+    "loading_text_encoder",
+    "encoding_prompt",
+    "loading_model",
+    "preparing_references",
+    "sampling",
+    "decoding",
+    "saving",
+)
+
+# Back-compat "phase" of each stage (the v1 progress protocol).
+STAGE_PHASE: dict[str, str] = {
+    "loading_text_encoder": "loading",
+    "encoding_prompt": "loading",
+    "loading_model": "loading",
+    "preparing_references": "loading",
+    "sampling": "sampling",
+    "decoding": "saving",
+    "saving": "saving",
+}
+
+# Loader stages: when ComfyUI reports all their nodes as cached, the weights
+# are already in memory and the stage costs nothing.
+LOADER_STAGES = frozenset({"loading_text_encoder", "loading_model"})
+
+_STAGE_OF_CLASS: dict[str, str] = {
+    "CLIPLoader": "loading_text_encoder",
+    "DualCLIPLoader": "loading_text_encoder",
+    "CLIPLoaderGGUF": "loading_text_encoder",
+    "TextEncodeQwenImage21": "encoding_prompt",
+    "T5TokenizerOptions": "encoding_prompt",
+    "UNETLoader": "loading_model",
+    "UnetLoaderGGUF": "loading_model",
+    "LoraLoaderModelOnly": "loading_model",
+    "QwenImage21Cache": "loading_model",  # model patcher on the loader chain
+    "LoadImage": "preparing_references",
+    "ImageScaleToTotalPixels": "preparing_references",
+    "VAEEncode": "preparing_references",
+    "ReferenceLatent": "preparing_references",
+    "KSampler": "sampling",
+    "SamplerCustomAdvanced": "sampling",
+    "VAEDecode": "decoding",
+    "SaveImage": "saving",
+}
+
+
+def node_stage(class_type: str) -> str | None:
+    """The progress stage a node of `class_type` belongs to; None = no change.
+
+    Helper nodes (VAELoader, CFGGuider, schedulers, empty latents, ...) run in
+    milliseconds and keep whatever stage is current.
+    """
+    stage = _STAGE_OF_CLASS.get(class_type)
+    if stage is None:
+        if class_type.startswith("CLIPTextEncode"):
+            stage = "encoding_prompt"
+        elif class_type.startswith("ModelSampling"):
+            stage = "loading_model"
+    return stage
+
+
+def graph_node_stages(graph: dict) -> dict[str, str]:
+    """{node_id: stage} for every node of `graph` that maps to a stage."""
+    out = {}
+    for nid, node in graph.items():
+        stage = node_stage(node.get("class_type", ""))
+        if stage is not None:
+            out[nid] = stage
+    return out
+
+
+def graph_stages(graph: dict) -> list[str]:
+    """The stages that apply to `graph`, in display order (sampling always)."""
+    present = set(graph_node_stages(graph).values()) | {"sampling"}
+    return [s for s in STAGES if s in present]

@@ -215,6 +215,7 @@ async function stopGpuInternal(reason: "user" | "idle" | "external") {
   // Terminating the pod ends whatever was running on it.
   activeJobs.forEach((j) => jobCancel.add(j.jobId));
   for (const t of [...modelTasks.values(), ...loraTasks.values()]) if (t.status === "queued" || t.status === "running") taskCancel.add(t.taskId);
+  loadedModels.clear(); // a new pod starts with empty GPU memory
   setGpu({ status: "stopped", podId: null, gpuType: null, costPerHr: null, startedAt: null, phase: null, error: null, leftRunning: false, stopReason: reason, watchdogArmed: null });
 }
 
@@ -453,6 +454,123 @@ if (!params.has("empty")) {
   }
 }
 
+// ---------- generate progress (mirror of worker/src/handler.py StageTracker) ----------
+
+const STAGE_PHASE: Record<string, string> = {
+  loading_text_encoder: "loading",
+  encoding_prompt: "loading",
+  loading_model: "loading",
+  preparing_references: "loading",
+  sampling: "sampling",
+  decoding: "saving",
+  saving: "saving",
+};
+
+/** Models whose weights the simulated GPU holds (the 2nd run of a model reports cached loaders). */
+const loadedModels = new Set<string>();
+
+/** Sleeps in small slices; false if the job was cancelled meanwhile. */
+async function pause(ms: number, cancelled: () => boolean): Promise<boolean> {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (cancelled()) return false;
+    await sleep(Math.min(150, end - Date.now()));
+  }
+  return !cancelled();
+}
+
+/** v2 worker progress: stage checklist, elapsed times, cached loaders. */
+async function runStages(job: Job, input: GenerateInput, steps: number, cold: boolean, cancelled: () => boolean): Promise<boolean | "failed"> {
+  const warm = loadedModels.has(input.model);
+  const refsUsed = input.referenceIds.length > 0;
+  const stages = ["loading_text_encoder", "encoding_prompt", "loading_model", ...(refsUsed ? ["preparing_references"] : []), "sampling", "decoding", "saving"];
+  const cachedStages = warm ? ["loading_text_encoder", "loading_model"] : [];
+  const t0 = Date.now();
+  const times: Record<string, number> = {};
+  let stage = stages[0];
+  let stageStart = t0;
+  let step = 0;
+  const send = () => {
+    const now = Date.now();
+    job.progress = {
+      phase: STAGE_PHASE[stage],
+      stage,
+      stages,
+      step,
+      totalSteps: steps,
+      elapsedMs: now - t0,
+      stageElapsedMs: now - stageStart,
+      cached: cachedStages.length > 0,
+      cachedStages,
+      stageTimes: { ...times },
+    };
+    emit("job-update", job);
+  };
+  const enter = (next: string) => {
+    const now = Date.now();
+    times[stage] = (times[stage] ?? 0) + (now - stageStart);
+    stage = next;
+    stageStart = now;
+    if (next === "decoding" || next === "saving") step = steps;
+    send();
+  };
+  // Like the 1 s status poll: a heartbeat while a stage runs.
+  const hold = async (ms: number) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      if (!(await pause(Math.min(1000, end - Date.now()), cancelled))) return false;
+      send();
+    }
+    return true;
+  };
+  send();
+  if (!warm) {
+    if (!(await hold(cold ? 3200 : 2400))) return false;
+    enter("encoding_prompt");
+    if (!(await hold(900))) return false;
+    enter("loading_model");
+    if (!(await hold(cold ? 6500 : 4800))) return false;
+  } else {
+    enter("encoding_prompt");
+    if (!(await hold(400))) return false;
+  }
+  if (input.prompt.toLowerCase().includes("fail")) return "failed";
+  loadedModels.add(input.model);
+  if (refsUsed) {
+    enter("preparing_references");
+    if (!(await hold(700))) return false;
+  }
+  enter("sampling");
+  const perStep = Math.max(80, 7000 / steps);
+  for (let s = 1; s <= steps; s++) {
+    // The first step also moves the weights onto the GPU.
+    if (!(await pause(s === 1 && !warm ? perStep * 4 : perStep * (0.85 + Math.random() * 0.3), cancelled))) return false;
+    step = s;
+    send();
+  }
+  enter("decoding");
+  if (!(await hold(600))) return false;
+  enter("saving");
+  return hold(300);
+}
+
+/** v1 worker progress (?v1progress): phase + step only, as before the stage fields. */
+async function runPhasesV1(job: Job, input: GenerateInput, steps: number, cold: boolean, cancelled: () => boolean): Promise<boolean | "failed"> {
+  job.progress = { phase: "loading", step: 0, totalSteps: steps };
+  emit("job-update", job);
+  if (!(await pause(cold ? 900 : 250, cancelled))) return false;
+  if (input.prompt.toLowerCase().includes("fail")) return "failed";
+  for (let s = 1; s <= steps; s++) {
+    if (cancelled()) return false;
+    job.progress = { phase: "sampling", step: s, totalSteps: steps };
+    emit("job-update", job);
+    await sleep(Math.max(60, 2400 / steps));
+  }
+  job.progress = { phase: "saving", step: steps, totalSteps: steps };
+  emit("job-update", job);
+  return pause(300, cancelled);
+}
+
 // ---------- jobs ----------
 
 async function runJob(jobId: string, input: GenerateInput) {
@@ -503,20 +621,12 @@ async function runJob(jobId: string, input: GenerateInput) {
     }
     const delayMs = Date.now() - startedAt + (cold ? 41_000 : 0);
     job.status = "running";
-    job.progress = { phase: "loading", step: 0, totalSteps: steps };
-    emit("job-update", job);
-    await sleep(cold ? 900 : 250);
-    if (input.prompt.toLowerCase().includes("fail")) return stop("failed", "Worker error: CUDA out of memory (simulated — prompt contains 'fail').");
     const execStart = Date.now();
-    for (let s = 1; s <= steps; s++) {
-      if (cancelled()) return stop("cancelled");
-      job.progress = { phase: "sampling", step: s, totalSteps: steps };
-      emit("job-update", job);
-      await sleep(Math.max(60, 2400 / steps));
-    }
-    job.progress = { phase: "saving", step: steps, totalSteps: steps };
-    emit("job-update", job);
-    await sleep(300);
+    const ok = params.has("v1progress")
+      ? await runPhasesV1(job, input, steps, cold, cancelled)
+      : await runStages(job, input, steps, cold, cancelled);
+    if (ok === "failed") return stop("failed", "Worker error: CUDA out of memory (simulated — prompt contains 'fail').");
+    if (!ok) return stop("cancelled");
     const lorasUsed = input.loras.map((l) => ({ name: loras.find((x) => x.id === l.loraId)?.name ?? l.loraId, strength: l.strength }));
     const rec = makeImage({
       model: input.model,

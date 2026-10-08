@@ -242,13 +242,44 @@ export interface ImagePage {
 export type JobStatus = "queued" | "starting" | "running" | "completed" | "failed" | "cancelled";
 export type JobPhase = "loading" | "sampling" | "saving" | "downloading";
 
+/** Fine-grained generate stages reported by the worker (v2 progress). */
+export type JobStage =
+  | "loading_text_encoder"
+  | "encoding_prompt"
+  | "loading_model"
+  | "preparing_references"
+  | "sampling"
+  | "decoding"
+  | "saving";
+
+export interface JobProgress {
+  /** v1 phase ("loading" | "sampling" | "saving"), or the pod start phase while `starting`. */
+  phase: JobPhase | string | null;
+  step: number | null;
+  totalSteps: number | null;
+  /** The v2 fields below are absent with an older worker and during pod start. */
+  stage?: JobStage | string;
+  /** The stages that apply to this generation, in display order. */
+  stages?: string[];
+  /** Since the worker started this image. */
+  elapsedMs?: number;
+  /** Since the current stage started. */
+  stageElapsedMs?: number;
+  /** A loader stage was cached: the model was already in GPU memory. */
+  cached?: boolean;
+  /** Stages that were cached and didn't run. */
+  cachedStages?: string[];
+  /** Milliseconds spent in each stage already finished. */
+  stageTimes?: Record<string, number>;
+}
+
 export interface Job {
   jobId: string;
   status: JobStatus;
   total: number;
   completed: number;
-  /** null outside `running`; each field may be null. */
-  progress: { phase: JobPhase | string | null; step: number | null; totalSteps: number | null } | null;
+  /** null outside `starting`/`running`; each field may be null. */
+  progress: JobProgress | null;
   images: ImageRecord[];
   error: string | null;
 }
