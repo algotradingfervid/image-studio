@@ -1,0 +1,11 @@
+comfyui/
+data/
+.venv/
+node_modules/
+dist/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+target/
+app/src-tauri/gen/
