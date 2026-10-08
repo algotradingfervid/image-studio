@@ -54,14 +54,17 @@ FALLBACK_DATACENTER = "EU-RO-1"  # image-studio-models volume lives here
 # EU-RO-1 (where the volume lives) has serverless stock for these, cheapest first:
 # RTX PRO 4500 Blackwell 32 GB ($1.15/h), RTX 5090 32 GB ($1.58/h), RTX PRO 6000 96 GB ($3.49/h).
 # Type ids as in GET /v2/catalog/gpus.
+# RTX 4090 24 GB ($1.10/h) is a last fallback for availability: ComfyUI unloads the
+# text encoder before sampling, so every diffusion model (max 12.3 GB) fits.
 WANTED_GPUS = ["NVIDIA RTX PRO 4500 Blackwell", "NVIDIA GeForce RTX 5090",
-               "NVIDIA RTX PRO 6000 Blackwell Server Edition"]
+               "NVIDIA RTX PRO 6000 Blackwell Server Edition", "NVIDIA GeForce RTX 4090"]
 
 # Used only when the catalog cannot be read (offline dry run). Snapshot of
 # GET /v2/catalog/gpus on 2026-10-08: serverless pool -> member GPU type ids.
 FALLBACK_POOLS = {
     "BLACKWELL_32": ["NVIDIA B300 SXM6 AC MIG 1g.34gb", "NVIDIA RTX PRO 4500 Blackwell"],
     "ADA_32_PRO": ["NVIDIA GeForce RTX 5090"],
+    "ADA_24": ["NVIDIA GeForce RTX 4090"],
     "BLACKWELL_96": ["NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
                      "NVIDIA RTX PRO 6000 Blackwell Server Edition",
                      "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"],
