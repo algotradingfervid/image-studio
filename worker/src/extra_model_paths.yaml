@@ -1,0 +1,20 @@
+# Installed as /comfyui/extra_model_paths.yaml (ComfyUI auto-loads this file
+# from its own directory at startup). Replaces the upstream worker-comfyui file.
+#
+# Network volume layout (spec "Paths and models"):
+#   /runpod-volume/models/unet/            diffusion models
+#   /runpod-volume/models/clip/            text encoders
+#   /runpod-volume/models/vae/
+#   /runpod-volume/models/loras/<modelId>/ LoRAs (lora_name "<modelId>/<file>")
+#
+# ComfyUI treats "unet" as a legacy alias of "diffusion_models" and "clip" as a
+# legacy alias of "text_encoders" (folder_paths.map_legacy), so both spellings
+# resolve to the same search path; they are listed explicitly for clarity.
+image_studio:
+  base_path: /runpod-volume/models
+  diffusion_models: unet/
+  unet: unet/
+  text_encoders: clip/
+  clip: clip/
+  vae: vae/
+  loras: loras/

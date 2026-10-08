@@ -1,51 +1,131 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
-import "./App.css";
+import { useEffect, useState } from "react";
+import { inTauri } from "./api";
+import { Icon, type IconName } from "./components/Icon";
+import { radioKeys } from "./components/radio";
+import { CreateScreen } from "./screens/create/CreateScreen";
+import { ModelsScreen } from "./screens/models/ModelsScreen";
+import { SettingsScreen } from "./screens/settings/SettingsScreen";
+import { LibraryProvider, useLibrary } from "./state/library";
+import { ToastProvider } from "./state/toast";
 
-function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+export type Tab = "create" | "models" | "settings";
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
-  }
+const TABS: { id: Tab; label: string; icon: IconName; key: string }[] = [
+  { id: "create", label: "Create", icon: "wand", key: "1" },
+  { id: "models", label: "Models", icon: "cube", key: "2" },
+  { id: "settings", label: "Settings", icon: "gear", key: "3" },
+];
+
+function Shell() {
+  const [tab, setTab] = useState<Tab>("create");
+  const lib = useLibrary();
+  const s = lib.settings;
+  const needsSetup = !!s && (!s.hasApiKey || !s.endpointId);
+  const activeDownloads = lib.models.filter((m) => m.task && (m.task.status === "running" || m.task.status === "queued")).length;
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+      const t = TABS.find((x) => x.key === e.key);
+      if (t) {
+        e.preventDefault();
+        setTab(t.id);
+      }
+      if (e.key === ",") {
+        e.preventDefault();
+        setTab("settings");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    // Stop the browser from navigating to files dropped outside a drop zone.
+    const stop = (e: DragEvent) => e.preventDefault();
+    window.addEventListener("dragover", stop);
+    window.addEventListener("drop", stop);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("dragover", stop);
+      window.removeEventListener("drop", stop);
+    };
+  }, []);
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
+    <div className="app">
+      <header className="toolbar" data-tauri-drag-region>
+        <div className="brand" data-tauri-drag-region>
+          <span className="brand__mark" aria-hidden />
+          <span className="brand__name">Image Studio</span>
+          {!inTauri && <span className="badge badge--mock" title="Running in a browser with the in-memory mock">Dev mock</span>}
+        </div>
+        <nav
+          className="tabs"
+          role="tablist"
+          aria-label="Sections"
+          onKeyDown={radioKeys(
+            TABS.map((t) => t.id),
+            tab,
+            setTab,
+          )}
+        >
+          {TABS.map((t) => (
+            <button
+              key={t.id}
+              id={`tab-${t.id}`}
+              type="button"
+              role="tab"
+              aria-selected={tab === t.id}
+              aria-controls={`panel-${t.id}`}
+              tabIndex={tab === t.id ? 0 : -1}
+              className={`tab ${tab === t.id ? "is-active" : ""}`}
+              onClick={() => setTab(t.id)}
+              title={`${t.label} (⌘${t.key})`}
+            >
+              <Icon name={t.icon} />
+              {t.label}
+              {t.id === "models" && activeDownloads > 0 && <span className="tab__dot" aria-label={`${activeDownloads} downloading`} />}
+            </button>
+          ))}
+        </nav>
+        <div className="toolbar__end" data-tauri-drag-region />
+      </header>
 
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
+      {needsSetup && (
+        <div className="banner" role="status">
+          <Icon name="key" />
+          <span>
+            {!s?.hasApiKey ? "Add your RunPod API key" : "Add your RunPod endpoint ID"} to start generating.
+          </span>
+          {tab !== "settings" && (
+            <button type="button" className="link-btn" onClick={() => setTab("settings")}>
+              Open Settings →
+            </button>
+          )}
+        </div>
+      )}
 
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
-    </main>
+      {TABS.map((t) => (
+        <section
+          key={t.id}
+          id={`panel-${t.id}`}
+          role="tabpanel"
+          aria-labelledby={`tab-${t.id}`}
+          className="screen"
+          hidden={tab !== t.id}
+        >
+          {t.id === "create" && <CreateScreen active={tab === "create"} onNavigate={setTab} />}
+          {t.id === "models" && <ModelsScreen active={tab === "models"} />}
+          {t.id === "settings" && <SettingsScreen />}
+        </section>
+      ))}
+    </div>
   );
 }
 
-export default App;
+export default function App() {
+  return (
+    <ToastProvider>
+      <LibraryProvider>
+        <Shell />
+      </LibraryProvider>
+    </ToastProvider>
+  );
+}

@@ -31,7 +31,7 @@ Mac: Tauri 2 app                                  RunPod Serverless endpoint
 ┌──────────────────────────────────┐   HTTPS     ┌──────────────────────────────────┐
 │ React UI (app/src)               │  /run       │ worker image (worker/)           │
 │   ⇅ invoke + events              │  /status    │  FROM runpod/worker-comfyui:     │
-│ Rust core (app/src-tauri)        │  /cancel    │       5.11.0-base, ComfyUI v0.39.0│
+│ Rust core (app/src-tauri)        │  /cancel    │       5.10.0-base-cuda12.8.1 + v0.39│
 │   runpod client · job manager    │ ──────────▶ │  handler.py (actions below)      │
 │   gallery (SQLite) · Keychain    │             │  workflows.py (graph builders)   │
 │   civitai/HF link resolver       │             │  /runpod-volume/models/{unet,    │

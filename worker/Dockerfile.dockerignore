@@ -1,0 +1,6 @@
+# BuildKit reads <Dockerfile>.dockerignore next to the Dockerfile. The build
+# context is the repo root; only shared/models.json and worker/src are needed.
+*
+!shared/models.json
+!worker/src/
+worker/src/__pycache__

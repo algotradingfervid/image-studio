@@ -24,6 +24,10 @@ export default defineConfig(() => ({
           port: 1421,
         }
       : undefined,
+    // The dev mock imports ../shared/models.json (the registry) from outside the app root.
+    fs: {
+      allow: [".", "../shared"],
+    },
     watch: {
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],

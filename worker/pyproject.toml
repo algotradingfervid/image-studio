@@ -1,0 +1,25 @@
+[project]
+name = "image-studio-worker"
+version = "0.1.0"
+description = "RunPod Serverless ComfyUI worker for Image Studio"
+requires-python = ">=3.12"
+# Runtime deps. In the Docker image these are already installed into /opt/venv
+# by the runpod/worker-comfyui base image (runpod, requests, websocket-client).
+dependencies = [
+    "runpod>=1.7.12,<2",
+    "requests>=2.31",
+    "websocket-client>=1.7",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
