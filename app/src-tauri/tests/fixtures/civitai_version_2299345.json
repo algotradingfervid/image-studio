@@ -1,0 +1,77 @@
+{
+ "id": 2299345,
+ "modelId": 1662740,
+ "name": "v1.0 Chroma",
+ "nsfwLevel": 31,
+ "createdAt": "2025-10-10T08:57:53.271Z",
+ "updatedAt": "2026-09-22T18:40:46.291Z",
+ "status": "Published",
+ "publishedAt": "2025-10-10T11:56:10.516Z",
+ "trainedWords": [
+  "l3n0v0"
+ ],
+ "trainingStatus": null,
+ "baseModel": "Chroma",
+ "baseModelType": "Standard",
+ "uploadType": "Created",
+ "usageControl": "Download",
+ "licensingFee": null,
+ "paidAccess": null,
+ "air": "urn:air:chroma:lora:civitai:1662740@2299345",
+ "stats": {
+  "downloadCount": 12101,
+  "thumbsUpCount": 579
+ },
+ "model": {
+  "name": "Lenovo UltraReal",
+  "type": "LORA",
+  "nsfw": false,
+  "poi": false
+ },
+ "files": [
+  {
+   "id": 2190290,
+   "sizeKB": 109497.609375,
+   "name": "lenovo_chroma.safetensors",
+   "type": "Model",
+   "pickleScanResult": "Success",
+   "pickleScanMessage": "No Pickle imports",
+   "virusScanResult": "Success",
+   "virusScanMessage": null,
+   "scannedAt": "2025-10-10T09:00:55.664",
+   "metadata": {
+    "format": "SafeTensor",
+    "size": null,
+    "fp": null
+   },
+   "hashes": {
+    "AutoV1": "07E0518A",
+    "AutoV2": "DF934B1A36",
+    "SHA256": "DF934B1A366206DAA3B5DCFEF7C84EFD9E75CA19D00867D7FE24FA2BB233FDC9",
+    "CRC32": "1267350B",
+    "BLAKE3": "66B2CEAE2AAC299B4EE6C3109EC0C7EF4AC87BA50D7C455304ECB9FB3015FB21",
+    "AutoV3": "3DD4CA9F59BD",
+    "SHA256_12": "DF934B1A3662"
+   },
+   "primary": true,
+   "downloadUrl": "https://civitai.com/api/download/models/2299345?fileId=2190290"
+  }
+ ],
+ "images": [
+  {
+   "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/9e12de3c-0969-4c07-ba18-6607478df7d6/original=true/105264251.jpeg",
+   "nsfwLevel": 2,
+   "width": 1024,
+   "height": 1472,
+   "type": "image"
+  },
+  {
+   "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/61b3fb3b-e450-47dc-8450-aefb281177a9/original=true/105239999.jpeg",
+   "nsfwLevel": 2,
+   "width": 1088,
+   "height": 1408,
+   "type": "image"
+  }
+ ],
+ "downloadUrl": "https://civitai.com/api/download/models/2299345"
+}

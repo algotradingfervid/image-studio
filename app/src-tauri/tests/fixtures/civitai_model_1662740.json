@@ -1,0 +1,919 @@
+{
+ "id": 1662740,
+ "name": "Lenovo UltraReal",
+ "description": "(trimmed)",
+ "allowNoCredit": false,
+ "allowCommercialUse": [
+  "RentCivit",
+  "Rent",
+  "Sell",
+  "Image",
+  "SellMerge"
+ ],
+ "allowDerivatives": false,
+ "allowDifferentLicense": false,
+ "type": "LORA",
+ "minor": false,
+ "sfwOnly": false,
+ "poi": false,
+ "nsfw": false,
+ "nsfwLevel": 31,
+ "availability": "Public",
+ "userId": 2703479,
+ "hasActivePaidAccess": false,
+ "baseModels": [
+  "Qwen 2.1",
+  "Krea 2",
+  "Ideogram 4.0",
+  "Anima",
+  "Flux.2 Klein 9B-base",
+  "ZImageBase",
+  "ZImageTurbo",
+  "Flux.2 D",
+  "Chroma",
+  "Qwen",
+  "Wan Video 14B t2v",
+  "Flux.1 D"
+ ],
+ "cosmetic": null,
+ "supportsGeneration": true,
+ "stats": {
+  "downloadCount": 189698,
+  "thumbsUpCount": 5387,
+  "thumbsDownCount": 10,
+  "commentCount": 0,
+  "tippedAmountCount": 5071
+ },
+ "creator": {
+  "username": "Danrisi",
+  "image": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/49205573-e130-4773-aeeb-b67c285c80c6/width=96/Danrisi.jpeg"
+ },
+ "modelVersions": [
+  {
+   "id": 3349565,
+   "index": 1,
+   "name": "v1.0 Qwen2.1",
+   "baseModel": "Qwen 2.1",
+   "baseModelType": "Standard",
+   "createdAt": "2026-09-22T16:25:45.075Z",
+   "publishedAt": "2026-09-22T17:05:54.837Z",
+   "status": "Published",
+   "flags": 0,
+   "availability": "Public",
+   "nsfwLevel": 7,
+   "covered": false,
+   "coveredNext": false,
+   "stats": {
+    "downloadCount": 11537,
+    "thumbsUpCount": 308,
+    "thumbsDownCount": 1
+   },
+   "files": [
+    {
+     "id": 3236680,
+     "sizeKB": 77874.8984375,
+     "name": "lenovo_qwen21.safetensors",
+     "overrideName": null,
+     "type": "Model",
+     "pickleScanResult": "Success",
+     "pickleScanMessage": null,
+     "virusScanResult": "Success",
+     "virusScanMessage": null,
+     "scannedAt": "2026-09-22T16:27:04.989Z",
+     "metadata": {
+      "format": "SafeTensor",
+      "fp": "fp16",
+      "isRequired": false
+     },
+     "hashes": {
+      "AutoV1": "A6182567",
+      "AutoV2": "7F1E95C3EC",
+      "SHA256": "7F1E95C3EC1E9C7CEA197F7B6F80F601AF8E6B479F6EAD78AB16DF542F447C0E",
+      "CRC32": "45ED492D",
+      "BLAKE3": "17ED8EBC422D40488CAECA6A6AF8BAFF626D29B7A30DB8D177551C50096BC8DD",
+      "AutoV3": "05FE148E5623",
+      "SHA256_12": "7F1E95C3EC1E"
+     },
+     "downloadUrl": "https://civitai.com/api/download/models/3349565?fileId=3236680",
+     "primary": true
+    }
+   ],
+   "images": [
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/0a89a58a-1810-454f-a289-8787e4827c72/original=true/143722504.jpeg",
+     "nsfwLevel": 1,
+     "width": 1248,
+     "height": 1664,
+     "type": "image"
+    },
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/6dc36647-3d99-4a86-a2df-349761a73436/original=true/143524783.jpeg",
+     "nsfwLevel": 1,
+     "width": 1248,
+     "height": 1664,
+     "type": "image"
+    }
+   ],
+   "downloadUrl": "https://civitai.com/api/download/models/3349565"
+  },
+  {
+   "id": 3075606,
+   "index": 2,
+   "name": "v1.0 Krea2",
+   "baseModel": "Krea 2",
+   "baseModelType": "Standard",
+   "createdAt": "2026-06-27T17:30:17.078Z",
+   "publishedAt": "2026-06-27T17:35:09.672Z",
+   "status": "Published",
+   "flags": 0,
+   "availability": "Public",
+   "nsfwLevel": 15,
+   "covered": true,
+   "coveredNext": true,
+   "stats": {
+    "downloadCount": 35403,
+    "thumbsUpCount": 1421,
+    "thumbsDownCount": 0
+   },
+   "files": [
+    {
+     "id": 2954661,
+     "sizeKB": 111645.25,
+     "name": "lenovo_krea2.safetensors",
+     "overrideName": null,
+     "type": "Model",
+     "pickleScanResult": "Success",
+     "pickleScanMessage": null,
+     "virusScanResult": "Success",
+     "virusScanMessage": null,
+     "scannedAt": "2026-06-27T17:31:08.355Z",
+     "metadata": {
+      "format": "SafeTensor",
+      "fp": "fp16",
+      "isRequired": false
+     },
+     "hashes": {
+      "AutoV1": "D3B2ACE1",
+      "AutoV2": "6967840059",
+      "SHA256": "6967840059E54D0CA6771AE00ACDC5979266F761175A8C9380F23F1A3723E9A2",
+      "CRC32": "880E5250",
+      "BLAKE3": "3954159B678BC4F716A467E21124C3A2A73464374EB89CE54A558F7EDC399A2F",
+      "AutoV3": "687483F5B2B6",
+      "SHA256_12": "6967840059E5"
+     },
+     "downloadUrl": "https://civitai.com/api/download/models/3075606?fileId=2954661",
+     "primary": true
+    }
+   ],
+   "images": [
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/71ab2532-8e15-4f58-b5ad-c2e1067ae251/original=true/135047454.jpeg",
+     "nsfwLevel": 4,
+     "width": 1216,
+     "height": 1664,
+     "type": "image"
+    },
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/9f67657e-31b3-4566-b51a-182180bb7680/original=true/135047280.jpeg",
+     "nsfwLevel": 2,
+     "width": 1728,
+     "height": 1152,
+     "type": "image"
+    }
+   ],
+   "downloadUrl": "https://civitai.com/api/download/models/3075606"
+  },
+  {
+   "id": 3025161,
+   "index": 3,
+   "name": "v1.0 Ideogram4",
+   "baseModel": "Ideogram 4.0",
+   "baseModelType": "Standard",
+   "createdAt": "2026-06-12T01:44:09.887Z",
+   "publishedAt": "2026-06-12T01:46:59.466Z",
+   "status": "Published",
+   "flags": 0,
+   "availability": "Public",
+   "nsfwLevel": 3,
+   "covered": true,
+   "coveredNext": true,
+   "stats": {
+    "downloadCount": 7540,
+    "thumbsUpCount": 283,
+    "thumbsDownCount": 1
+   },
+   "files": [
+    {
+     "id": 2903921,
+     "sizeKB": 103410.6640625,
+     "name": "lenovo_ideogram4.safetensors",
+     "overrideName": null,
+     "type": "Model",
+     "pickleScanResult": "Success",
+     "pickleScanMessage": null,
+     "virusScanResult": "Success",
+     "virusScanMessage": null,
+     "scannedAt": "2026-06-12T01:45:22.027Z",
+     "metadata": {
+      "format": "SafeTensor",
+      "isRequired": false
+     },
+     "hashes": {
+      "AutoV1": "F6A9D943",
+      "AutoV2": "29AB3CA98B",
+      "SHA256": "29AB3CA98BF13EEBD3ACE30675878E51F3F61776E86E6F99FF601BA8DC673BD7",
+      "CRC32": "291510D7",
+      "BLAKE3": "951AC4DE274172983605A59C07AF0C0F2BD3E5066C23E014687A271E95120550",
+      "AutoV3": "5768305E1B82",
+      "SHA256_12": "29AB3CA98BF1"
+     },
+     "downloadUrl": "https://civitai.com/api/download/models/3025161?fileId=2903921",
+     "primary": true
+    }
+   ],
+   "images": [
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/fe6d0d7f-0fee-4173-818b-251b382614c5/original=true/133520779.jpeg",
+     "nsfwLevel": 2,
+     "width": 1776,
+     "height": 1184,
+     "type": "image"
+    },
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/fe19a0f7-b42c-4416-aed3-737660ef1f8f/original=true/133520795.jpeg",
+     "nsfwLevel": 2,
+     "width": 1776,
+     "height": 1184,
+     "type": "image"
+    }
+   ],
+   "downloadUrl": "https://civitai.com/api/download/models/3025161"
+  },
+  {
+   "id": 2973386,
+   "index": 4,
+   "name": "v1.0 Anima_base1",
+   "baseModel": "Anima",
+   "baseModelType": "Standard",
+   "createdAt": "2026-05-24T15:18:22.191Z",
+   "publishedAt": "2026-05-25T19:18:04.634Z",
+   "status": "Published",
+   "flags": 0,
+   "availability": "Public",
+   "nsfwLevel": 15,
+   "covered": true,
+   "coveredNext": true,
+   "stats": {
+    "downloadCount": 7928,
+    "thumbsUpCount": 346,
+    "thumbsDownCount": 0
+   },
+   "files": [
+    {
+     "id": 2852982,
+     "sizeKB": 135494.984375,
+     "name": "lenovo_ultrareal_anima_base1.safetensors",
+     "overrideName": null,
+     "type": "Model",
+     "pickleScanResult": "Success",
+     "pickleScanMessage": null,
+     "virusScanResult": "Success",
+     "virusScanMessage": null,
+     "scannedAt": "2026-05-25T03:05:02.663Z",
+     "metadata": {
+      "format": "SafeTensor",
+      "isRequired": false
+     },
+     "hashes": {
+      "AutoV1": "3B4F3F9F",
+      "AutoV2": "5D68598EA9",
+      "SHA256": "5D68598EA9BCDF3A1AE120E622C125F98CE116E32E8B63C4859D30D41D39D7F8",
+      "CRC32": "95B7B716",
+      "BLAKE3": "F8DA57D50BEA18FF68ED5BC6C591C50A15E2609706418FD91CDCD69A4AE0CF4F",
+      "AutoV3": "F702F677B79C",
+      "SHA256_12": "5D68598EA9BC"
+     },
+     "downloadUrl": "https://civitai.com/api/download/models/2973386?fileId=2852982",
+     "primary": true
+    }
+   ],
+   "images": [
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/ad31e735-a7d1-42d7-99ff-f0fa50267650/original=true/131820489.jpeg",
+     "nsfwLevel": 1,
+     "width": 1664,
+     "height": 1216,
+     "type": "image"
+    },
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/579436e1-bdda-4de5-87a1-2246d197cdd2/original=true/131820951.jpeg",
+     "nsfwLevel": 2,
+     "width": 1216,
+     "height": 1664,
+     "type": "image"
+    }
+   ],
+   "downloadUrl": "https://civitai.com/api/download/models/2973386"
+  },
+  {
+   "id": 2882170,
+   "index": 5,
+   "name": "v0.5 Anima",
+   "baseModel": "Anima",
+   "baseModelType": "Standard",
+   "createdAt": "2026-04-22T16:36:33.661Z",
+   "publishedAt": "2026-04-22T16:47:58.919Z",
+   "status": "Published",
+   "flags": 0,
+   "availability": "Public",
+   "nsfwLevel": 21,
+   "covered": true,
+   "coveredNext": true,
+   "stats": {
+    "downloadCount": 4643,
+    "thumbsUpCount": 197,
+    "thumbsDownCount": 0
+   },
+   "files": [
+    {
+     "id": 2762422,
+     "sizeKB": 135494.9765625,
+     "name": "lenovo_anima.safetensors",
+     "overrideName": null,
+     "type": "Model",
+     "pickleScanResult": "Success",
+     "pickleScanMessage": "No Pickle imports",
+     "virusScanResult": "Success",
+     "virusScanMessage": null,
+     "scannedAt": "2026-04-22T17:40:43.159Z",
+     "metadata": {
+      "format": "SafeTensor"
+     },
+     "hashes": {
+      "AutoV1": "366C1670",
+      "AutoV2": "BCB7425CF0",
+      "SHA256": "BCB7425CF081027339C6216619437C133521F4F941E40E4A96681F719DACFFE6",
+      "CRC32": "EA8005EC",
+      "BLAKE3": "2332B34056C52B35BE153693B2BB257AEC1ABA1E8E45439A0260ADA5D46A99A3",
+      "AutoV3": "C737C4B54443",
+      "SHA256_12": "BCB7425CF081"
+     },
+     "downloadUrl": "https://civitai.com/api/download/models/2882170?fileId=2762422",
+     "primary": true
+    }
+   ],
+   "images": [
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/f6b7669b-cee1-4f1e-907a-631604f59101/original=true/128284615.jpeg",
+     "nsfwLevel": 1,
+     "width": 832,
+     "height": 1216,
+     "type": "image"
+    },
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/d4eb9f5f-6d67-4042-a681-5dc5b1dc7e6f/original=true/128284795.jpeg",
+     "nsfwLevel": 4,
+     "width": 832,
+     "height": 1216,
+     "type": "image"
+    }
+   ],
+   "downloadUrl": "https://civitai.com/api/download/models/2882170"
+  },
+  {
+   "id": 2682771,
+   "index": 6,
+   "name": "v1.0 Flux.Klein 9b Base",
+   "baseModel": "Flux.2 Klein 9B-base",
+   "baseModelType": "Standard",
+   "createdAt": "2026-02-12T11:06:18.797Z",
+   "publishedAt": "2026-02-12T11:53:15.037Z",
+   "status": "Published",
+   "flags": 0,
+   "availability": "Public",
+   "nsfwLevel": 1,
+   "covered": true,
+   "coveredNext": true,
+   "stats": {
+    "downloadCount": 21313,
+    "thumbsUpCount": 778,
+    "thumbsDownCount": 0
+   },
+   "files": [
+    {
+     "id": 2569291,
+     "sizeKB": 164900.734375,
+     "name": "lenovo_flux_klein9b.safetensors",
+     "overrideName": null,
+     "type": "Model",
+     "pickleScanResult": "Success",
+     "pickleScanMessage": "No Pickle imports",
+     "virusScanResult": "Success",
+     "virusScanMessage": null,
+     "scannedAt": "2026-02-12T11:45:33.146Z",
+     "metadata": {
+      "format": "SafeTensor"
+     },
+     "hashes": {
+      "AutoV1": "E90009C0",
+      "AutoV2": "1088621D82",
+      "SHA256": "1088621D824EF31C3C03AC65DA3C59335E0346BAF0F9BF9CF1ECA2063F6A7A60",
+      "CRC32": "0243E418",
+      "BLAKE3": "B60498CB180515EBB15ED625DE298AB8ABBA77DFDC699DBBD6A284B092944927",
+      "AutoV3": "96F7B2B0B4AF",
+      "SHA256_12": "1088621D824E"
+     },
+     "downloadUrl": "https://civitai.com/api/download/models/2682771?fileId=2569291",
+     "primary": true
+    }
+   ],
+   "images": [
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/eb25ce28-bd39-47b5-8d69-507d004dbb63/original=true/122329663.jpeg",
+     "nsfwLevel": 1,
+     "width": 1216,
+     "height": 1664,
+     "type": "image"
+    },
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/08e67042-7eab-4f4e-8179-0d7646e5c02e/original=true/120823948.jpeg",
+     "nsfwLevel": 1,
+     "width": 1664,
+     "height": 1216,
+     "type": "image"
+    }
+   ],
+   "downloadUrl": "https://civitai.com/api/download/models/2682771"
+  },
+  {
+   "id": 2683568,
+   "index": 7,
+   "name": "v1.0 ZImageBase",
+   "baseModel": "ZImageBase",
+   "baseModelType": "Standard",
+   "createdAt": "2026-02-12T17:50:37.652Z",
+   "publishedAt": "2026-02-12T17:56:45.324Z",
+   "status": "Published",
+   "flags": 0,
+   "availability": "Public",
+   "nsfwLevel": 5,
+   "covered": true,
+   "coveredNext": true,
+   "stats": {
+    "downloadCount": 4162,
+    "thumbsUpCount": 198,
+    "thumbsDownCount": 0
+   },
+   "files": [
+    {
+     "id": 2569897,
+     "sizeKB": 83100.390625,
+     "name": "lenovo_zimagebase.safetensors",
+     "overrideName": null,
+     "type": "Model",
+     "pickleScanResult": "Success",
+     "pickleScanMessage": "No Pickle imports",
+     "virusScanResult": "Success",
+     "virusScanMessage": null,
+     "scannedAt": "2026-02-12T17:55:35.462Z",
+     "metadata": {
+      "format": "SafeTensor"
+     },
+     "hashes": {
+      "AutoV1": "9D683A59",
+      "AutoV2": "12BD40D66E",
+      "SHA256": "12BD40D66EBFF2F43F0256E87FEC99E68DC0D132E94401BCD81ABED9438304C4",
+      "CRC32": "1D109CEE",
+      "BLAKE3": "784E6E528EF4CC1BCC86F32381ED057E7FEDF2D07E4BCC693E4D7261621E9803",
+      "AutoV3": "B288B8CBF8DF",
+      "SHA256_12": "12BD40D66EBF"
+     },
+     "downloadUrl": "https://civitai.com/api/download/models/2683568?fileId=2569897",
+     "primary": true
+    }
+   ],
+   "images": [
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/cc4100fc-7077-42f4-9f2e-d66f700ea1b2/original=true/120845988.jpeg",
+     "nsfwLevel": 1,
+     "width": 1088,
+     "height": 1856,
+     "type": "image"
+    },
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/6e86cb74-e677-42a5-a32c-8bbce7ce8cb9/original=true/120845981.jpeg",
+     "nsfwLevel": 1,
+     "width": 1664,
+     "height": 1216,
+     "type": "image"
+    }
+   ],
+   "downloadUrl": "https://civitai.com/api/download/models/2683568"
+  },
+  {
+   "id": 2452071,
+   "index": 8,
+   "name": "v1.0 Z-Image Turbo",
+   "baseModel": "ZImageTurbo",
+   "baseModelType": "Standard",
+   "createdAt": "2025-11-29T23:07:40.755Z",
+   "publishedAt": "2025-11-29T23:16:46.341Z",
+   "status": "Published",
+   "flags": 0,
+   "availability": "Public",
+   "nsfwLevel": 15,
+   "trainedWords": [
+    "l3n0v0"
+   ],
+   "covered": true,
+   "coveredNext": true,
+   "stats": {
+    "downloadCount": 30645,
+    "thumbsUpCount": 1452,
+    "thumbsDownCount": 3
+   },
+   "files": [
+    {
+     "id": 2343134,
+     "sizeKB": 83100.4296875,
+     "name": "lenovo_z.safetensors",
+     "overrideName": null,
+     "type": "Model",
+     "pickleScanResult": "Success",
+     "pickleScanMessage": "No Pickle imports",
+     "virusScanResult": "Success",
+     "virusScanMessage": null,
+     "scannedAt": "2025-11-29T23:10:45.231Z",
+     "metadata": {
+      "format": "SafeTensor"
+     },
+     "hashes": {
+      "AutoV1": "5C7F89EA",
+      "AutoV2": "B77465F098",
+      "SHA256": "B77465F098A65455364D1118A0C2465091F38FA3CED7CFB64BE7AC123EC0E773",
+      "CRC32": "DF367CB2",
+      "BLAKE3": "70ABB98F38DD5A12D14B59001F3FBF24BE3E5FD79CBC51DABE058CD9AA8FED85",
+      "AutoV3": "B45E6B6B2939",
+      "SHA256_12": "B77465F098A6"
+     },
+     "downloadUrl": "https://civitai.com/api/download/models/2452071?fileId=2343134",
+     "primary": true
+    }
+   ],
+   "images": [
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/cdb28f60-dfaa-4ca7-8fbc-21583cf8ff82/original=true/112044656.jpeg",
+     "nsfwLevel": 2,
+     "width": 1152,
+     "height": 1728,
+     "type": "image"
+    },
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/49d440ac-8bd1-47c1-be56-000c33845304/original=true/112044012.jpeg",
+     "nsfwLevel": 1,
+     "width": 1216,
+     "height": 1664,
+     "type": "image"
+    }
+   ],
+   "downloadUrl": "https://civitai.com/api/download/models/2452071"
+  },
+  {
+   "id": 2449027,
+   "index": 9,
+   "name": "v1.0 Flux2",
+   "baseModel": "Flux.2 D",
+   "baseModelType": "Standard",
+   "createdAt": "2025-11-29T04:30:24.361Z",
+   "publishedAt": "2025-11-29T21:19:00.320Z",
+   "status": "Published",
+   "flags": 0,
+   "availability": "Public",
+   "nsfwLevel": 5,
+   "trainedWords": [
+    "l3n0v0"
+   ],
+   "covered": true,
+   "coveredNext": true,
+   "stats": {
+    "downloadCount": 4316,
+    "thumbsUpCount": 149,
+    "thumbsDownCount": 0
+   },
+   "files": [
+    {
+     "id": 2340186,
+     "sizeKB": 190504.8046875,
+     "name": "lenovo_flux2.safetensors",
+     "overrideName": null,
+     "type": "Model",
+     "pickleScanResult": "Success",
+     "pickleScanMessage": "No Pickle imports",
+     "virusScanResult": "Success",
+     "virusScanMessage": null,
+     "scannedAt": "2025-11-29T04:35:37.634Z",
+     "metadata": {
+      "format": "SafeTensor"
+     },
+     "hashes": {
+      "AutoV1": "7877B237",
+      "AutoV2": "7BC867CF4B",
+      "SHA256": "7BC867CF4BBDB6105177264F26DB3D44D72D4B37B67DC1B91350C132F197D464",
+      "CRC32": "717F8354",
+      "BLAKE3": "8AAD4AA32FD58E43BAB2B51A57D70A01891655267311D74278B95648BBA17859",
+      "AutoV3": "B71B9672ED9B",
+      "SHA256_12": "7BC867CF4BBD"
+     },
+     "downloadUrl": "https://civitai.com/api/download/models/2449027?fileId=2340186",
+     "primary": true
+    }
+   ],
+   "images": [
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/9b14b55c-6328-45b2-a3cf-44e4c96509dd/original=true/112020770.jpeg",
+     "nsfwLevel": 1,
+     "width": 1216,
+     "height": 1664,
+     "type": "image"
+    },
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/e18804bc-6bf6-4522-8b05-95938c02887d/original=true/112020776.jpeg",
+     "nsfwLevel": 1,
+     "width": 1216,
+     "height": 1664,
+     "type": "image"
+    }
+   ],
+   "downloadUrl": "https://civitai.com/api/download/models/2449027"
+  },
+  {
+   "id": 2299345,
+   "index": 10,
+   "name": "v1.0 Chroma",
+   "baseModel": "Chroma",
+   "baseModelType": "Standard",
+   "createdAt": "2025-10-10T08:57:53.271Z",
+   "publishedAt": "2025-10-10T11:56:10.516Z",
+   "status": "Published",
+   "flags": 0,
+   "availability": "Public",
+   "nsfwLevel": 31,
+   "trainedWords": [
+    "l3n0v0"
+   ],
+   "covered": true,
+   "coveredNext": true,
+   "stats": {
+    "downloadCount": 12101,
+    "thumbsUpCount": 579,
+    "thumbsDownCount": 1
+   },
+   "files": [
+    {
+     "id": 2190290,
+     "sizeKB": 109497.609375,
+     "name": "lenovo_chroma.safetensors",
+     "overrideName": null,
+     "type": "Model",
+     "pickleScanResult": "Success",
+     "pickleScanMessage": "No Pickle imports",
+     "virusScanResult": "Success",
+     "virusScanMessage": null,
+     "scannedAt": "2025-10-10T09:00:55.664Z",
+     "metadata": {
+      "format": "SafeTensor"
+     },
+     "hashes": {
+      "AutoV1": "07E0518A",
+      "AutoV2": "DF934B1A36",
+      "SHA256": "DF934B1A366206DAA3B5DCFEF7C84EFD9E75CA19D00867D7FE24FA2BB233FDC9",
+      "CRC32": "1267350B",
+      "BLAKE3": "66B2CEAE2AAC299B4EE6C3109EC0C7EF4AC87BA50D7C455304ECB9FB3015FB21",
+      "AutoV3": "3DD4CA9F59BD",
+      "SHA256_12": "DF934B1A3662"
+     },
+     "downloadUrl": "https://civitai.com/api/download/models/2299345?fileId=2190290",
+     "primary": true
+    }
+   ],
+   "images": [
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/9e12de3c-0969-4c07-ba18-6607478df7d6/original=true/105264251.jpeg",
+     "nsfwLevel": 2,
+     "width": 1024,
+     "height": 1472,
+     "type": "image"
+    },
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/61b3fb3b-e450-47dc-8450-aefb281177a9/original=true/105239999.jpeg",
+     "nsfwLevel": 2,
+     "width": 1088,
+     "height": 1408,
+     "type": "image"
+    }
+   ],
+   "downloadUrl": "https://civitai.com/api/download/models/2299345"
+  },
+  {
+   "id": 2106185,
+   "index": 11,
+   "name": "v1.0 Qwen",
+   "baseModel": "Qwen",
+   "baseModelType": "Standard",
+   "createdAt": "2025-08-12T09:47:33.075Z",
+   "publishedAt": "2025-08-12T23:54:14.248Z",
+   "status": "Published",
+   "flags": 0,
+   "availability": "Public",
+   "nsfwLevel": 13,
+   "covered": true,
+   "coveredNext": true,
+   "stats": {
+    "downloadCount": 20873,
+    "thumbsUpCount": 830,
+    "thumbsDownCount": 3
+   },
+   "files": [
+    {
+     "id": 2000920,
+     "sizeKB": 46142.0859375,
+     "name": "lenovo.safetensors",
+     "overrideName": null,
+     "type": "Model",
+     "pickleScanResult": "Success",
+     "pickleScanMessage": "No Pickle imports",
+     "virusScanResult": "Success",
+     "virusScanMessage": null,
+     "scannedAt": "2025-08-12T09:50:47.894Z",
+     "metadata": {
+      "format": "SafeTensor"
+     },
+     "hashes": {
+      "AutoV1": "B084165D",
+      "AutoV2": "A988CEEB95",
+      "SHA256": "A988CEEB9558E4B5BC9FB462B644E95D1F2C43FC6C039046667B27AA3CF02251",
+      "CRC32": "D87CF1C2",
+      "BLAKE3": "76797D335EEBF48330CC608B7FCE9D989EB30430056D7B7EB27E91E6BC812E65",
+      "AutoV3": "61D65E0E37F6",
+      "SHA256_12": "A988CEEB9558"
+     },
+     "downloadUrl": "https://civitai.com/api/download/models/2106185?fileId=2000920",
+     "primary": true
+    }
+   ],
+   "images": [
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/264004fa-86c2-492b-9973-4d1677b42d76/original=true/93915557.jpeg",
+     "nsfwLevel": 1,
+     "width": 1408,
+     "height": 1088,
+     "type": "image"
+    },
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/1bf5bd3c-c2ee-4900-9be4-f98e6ba0aeed/original=true/93915377.jpeg",
+     "nsfwLevel": 1,
+     "width": 1408,
+     "height": 1088,
+     "type": "image"
+    }
+   ],
+   "downloadUrl": "https://civitai.com/api/download/models/2106185"
+  },
+  {
+   "id": 2066914,
+   "index": 12,
+   "name": "v1.0 Wan",
+   "baseModel": "Wan Video 14B t2v",
+   "baseModelType": "Standard",
+   "createdAt": "2025-07-31T09:05:48.652Z",
+   "publishedAt": "2025-07-31T10:02:14.712Z",
+   "status": "Published",
+   "flags": 0,
+   "availability": "Public",
+   "nsfwLevel": 5,
+   "trainedWords": [
+    "l3n0v0"
+   ],
+   "covered": true,
+   "coveredNext": true,
+   "stats": {
+    "downloadCount": 20857,
+    "thumbsUpCount": 686,
+    "thumbsDownCount": 1
+   },
+   "files": [
+    {
+     "id": 1963321,
+     "sizeKB": 299655.1279296875,
+     "name": "Lenovo.safetensors",
+     "overrideName": null,
+     "type": "Model",
+     "pickleScanResult": "Success",
+     "pickleScanMessage": "No Pickle imports",
+     "virusScanResult": "Success",
+     "virusScanMessage": null,
+     "scannedAt": "2025-07-31T09:10:45.268Z",
+     "metadata": {
+      "format": "SafeTensor"
+     },
+     "hashes": {
+      "AutoV1": "8EB32890",
+      "AutoV2": "64002D78ED",
+      "SHA256": "64002D78EDC3CEA47D440C4D7BD7BB9DE9C8A67177FE10607632CD6281144631",
+      "CRC32": "0224180A",
+      "BLAKE3": "D87B9227010262FDE026CE19C8205D332236F1816DA82572E1E3F359B9BEB448",
+      "AutoV3": "3B0EA78C209D",
+      "SHA256_12": "64002D78EDC3"
+     },
+     "downloadUrl": "https://civitai.com/api/download/models/2066914?fileId=1963321",
+     "primary": true
+    }
+   ],
+   "images": [
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/752d0c4c-4ee4-4ffe-964a-8b6e709f1386/original=true/91542393.jpeg",
+     "nsfwLevel": 1,
+     "width": 1088,
+     "height": 1472,
+     "type": "image"
+    },
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/8b7ca815-2d41-415b-8af3-9b7b18a4bde2/original=true/91542467.jpeg",
+     "nsfwLevel": 1,
+     "width": 1472,
+     "height": 1088,
+     "type": "image"
+    }
+   ],
+   "downloadUrl": "https://civitai.com/api/download/models/2066914"
+  },
+  {
+   "id": 1881976,
+   "index": 13,
+   "name": "v1.0 Flux",
+   "baseModel": "Flux.1 D",
+   "baseModelType": "Standard",
+   "createdAt": "2025-06-08T18:03:42.878Z",
+   "publishedAt": "2025-06-08T18:06:00.794Z",
+   "status": "Published",
+   "flags": 0,
+   "availability": "Public",
+   "nsfwLevel": 19,
+   "trainedWords": [
+    "l3n0v0"
+   ],
+   "covered": true,
+   "coveredNext": true,
+   "stats": {
+    "downloadCount": 8381,
+    "thumbsUpCount": 590,
+    "thumbsDownCount": 0
+   },
+   "files": [
+    {
+     "id": 1781742,
+     "sizeKB": 149676.1982421875,
+     "name": "IDunnohowtonameLora.safetensors",
+     "overrideName": null,
+     "type": "Model",
+     "pickleScanResult": "Success",
+     "pickleScanMessage": "No Pickle imports",
+     "virusScanResult": "Success",
+     "virusScanMessage": null,
+     "scannedAt": "2025-06-08T18:06:22.680Z",
+     "metadata": {
+      "format": "SafeTensor"
+     },
+     "hashes": {
+      "AutoV1": "95241C3C",
+      "AutoV2": "670508BBB8",
+      "SHA256": "670508BBB8C6111ED9FFC46A6C3D08C0D37F702F14EC2C47007314A62C7E3A99",
+      "CRC32": "901D036D",
+      "BLAKE3": "D44F28441BFB22F590191B6CD6FCA5B703519942C2D96318DB67BF02E59FA327",
+      "AutoV3": "75C35CF54227",
+      "SHA256_12": "670508BBB8C6"
+     },
+     "downloadUrl": "https://civitai.com/api/download/models/1881976?fileId=1781742",
+     "primary": true
+    }
+   ],
+   "images": [
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/3c2826ad-6776-4a35-82bf-099e679ec9db/original=true/81149266.jpeg",
+     "nsfwLevel": 1,
+     "width": 1504,
+     "height": 992,
+     "type": "image"
+    },
+    {
+     "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/b079a223-4dd7-4213-adfd-7e84fba580b2/original=true/81149200.jpeg",
+     "nsfwLevel": 1,
+     "width": 2592,
+     "height": 1696,
+     "type": "image"
+    }
+   ],
+   "downloadUrl": "https://civitai.com/api/download/models/1881976"
+  }
+ ]
+}

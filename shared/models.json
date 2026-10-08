@@ -62,9 +62,7 @@
         "negativePrompt": ""
       },
       "civitaiBaseModels": [
-        "ZImageTurbo",
-        "Z-Image Turbo",
-        "Z-Image"
+        "ZImageTurbo"
       ],
       "files": [
         {
@@ -110,8 +108,7 @@
       },
       "civitaiBaseModels": [
         "Flux.2 Klein 9B",
-        "Flux.2 Klein 9B-base",
-        "FLUX.2 klein 9B"
+        "Flux.2 Klein 9B-base"
       ],
       "files": [
         {
@@ -149,16 +146,14 @@
       "maxReferences": 4,
       "supportsNegativePrompt": true,
       "defaults": {
-        "steps": 0,
-        "cfg": 0,
-        "sampler": "",
-        "scheduler": "",
+        "steps": 25,
+        "cfg": 1.0,
+        "sampler": "euler",
+        "scheduler": "simple",
         "negativePrompt": ""
       },
       "civitaiBaseModels": [
-        "Qwen Image 2.1",
-        "Qwen-Image 2.1",
-        "Qwen"
+        "Qwen 2.1"
       ],
       "files": [
         {

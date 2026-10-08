@@ -1,0 +1,74 @@
+{
+ "id": 3349565,
+ "modelId": 1662740,
+ "name": "v1.0 Qwen2.1",
+ "nsfwLevel": 7,
+ "createdAt": "2026-09-22T16:25:45.075Z",
+ "updatedAt": "2026-09-24T08:17:55.959Z",
+ "status": "Published",
+ "publishedAt": "2026-09-22T17:05:54.837Z",
+ "trainedWords": [],
+ "trainingStatus": null,
+ "baseModel": "Qwen 2.1",
+ "baseModelType": "Standard",
+ "uploadType": "Created",
+ "usageControl": "Download",
+ "licensingFee": null,
+ "paidAccess": null,
+ "air": "urn:air:qwen21:lora:civitai:1662740@3349565",
+ "stats": {
+  "downloadCount": 11537,
+  "thumbsUpCount": 308
+ },
+ "model": {
+  "name": "Lenovo UltraReal",
+  "type": "LORA",
+  "nsfw": false,
+  "poi": false
+ },
+ "files": [
+  {
+   "id": 3236680,
+   "sizeKB": 77874.8984375,
+   "name": "lenovo_qwen21.safetensors",
+   "type": "Model",
+   "pickleScanResult": "Success",
+   "pickleScanMessage": null,
+   "virusScanResult": "Success",
+   "virusScanMessage": null,
+   "scannedAt": "2026-09-22T16:27:04.989",
+   "metadata": {
+    "format": "SafeTensor",
+    "fp": "fp16"
+   },
+   "hashes": {
+    "AutoV1": "A6182567",
+    "AutoV2": "7F1E95C3EC",
+    "SHA256": "7F1E95C3EC1E9C7CEA197F7B6F80F601AF8E6B479F6EAD78AB16DF542F447C0E",
+    "CRC32": "45ED492D",
+    "BLAKE3": "17ED8EBC422D40488CAECA6A6AF8BAFF626D29B7A30DB8D177551C50096BC8DD",
+    "AutoV3": "05FE148E5623",
+    "SHA256_12": "7F1E95C3EC1E"
+   },
+   "primary": true,
+   "downloadUrl": "https://civitai.com/api/download/models/3349565?fileId=3236680"
+  }
+ ],
+ "images": [
+  {
+   "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/0a89a58a-1810-454f-a289-8787e4827c72/original=true/143722504.jpeg",
+   "nsfwLevel": 1,
+   "width": 1248,
+   "height": 1664,
+   "type": "image"
+  },
+  {
+   "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/6dc36647-3d99-4a86-a2df-349761a73436/original=true/143524783.jpeg",
+   "nsfwLevel": 1,
+   "width": 1248,
+   "height": 1664,
+   "type": "image"
+  }
+ ],
+ "downloadUrl": "https://civitai.com/api/download/models/3349565"
+}
