@@ -275,6 +275,22 @@ export function SettingsScreen() {
                 </div>
               </div>
               <div className="field">
+                <label className="field__label" htmlFor="worker-ref">
+                  Worker code
+                </label>
+                <input
+                  id="worker-ref"
+                  className="input mono"
+                  value={s?.workerRef ?? "main"}
+                  title={s?.podImage ?? ""}
+                  readOnly
+                  aria-describedby="worker-ref-help"
+                />
+                <p id="worker-ref-help" className="hint">
+                  Git ref the pod loads its code from at each start. Change <code>workerRef</code> (or <code>podImage</code>) in the settings file.
+                </p>
+              </div>
+              <div className="field">
                 <label className="switch">
                   <input type="checkbox" checked={passKey} onChange={(e) => setPassKey(e.target.checked)} aria-describedby="pass-key-help" />
                   <span className="switch__track" aria-hidden />

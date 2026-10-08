@@ -1,0 +1,136 @@
+# syntax=docker/dockerfile:1
+#
+# Image Studio RUNTIME image (docs/spec.md "v4 runtime image + code at boot").
+#
+#   ghcr.io/algotradingfervid/image-studio-runtime:{latest,sha-<commit>}
+#
+# Holds only what changes rarely: Python 3.12, torch (cu128 wheels), ComfyUI
+# v0.39.0 and the worker's third-party dependencies. The worker code
+# (worker/src + shared/models.json) is downloaded from GitHub by
+# worker/boot/boot.py at every container start; the copy baked in below
+# (/app-baked) is only the fallback when that download fails.
+#
+# Build from the REPO ROOT (CI: .github/workflows/runtime-image.yml):
+#   docker buildx build --platform linux/amd64 -f worker/Dockerfile.runtime \
+#     --build-arg GIT_SHA=$(git rev-parse HEAD) -t <image> .
+#
+# No CUDA toolkit in the image: torch's cu128 wheels bundle the CUDA 12.8
+# runtime libraries (nvidia-*-cu12 wheels: cuBLAS, cuDNN 9, NCCL, ...), and the
+# host driver (libcuda, nvidia-smi) is mounted by the NVIDIA container runtime.
+# cu128 builds include sm_120 kernels (Blackwell: RTX PRO 4000/4500/6000,
+# RTX 5090) as well as Ada (sm_89) and Ampere (sm_80/86); they need driver >= 570.
+#
+# The legacy all-in-one image (worker/Dockerfile, ~14.8 GB compressed) is kept
+# as a fallback; see worker/README.md.
+
+FROM python:3.12.15-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258
+
+ARG COMFYUI_VERSION=v0.39.0
+ARG COMFYUI_COMMIT=b0b743566f65daafc423b4fea8a2fbda94b3384a
+ARG TORCH_VERSION=2.11.0
+ARG TORCHVISION_VERSION=0.26.0
+ARG TORCHAUDIO_VERSION=2.11.0
+ARG TORCH_CUDA=cu128
+
+# NVIDIA_*: nvidia/cuda base images set these; without NVIDIA_VISIBLE_DEVICES
+# the NVIDIA container runtime exposes no GPU to a non-CUDA image.
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    UV_NO_CACHE=1 \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 \
+    UV_SYSTEM_PYTHON=1 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64 \
+    PATH=/usr/local/nvidia/bin:${PATH}
+
+# 1. tcmalloc (preloaded by boot.py, like upstream start.sh). Nothing else from
+#    apt: no git (ComfyUI comes as a tarball), no compilers, no ffmpeg (PyAV
+#    wheels bundle their own), no libGL (only ComfyUI nodes we don't use need it).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libtcmalloc-minimal4 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. ComfyUI source at the tag, verified against the expected commit (GitHub
+#    archives carry the commit SHA in the pax global header).
+RUN python - <<'EOF'
+import io, os, tarfile, urllib.request
+tag, want = os.environ["COMFYUI_VERSION"], os.environ["COMFYUI_COMMIT"]
+url = f"https://codeload.github.com/comfyanonymous/ComfyUI/tar.gz/refs/tags/{tag}"
+data = urllib.request.urlopen(url, timeout=120).read()
+tf = tarfile.open(fileobj=io.BytesIO(data), mode="r:gz")
+got = tf.pax_headers.get("comment")
+assert got == want, f"ComfyUI {tag} is commit {got}, expected {want}"
+members = []
+for m in tf.getmembers():
+    top, _, rest = m.name.partition("/")
+    if rest:
+        m.name = rest
+        members.append(m)
+tf.extractall("/comfyui", members=members, filter="data")
+print(f"ComfyUI {tag} ({got}) -> /comfyui, {len(members)} entries")
+EOF
+
+# 3. torch from the cu128 index, in its own layer (~4 GB compressed): ComfyUI
+#    or worker dependency changes don't invalidate it, so CI rebuilds and
+#    pod-side pulls of a new runtime image skip it.
+RUN --mount=from=ghcr.io/astral-sh/uv:0.11.7,source=/uv,target=/bin/uv \
+    printf 'torch==%s+%s\ntorchvision==%s+%s\ntorchaudio==%s+%s\n' \
+        "$TORCH_VERSION" "$TORCH_CUDA" "$TORCHVISION_VERSION" "$TORCH_CUDA" \
+        "$TORCHAUDIO_VERSION" "$TORCH_CUDA" > /etc/torch-constraints.txt \
+    && uv pip install --index-url "https://download.pytorch.org/whl/${TORCH_CUDA}" \
+         -c /etc/torch-constraints.txt torch torchvision torchaudio \
+    && python -c "import torch; v = torch.__version__; \
+flags = getattr(torch._C, '_cuda_getArchFlags', lambda: None)(); \
+print('torch', v, 'cuda', torch.version.cuda, 'archs', flags); \
+assert v == '${TORCH_VERSION}+${TORCH_CUDA}', v; \
+assert flags is None or 'sm_120' in flags, 'no Blackwell (sm_120) kernels: ' + str(flags)"
+
+# 4. ComfyUI's requirements + the worker's runtime deps (worker/requirements-
+#    runtime.txt), with torch frozen by the constraints file so ComfyUI's bare
+#    `torch` can never pull PyPI's CUDA 13 builds (driver >= 580). The
+#    workflow-template media packages (~0.5 GB of example images/videos for
+#    the ComfyUI web UI's template browser) are removed: this worker only uses
+#    the API on 127.0.0.1; ComfyUI starts fine without them.
+COPY worker/requirements-runtime.txt /tmp/requirements-runtime.txt
+RUN --mount=from=ghcr.io/astral-sh/uv:0.11.7,source=/uv,target=/bin/uv \
+    uv pip install -c /etc/torch-constraints.txt \
+         -r /comfyui/requirements.txt -r /tmp/requirements-runtime.txt \
+    && uv pip uninstall \
+         comfyui-workflow-templates-media-api comfyui-workflow-templates-media-video \
+         comfyui-workflow-templates-media-image comfyui-workflow-templates-media-other \
+         comfyui-workflow-templates-media-assets-01 comfyui-workflow-templates-media-assets-02 \
+    && rm /tmp/requirements-runtime.txt \
+    && python -c "import torch, runpod, aiohttp, requests, websocket; v = torch.__version__; \
+assert v == '${TORCH_VERSION}+${TORCH_CUDA}', v; print('torch', v, 'runpod', runpod.__version__)"
+
+# 5. Smoke tests on CPU (no GPU at build time): the version is right, ComfyUI
+#    starts (upstream's --quick-test-for-ci), and every node class our graphs
+#    use is registered. Then precompile ComfyUI's bytecode so pods don't.
+COPY worker/boot/check_comfy_nodes.py /boot/check_comfy_nodes.py
+COPY worker/src/workflows.py /tmp/workflows.py
+RUN python -c "import sys; sys.path.insert(0, '/comfyui'); from comfyui_version import __version__ as v; \
+assert 'v' + v == '${COMFYUI_VERSION}', v; print('ComfyUI', v)" \
+    && cd /comfyui && timeout 300 python main.py --quick-test-for-ci --cpu \
+    && timeout 300 python /boot/check_comfy_nodes.py /comfyui /tmp/workflows.py \
+    && rm -rf /comfyui/user /comfyui/temp /tmp/workflows.py \
+    && (python -m compileall -q -j 0 /comfyui > /dev/null || true)
+
+# 6. Entrypoint + the fallback copy of the worker code. Keep these last: they
+#    are tiny and change most often.
+COPY worker/boot/boot.py /boot/boot.py
+COPY worker/src/ /app-baked/src/
+COPY shared/models.json /app-baked/models.json
+ARG GIT_SHA=unknown
+RUN printf '{"commit": "%s"}\n' "$GIT_SHA" > /app-baked/BUILD_INFO.json \
+    && python /boot/boot.py --check /app-baked
+
+ENV VOLUME_ROOT=/runpod-volume \
+    COMFYUI_PATH=/comfyui
+WORKDIR /
+# Pod mode (MODE=pod) serves the RunPod-serverless-compatible API on :8000.
+EXPOSE 8000
+# boot.py: fetch code (WORKER_REF, default main) -> start ComfyUI -> exec handler.
+CMD ["python", "-u", "/boot/boot.py"]

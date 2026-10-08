@@ -1,8 +1,10 @@
 """Image Studio RunPod Serverless handler.
 
-Installed as /handler.py in the image, replacing the upstream worker-comfyui
-handler; the base image's /start.sh starts ComfyUI in the background and then
-runs `python -u /handler.py`.
+Runtime image (spec "v4"): worker/boot/boot.py fetches this directory from
+GitHub (WORKER_REF) into /app/src (fallback: the baked /app-baked/src), starts
+ComfyUI in the background and then execs `python -u <dir>/handler.py`.
+Legacy image: installed as /handler.py; the base image's /start.sh starts
+ComfyUI and then runs it.
 
 Actions (docs/spec.md, "Worker job protocol"):
   generate  {model, prompt, negativePrompt, width, height, seed, steps, cfg,
@@ -22,7 +24,7 @@ Actions (docs/spec.md, "Worker job protocol"):
 Failures are returned as {"error": "<CODE>: <detail>"}; the RunPod SDK then
 marks the job FAILED with that message.
 
-Pod mode (MODE=pod, docs/spec.md "v3 change"): the same /start.sh runs this
+Pod mode (MODE=pod, docs/spec.md "v3 change"): the same entrypoint runs this
 file, which then starts server.py instead of runpod.serverless.start. The pod
 server passes two private keys in the job dict:
   "_progress": callable(payload)  receives progress instead of progress_update
@@ -804,7 +806,7 @@ def handler(job: dict) -> dict:
 
 def main() -> None:
     if os.environ.get("MODE", "").strip().lower() == "pod":
-        import server  # the /image_studio copy; imports `handler` from PYTHONPATH
+        import server  # next to this file (PYTHONPATH); imports `handler` from there
         server.main()
     else:
         runpod.serverless.start({"handler": handler})

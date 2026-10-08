@@ -6,7 +6,7 @@ serverless, so the app only swaps its base URL and token:
   POST /run              {input, policy?}  -> {id, status: "IN_QUEUE"}
   GET  /status/{id}      -> {id, status, output?, delayTime, executionTime, error?}
   POST /cancel/{id}      -> {id, status}
-  GET  /health           -> {jobs, workers, ready, gpu, comfyui, watchdog}
+  GET  /health           -> {jobs, workers, ready, gpu, comfyui, watchdog, code?}
   GET  /ping             -> {status: "ok"}  (no auth; liveness)
 
 Every route is also served under /v2/{anything}/..., the serverless URL shape.
@@ -501,24 +501,57 @@ def gpu_name() -> str:
     return ""
 
 
+CODE_INFO_ENV = "IMAGE_STUDIO_CODE_INFO"
+
+
+def code_info() -> dict | None:
+    """Which worker code is running, as written by worker/boot/boot.py (runtime
+    image, spec "v4"): {source: "github"|"baked", ref, commit[, error]}.
+    None (no `code` in /health) on the legacy image, which has no boot.py."""
+    path = os.environ.get(CODE_INFO_ENV)
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    out = {k: data.get(k) for k in ("source", "ref", "commit")}
+    if data.get("error"):
+        out["error"] = str(data["error"])
+    return out
+
+
 class Health:
     def __init__(self, manager: JobManager, comfy_up: Callable[[], bool] | None = None,
                  gpu: Callable[[], str] = gpu_name,
-                 comfy_version: Callable[[], str | None] = worker.comfyui_version):
+                 comfy_version: Callable[[], str | None] = worker.comfyui_version,
+                 code: Callable[[], dict | None] = code_info):
         self.manager = manager
         self.comfy_up = comfy_up or (lambda: worker.make_client().is_up())
         self._gpu_fn = gpu
         self._gpu: str | None = None
         self.comfy_version = comfy_version
+        self._code_fn = code
+        self._code: dict | None = None
+        self._code_read = False
 
     def payload(self) -> dict:
         if self._gpu is None:
             self._gpu = self._gpu_fn()
         counts = self.manager.counts()
         running = 1 if counts["inProgress"] else 0
-        return {"jobs": counts, "workers": {"idle": 1 - running, "running": running},
-                "ready": bool(self.comfy_up()), "gpu": self._gpu,
-                "comfyui": self.comfy_version() or ""}
+        if not self._code_read:  # fixed for the life of the process
+            self._code = self._code_fn()
+            self._code_read = True
+        out = {"jobs": counts, "workers": {"idle": 1 - running, "running": running},
+               "ready": bool(self.comfy_up()), "gpu": self._gpu,
+               "comfyui": self.comfy_version() or ""}
+        if self._code is not None:
+            out["code"] = self._code
+        return out
 
 
 # ---------------------------------------------------------------------------

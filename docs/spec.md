@@ -269,3 +269,46 @@ Additive "start image" + strength for the models with `"supportsImg2Img": true` 
 - **Worker `generate`** gains optional `initImage: {name, base64}` (PNG/JPEG/WebP) and `denoise` (0.05–1.0, default 0.6; ignored without `initImage`). A model without `supportsImg2Img` returns `IMG2IMG_NOT_SUPPORTED: <model> …`; bad images return `INVALID_INIT_IMAGE: …`. The image is uploaded to ComfyUI `/upload/image` like references. Graph: `LoadImage → ImageScaleToTotalPixels(lanczos, 1.0 MP) → ImageScale(lanczos, W, H, crop center) → VAEEncode(model VAE)` replaces the empty latent, where W×H = the start image scaled to 1 MP with both sides rounded to multiples of 16 (`workflows.init_image_size`). With a start image, `width`/`height` are optional and ignored; the output `image.width/height` is the actual size. Denoise goes to `KSampler.denoise` (Z-Image) or `BasicScheduler.denoise` (Chroma); steps are kept as given. Progress: stage `preparing_init_image` (phase `loading`, between `loading_model` and `preparing_references`) is in `stages` only when a start image is present; the LoadImage/ImageScale*/VAEEncode nodes that feed the sampler's `latent_image` map to it, not to `preparing_references`.
 - **Rust**: `generate` takes optional `initImageId` (an id from `import_reference` / `import_reference_bytes`, same ≤1 MP import pipeline) and `denoise` (clamped to 0.05–1.0, default 0.6); rejected for models without `supportsImg2Img`. The worker input then carries `initImage` + `denoise`. `ImageRecord` gains `initImage` (stored file path, or null) and `denoise` (or null), persisted by SQLite migration 2 (`ALTER TABLE images ADD COLUMN init_image TEXT, denoise REAL`; existing rows read as null). `ModelView` exposes `supportsImg2Img`.
 - **UI**: for img2img models the Create panel shows a "Start image (optional) — the model redraws this image" card (drop, paste, file picker; one image; thumbnail with remove). When set: a "How much to change" slider (0.05–1.0, step 0.05, default 0.6, "Keep close" … "Reimagine"), and the aspect-ratio chips are disabled with "Size follows the start image". Switching to a model without img2img drops the start image with a toast. JobCard labels the stage "Preparing start image"; the Lightbox shows the start image and strength, and "Use these settings" re-imports the stored start image; gallery tiles carry an "img2img" badge.
+
+## v4 runtime image + code at boot (2026-10-09)
+
+The pod image no longer contains the worker code. It is split in two:
+
+- **Runtime image** `ghcr.io/algotradingfervid/image-studio-runtime:{latest,sha-<commit>}` (`worker/Dockerfile.runtime`). It holds only what changes rarely:
+  - `python:3.12.15-slim-bookworm` (pinned by digest). No CUDA toolkit: torch's cu128 wheels bundle the CUDA 12.8 runtime, cuDNN and NCCL, and the NVIDIA container runtime mounts the host driver (driver ≥ 570). The cu128 build has kernels for sm_75/80/86/90/100/120, so it covers Blackwell (RTX PRO 4000/4500/6000, sm_120), Ada (RTX 4090, runs the sm_86 kernels) and Ampere.
+  - torch 2.11.0 / torchvision 0.26.0 / torchaudio 2.11.0 (`+cu128`), ComfyUI v0.39.0 (tag tarball, commit `b0b74356…` checked) with its requirements, and the worker's third-party dependencies (`worker/requirements-runtime.txt`: runpod 1.12.0, requests 2.34.2, websocket-client 1.9.2, and transformers below 5 / huggingface-hub below 1.0).
+  - The ComfyUI workflow-template media packages (~0.5 GB of example media for the web UI) are removed, because the worker only uses the API.
+  - Expected size: about 4.5 GB compressed (the legacy image was about 14.8 GB). The CI summary reports the real figure.
+- **Worker code** (`worker/src/**`, `shared/models.json`) comes from GitHub on every container start. `worker/boot/boot.py` is the entrypoint, written with the standard library only. It:
+  1. downloads `https://codeload.github.com/algotradingfervid/image-studio/tar.gz/<WORKER_REF>`. Each attempt has a 20 s deadline; there are 3 attempts with 1 s and 2 s backoff, and a 404 is not retried.
+  2. checks the tarball. It must have one top-level dir, no absolute paths, no `..`, and no links among the files taken. The required files must be present, `models.json` must parse, every `.py` must compile, and `import handler, server` must succeed in a subprocess. A full-SHA ref must match the tarball's commit.
+  3. extracts **only** `worker/src/**` → `/app/src` and `shared/models.json` → `/app/models.json`.
+  4. starts ComfyUI as upstream `start.sh` did: tcmalloc `LD_PRELOAD`, `--disable-auto-launch --disable-metadata --listen 127.0.0.1 --port 8188 --verbose $COMFY_LOG_LEVEL --log-stdout`, plus `--extra-model-paths-config /app/src/extra_model_paths.yaml`. Its PID goes to `/tmp/comfyui.pid`.
+  5. runs a non-fatal GPU check in parallel. It logs the GPU, its `sm_XY` and torch's arch list, or the reason it failed.
+  6. execs `python -u /app/src/handler.py` with the environment passed through. `MODE=pod` gives the pod server; anything else gives the serverless handler.
+
+The commit comes from the tarball's pax header (`git archive` writes it there). With a SHA ref it also appears in the top-level dir name (`image-studio-<sha>`).
+
+**How code ships:** push to `main`, and the next pod start runs it. You don't need an image build or an app release. `WORKER_REF` is a branch, tag or commit SHA. The app sends it from the settings-file key `workerRef` (default `"main"`). Settings shows it read-only. Pin a commit SHA to keep a known-good version while `main` moves. A running pod keeps the code it booted with; Stop and Start to pick up new code.
+
+**When the runtime image rebuilds:** `.github/workflows/runtime-image.yml` runs only when one of these changes on `main`, or by manual dispatch:
+- `worker/Dockerfile.runtime` or its `.dockerignore`
+- `worker/boot/**`
+- `worker/requirements-runtime.txt`
+- the workflow itself
+
+A change only under `worker/src/` or `shared/` builds nothing. Bumping torch, ComfyUI or a Python dependency means editing the Dockerfile or the requirements file.
+
+**Fallback:** the image also carries the code from its own build commit at `/app-baked` (same layout, plus `BUILD_INFO.json` with the commit). On any problem the boot logs a `FALLBACK` banner with the reason and runs the baked copy. Problems include a GitHub outage, a timeout, an unknown ref, a bad tarball, a syntax or import error, or a SHA mismatch. `WORKER_CODE_SOURCE=baked` forces the baked copy. The baked copy can be older than `main`: it is only refreshed when the runtime image rebuilds. If even the baked copy is broken, the container exits.
+
+**`GET /health`** gains `code: {source: "github"|"baked", ref, commit, error?}`. `error` (only on fallback) says why GitHub code was not used. boot.py writes this to `$IMAGE_STUDIO_CODE_INFO` (`/tmp/image_studio_code.json`). The legacy image has no boot.py, so `code` is absent there, and every other field is unchanged.
+
+**App:** `pod.rs` changes as follows:
+- `POD_IMAGE` is now the runtime image.
+- `LEGACY_POD_IMAGE` is `ghcr.io/algotradingfervid/image-studio-worker:latest`.
+- `create_payload` adds env `WORKER_REF`.
+- The image comes from `Settings::pod_image()`. Its settings-file key is `podImage`, and the default is `POD_IMAGE`.
+
+To switch back to the legacy image without rebuilding the app, set `"podImage": "ghcr.io/algotradingfervid/image-studio-worker:latest"` in the app's settings file (`~/Library/Application Support/com.naren.imagestudio/settings.json`), then Stop and Start the GPU. The legacy image ignores `WORKER_REF`.
+
+**Legacy image:** `worker/Dockerfile` (FROM `runpod/worker-comfyui:5.10.0-base-cuda12.8.1`) is kept unchanged. `.github/workflows/worker-image.yml` now runs by manual dispatch only.

@@ -5,7 +5,109 @@ protocol in `docs/spec.md` ("Worker job protocol"). The same image runs as a
 RunPod Serverless worker (default) or, with `MODE=pod`, as an HTTP server on a
 dedicated GPU pod ("v3 change"; see [Pod mode](#pod-mode-modepod)).
 
-## Build
+## Images and how code ships (v4)
+
+Pods run the slim **runtime image**, which fetches the worker code from GitHub every
+time it starts (`docs/spec.md`, "v4 runtime image + code at boot"):
+
+| | Runtime image (default) | Legacy image |
+|---|---|---|
+| Image | `ghcr.io/algotradingfervid/image-studio-runtime` | `ghcr.io/algotradingfervid/image-studio-worker` |
+| Dockerfile | `Dockerfile.runtime` | `Dockerfile` |
+| Built by | `runtime-image.yml`: on changes to `Dockerfile.runtime*`, `boot/**` or `requirements-runtime.txt`, or by hand | `worker-image.yml`: by hand only |
+| Worker code | downloaded at boot from `WORKER_REF`, with a baked fallback | baked in |
+| Size (compressed) | about 4.5 GB, estimated (the CI summary prints the real figure) | about 14.8 GB |
+
+**Shipping code:** push to `main`, then Stop and Start the GPU. Nothing is built.
+To pin a version, set `"workerRef": "<commit sha>"` in the app's settings file
+(`~/Library/Application Support/com.naren.imagestudio/settings.json`). The default is `"main"`.
+
+**Back to the legacy image** (no app rebuild): set
+`"podImage": "ghcr.io/algotradingfervid/image-studio-worker:latest"` in the same file,
+then Stop and Start. If that image is stale, rebuild it first with
+**Actions → worker-image → Run workflow**.
+
+### Runtime image (`Dockerfile.runtime`)
+
+The build context is the repo root. `Dockerfile.runtime.dockerignore` limits it to `worker/boot/`,
+`worker/src/`, `worker/requirements-runtime.txt` and `shared/models.json`.
+
+```sh
+docker buildx build --platform linux/amd64 -f worker/Dockerfile.runtime \
+  --build-arg GIT_SHA=$(git rev-parse HEAD) -t <registry>/image-studio-runtime:<tag> .
+```
+
+Pinned versions:
+
+| Component | Version | Source |
+|---|---|---|
+| Base | `python:3.12.15-slim-bookworm@sha256:34386ef0…7258` | Docker Hub |
+| torch / torchvision / torchaudio | 2.11.0 / 0.26.0 / 2.11.0 `+cu128` | `download.pytorch.org/whl/cu128` |
+| ComfyUI | v0.39.0, commit `b0b743566f65…` (checked at build) | codeload tag tarball |
+| Worker deps (`requirements-runtime.txt`) | runpod 1.12.0, requests 2.34.2, websocket-client 1.9.2, transformers <5, huggingface-hub <1.0 | PyPI |
+| uv (build only, bind-mounted, not in the image) | 0.11.7 | `ghcr.io/astral-sh/uv` |
+| apt | `libtcmalloc-minimal4` only | Debian bookworm |
+
+There is no CUDA toolkit in the image. The cu128 torch wheels pull `nvidia-*-cu12` wheels
+(CUDA 12.8 runtime, cuBLAS, cuDNN 9, NCCL…), and the NVIDIA container runtime mounts the host
+driver. The image sets `NVIDIA_VISIBLE_DEVICES=all` and
+`NVIDIA_DRIVER_CAPABILITIES=compute,utility`, as the `nvidia/cuda` images do.
+
+The cu128 kernels cover sm_75/80/86/90/100/120:
+
+- Blackwell RTX PRO 4000/4500/6000 is sm_120.
+- Ada (RTX 4090) runs the sm_86 kernels.
+
+They need driver ≥ 570.
+
+**What the Dockerfile does:**
+
+1. Installs tcmalloc from apt.
+2. Downloads the ComfyUI tag tarball and checks its commit.
+3. Installs torch in its own layer from the cu128 index. It asserts the version and that sm_120 kernels are present.
+4. Installs ComfyUI's requirements and `requirements-runtime.txt`, with torch frozen by a constraints file. It then removes the six `comfyui-workflow-templates-media-*` packages, about 0.5 GB of example media for the web UI, which this worker never serves.
+5. Runs the CPU smoke tests:
+   - checks the ComfyUI version
+   - runs `main.py --quick-test-for-ci --cpu`
+   - runs `boot/check_comfy_nodes.py`, which asserts that every node class `src/workflows.py` adds is registered
+
+   It then precompiles bytecode.
+6. Copies `boot/boot.py` to `/boot`, and `src/` + `shared/models.json` to `/app-baked` (the fallback), with `BUILD_INFO.json` = `{"commit": $GIT_SHA}`. It then runs `boot.py --check /app-baked`.
+
+`CMD ["python", "-u", "/boot/boot.py"]`.
+
+### Boot sequence (`boot/boot.py`, standard library only)
+
+1. Download `https://codeload.github.com/algotradingfervid/image-studio/tar.gz/$WORKER_REF`. The default ref is `main`; a branch, tag, or short or full SHA also works. Each attempt has a 20 s deadline, with 3 attempts and 1 s / 2 s backoff. A 404 is final.
+2. Check the tarball:
+   - one top-level dir
+   - no absolute paths or `..`, which reject the whole tarball
+   - no symlinks or hardlinks among the files taken
+   - `src/handler.py`, `src/server.py`, `src/extra_model_paths.yaml` and `models.json` present
+   - `models.json` parses as JSON
+   - every `.py` compiles
+   - a full-SHA ref matches the tarball commit
+
+   Then extract only `worker/src/**` → `/app/src` and `shared/models.json` → `/app/models.json`, and run `import handler, server` in a subprocess. The commit comes from the tarball's pax `comment` header, or from the `image-studio-<sha>` dir name.
+3. On any failure, log a `FALLBACK` banner with the reason and use `/app-baked`. `WORKER_CODE_SOURCE=baked` forces this. If `/app-baked` is broken too, the container exits.
+4. Write `{source, ref, commit, error?}` to `$IMAGE_STUDIO_CODE_INFO` (`/tmp/image_studio_code.json`). The pod server returns it as `code` in `GET /health`.
+5. Start ComfyUI, matching upstream `start.sh`:
+   - `LD_PRELOAD` = tcmalloc
+   - `--disable-auto-launch --disable-metadata --listen 127.0.0.1 --port 8188 --extra-model-paths-config <code>/src/extra_model_paths.yaml --verbose $COMFY_LOG_LEVEL --log-stdout $COMFY_EXTRA_ARGS`
+   - PID in `/tmp/comfyui.pid`
+6. Start a non-fatal GPU check in parallel. It logs the GPU, its `sm_XY` and torch's arch list, or a "no kernel image" hint. `GPU_CHECK=0` turns it off.
+7. `exec python -u <code>/src/handler.py`, with the environment passed through, plus `PYTHONPATH=<code>/src` and `REGISTRY_PATH=<code>/models.json`. `MODE=pod` gives the pod server; anything else gives `runpod.serverless.start`.
+
+| Boot variable | Purpose |
+|---|---|
+| `WORKER_REF` | Git ref to load code from. Default `main`. The app sends it from `workerRef`. |
+| `WORKER_REPO` | `owner/name`. Default `algotradingfervid/image-studio`. |
+| `WORKER_CODE_SOURCE=baked` | Skip GitHub and use `/app-baked`. |
+| `COMFY_LOG_LEVEL` | ComfyUI `--verbose` level. Default `DEBUG`, as upstream. |
+| `COMFY_EXTRA_ARGS` | Extra ComfyUI flags, shell-split. |
+| `GPU_CHECK=0` | Skip the GPU diagnostic. |
+
+### Legacy image (`Dockerfile`)
 
 The build context is the **repo root**, because the image embeds `shared/models.json`:
 
@@ -43,7 +145,7 @@ Docker Hub. The published image config shows:
 | `COMFY_READY_TIMEOUT_S` | How long `generate` waits for ComfyUI to boot. Default 300. |
 | `GENERATE_TIMEOUT_S` | Generation watchdog. Default 590, just under the 600 s job policy. |
 
-Set these by the Dockerfile; you normally don't change them: `REGISTRY_PATH`, `VOLUME_ROOT=/runpod-volume`, `COMFYUI_PATH=/comfyui`, `PYTHONPATH`.
+The image and boot script set these; you normally don't change them: `REGISTRY_PATH`, `VOLUME_ROOT=/runpod-volume`, `COMFYUI_PATH=/comfyui`, `PYTHONPATH`, `IMAGE_STUDIO_CODE_INFO`.
 
 Tokens are never forwarded across hosts. Redirects are followed manually, and the
 `Authorization` header is dropped as soon as a redirect leaves the original host,
@@ -51,8 +153,8 @@ for example HF → CDN or Civitai → a presigned S3/R2 URL.
 
 ## Pod mode (`MODE=pod`)
 
-The entrypoint is unchanged: `/start.sh` starts ComfyUI (on 127.0.0.1:8188,
-not exposed) and runs `/handler.py`, whose `main()` sees `MODE=pod` and starts
+The entrypoint (`boot.py`, or `/start.sh` on the legacy image) starts ComfyUI
+(on 127.0.0.1:8188, not exposed) and runs `handler.py`, whose `main()` sees `MODE=pod` and starts
 `server.py` (aiohttp, already in the image as a `runpod` dependency) on
 `0.0.0.0:8000` instead of `runpod.serverless.start`.
 
@@ -67,6 +169,7 @@ not exposed) and runs `/handler.py`, whose `main()` sees `MODE=pod` and starts
 | `RUNPOD_API_KEY` | Injected by RunPod into every pod as a "Pod-scoped API key". Its permissions are not documented. The watchdog tries it second. |
 | `RUNPOD_TERMINATE_API_KEY` | Optional key from the app (the user's RunPod key). The watchdog tries it first. A separate name avoids clashing with RunPod's injected `RUNPOD_API_KEY`. |
 | `PORT` | Default 8000. |
+| `WORKER_REF` | Runtime image only: the git ref the code was loaded from (see [Boot sequence](#boot-sequence-bootbootpy-standard-library-only)). |
 | `HF_TOKEN`, `CIVITAI_API_KEY`, … | As in serverless mode. |
 
 Secrets are never logged. The startup line names only the key variables that are set.
@@ -80,7 +183,7 @@ Every route also answers under `/v2/<anything>/…`, so the serverless URL shape
 | `POST /run {input, policy?}` | `{id, status: "IN_QUEUE"}`. Ids look like `pod-<uuid>`. The body can be up to 32 MB. |
 | `GET /status/{id}` | `{id, status, delayTime, executionTime, output?, error?}` |
 | `POST /cancel/{id}` | `{id, status}` |
-| `GET /health` | `{jobs: {inQueue, inProgress, completed, failed}, workers: {idle, running}, ready, gpu, comfyui, watchdog: {armed, check, idleMinutes, idleForS, lastError}}` (see [Idle watchdog](#idle-watchdog)) |
+| `GET /health` | `{jobs: {inQueue, inProgress, completed, failed}, workers: {idle, running}, ready, gpu, comfyui, watchdog: {armed, check, idleMinutes, idleForS, lastError}, code?: {source: "github"\|"baked", ref, commit, error?}}` (see [Idle watchdog](#idle-watchdog)). `code` is present only on the runtime image. |
 | `GET /ping` | `{status: "ok"}`. No auth. |
 
 **Auth:** `Authorization: Bearer $API_TOKEN`, compared in constant time. A missing or wrong header gets 401 `{"error": "unauthorized"}`. An unknown or expired job id gets 404.
@@ -273,4 +376,12 @@ uv run pytest -q
   - cancelling queued jobs, running generate (interrupt), running downloads, and the real handler's cooperative download cancel
   - `executionTimeout`, the failure shape, and 30-minute expiry
   - the idle watchdog and the terminate call, with mocked HTTP and `runpodctl`: retrying every `RETRY_S` without ever exiting, reset on requests and jobs, the startup arm check and its `/health` report, and keys never reaching the logs
+- **Boot** (`tests/test_boot.py`), covering:
+  - extraction of only `worker/src` and `models.json` from a fake GitHub-style tarball
+  - rejection of path traversal, links, a second top-level dir, missing files, syntax errors, bad JSON and garbage
+  - commit parsing, from the pax header or the dir name
+  - download retries, the per-attempt deadline, 404 and the size cap
+  - fallback to the baked copy on HTTP failure, a bad tarball, a failed import check or a SHA mismatch
+  - the ComfyUI command line and handler environment
+  - a check that `boot.py` imports only the standard library
 - **Handler actions**, with a fake ComfyUI built from message and response shapes captured from a real v0.39.0 run. This includes parallel downloads with aggregate progress.

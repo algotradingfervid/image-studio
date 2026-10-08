@@ -60,6 +60,8 @@ const settings: Settings = {
   volumeNames: ["image-studio-models"],
   passApiKeyToPod: true,
   fallbackCostPerHr: GPU_COST,
+  workerRef: "main",
+  podImage: "ghcr.io/algotradingfervid/image-studio-runtime:latest",
 };
 
 const models: RegistryModel[] = registry.models;

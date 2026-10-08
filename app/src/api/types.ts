@@ -69,6 +69,10 @@ export interface Settings {
   passApiKeyToPod: boolean;
   /** USD/h used when the pod doesn't report a price. */
   fallbackCostPerHr: number;
+  /** Git ref the pod's boot script fetches worker code at (`WORKER_REF`; settings file `workerRef`, default "main"). */
+  workerRef: string;
+  /** Pod container image (settings file `podImage`; default the runtime image). */
+  podImage: string;
 }
 
 export interface SaveSettingsInput {

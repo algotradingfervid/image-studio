@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -806,3 +807,39 @@ def test_terminator_falls_back_to_runpodctl():
                           run=run)
     assert t.terminate() is True
     assert ran == [["pod", "delete", "p1"], ["remove", "pod", "p1"]]
+
+
+# ---------------------------------------------------------------------------
+# code info (runtime image, boot.py)
+# ---------------------------------------------------------------------------
+def test_code_info_reads_boot_file(tmp_path, monkeypatch):
+    monkeypatch.delenv(server.CODE_INFO_ENV, raising=False)
+    assert server.code_info() is None  # legacy image: no `code` in /health
+    p = tmp_path / "code.json"
+    monkeypatch.setenv(server.CODE_INFO_ENV, str(p))
+    assert server.code_info() is None  # file missing
+    p.write_text("[1]")
+    assert server.code_info() is None
+    p.write_text(json.dumps({"source": "github", "ref": "main", "commit": "abc", "x": 1}))
+    assert server.code_info() == {"source": "github", "ref": "main", "commit": "abc"}
+    p.write_text(json.dumps({"source": "baked", "ref": "main", "commit": None,
+                             "error": "HTTP 503"}))
+    assert server.code_info() == {"source": "baked", "ref": "main", "commit": None,
+                                  "error": "HTTP 503"}
+
+
+def test_health_includes_code_when_known():
+    mgr = server.JobManager(run_job=lambda j: {}, interrupt=lambda: None)
+    code = {"source": "github", "ref": "main", "commit": "abc"}
+    calls = []
+    health = server.Health(mgr, comfy_up=lambda: True, gpu=lambda: "G",
+                           comfy_version=lambda: "0.39.0",
+                           code=lambda: calls.append(1) or code)
+    srv = Running(server.build_app(TOKEN, mgr, health))
+    try:
+        assert srv.get("/health").json()["code"] == code
+        assert srv.get("/v2/x/health").json()["code"] == code
+        assert calls == [1]  # read once
+    finally:
+        srv.close()
+        mgr.shutdown()

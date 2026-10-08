@@ -1,7 +1,8 @@
 """Minimal client for the local ComfyUI server (HTTP + websocket).
 
-ComfyUI is started by the base image's /start.sh (python /comfyui/main.py ...
-&, PID written to /tmp/comfyui.pid) before our handler starts. We only wait
+ComfyUI is started by worker/boot/boot.py (legacy image: the base image's
+/start.sh) in the background, PID written to /tmp/comfyui.pid, before our
+handler starts. We only wait
 for it to answer.
 """
 

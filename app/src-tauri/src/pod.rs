@@ -28,7 +28,13 @@ use tokio::sync::watch;
 pub const DEFAULT_REST_ROOT: &str = "https://api.runpod.io";
 pub const DEFAULT_PROXY_TEMPLATE: &str = "https://{podId}-8000.proxy.runpod.net";
 pub const POD_NAME: &str = "image-studio-gpu";
-pub const POD_IMAGE: &str = "ghcr.io/algotradingfervid/image-studio-worker:latest";
+/// Default pod image (spec "v4"): the slim runtime image. Its boot script
+/// fetches the worker code from GitHub at `WORKER_REF` on every start.
+/// Overridable with the `podImage` config key (`Settings::pod_image`).
+pub const POD_IMAGE: &str = "ghcr.io/algotradingfervid/image-studio-runtime:latest";
+/// The pre-v4 all-in-one image (code baked in, ignores `WORKER_REF`). Set
+/// `"podImage"` to this in the settings file to switch back without a rebuild.
+pub const LEGACY_POD_IMAGE: &str = "ghcr.io/algotradingfervid/image-studio-worker:latest";
 pub const VOLUME_PATH: &str = "/runpod-volume";
 /// Display fallback before a pod reports its GPU (first default priority).
 pub const GPU_TYPE: &str = crate::settings::DEFAULT_GPU_TYPES[0];
@@ -344,17 +350,22 @@ impl RestClient {
 /// `BaseGpuConfig` takes a single `id`). `api_key` is passed to the pod as
 /// `RUNPOD_TERMINATE_API_KEY` only when `pass_api_key_to_pod` is on, for its
 /// self-terminate watchdog (RunPod injects its own `RUNPOD_API_KEY`).
+/// `image` is `Settings::pod_image`; `worker_ref` (`WORKER_REF`) is the git
+/// ref the runtime image's boot script fetches the worker code from.
 pub fn create_payload(
     vol: &VolumeInfo,
     gpu_type: &str,
     token: &str,
     idle_minutes: u32,
     api_key: Option<&str>,
+    image: &str,
+    worker_ref: &str,
 ) -> Value {
     let mut env = Map::new();
     env.insert("MODE".into(), json!("pod"));
     env.insert("API_TOKEN".into(), json!(token));
     env.insert("IDLE_MINUTES".into(), json!(idle_minutes.to_string()));
+    env.insert("WORKER_REF".into(), json!(worker_ref));
     env.insert("HF_TOKEN".into(), json!(HF_SECRET_REF));
     env.insert("CIVITAI_API_KEY".into(), json!(CIVITAI_SECRET_REF));
     if let Some(k) = api_key {
@@ -362,7 +373,7 @@ pub fn create_payload(
     }
     json!({
         "name": POD_NAME,
-        "image": POD_IMAGE,
+        "image": image,
         "cloud": "SECURE",
         "gpu": {"id": gpu_type, "count": 1},
         "dataCenterIds": [vol.data_center],
@@ -802,9 +813,20 @@ async fn create_with_fallback(
     api_key: Option<&str>,
 ) -> Result<(Value, String), CreateError> {
     let gpus = core.settings.gpu_types();
+    let image = core.settings.pod_image();
+    let worker_ref = core.settings.worker_ref();
+    eprintln!("[pod] image {image}, WORKER_REF {worker_ref}");
     let mut last = String::new();
     for gpu in &gpus {
-        let body = create_payload(vol, gpu, token, core.settings.idle_minutes(), api_key);
+        let body = create_payload(
+            vol,
+            gpu,
+            token,
+            core.settings.idle_minutes(),
+            api_key,
+            &image,
+            &worker_ref,
+        );
         match rest.create_pod(&body).await {
             Ok(pod) if pod_str(&pod, "id").is_some() => return Ok((pod, gpu.clone())),
             Ok(_) => {
@@ -1358,11 +1380,17 @@ mod tests {
             data_center: "US-NE-1".into(),
             size_gb: 100,
         };
-        let p = create_payload(&vol, "G", "tok", 30, None);
+        let p = create_payload(&vol, "G", "tok", 30, None, POD_IMAGE, "main");
         assert_eq!(p["gpu"], json!({"id": "G", "count": 1}));
+        assert_eq!(p["image"], POD_IMAGE);
         assert_eq!(p["env"]["IDLE_MINUTES"], "30");
+        assert_eq!(p["env"]["WORKER_REF"], "main");
+        assert_eq!(p["env"]["MODE"], "pod");
         assert!(p["env"].get("RUNPOD_TERMINATE_API_KEY").is_none());
-        let p = create_payload(&vol, "G", "tok", 30, Some("k"));
+        let p = create_payload(&vol, "G", "tok", 30, None, LEGACY_POD_IMAGE, "abc123");
+        assert_eq!(p["image"], LEGACY_POD_IMAGE);
+        assert_eq!(p["env"]["WORKER_REF"], "abc123");
+        let p = create_payload(&vol, "G", "tok", 30, Some("k"), POD_IMAGE, "main");
         assert_eq!(p["env"]["RUNPOD_TERMINATE_API_KEY"], "k");
         assert!(p["env"].get("RUNPOD_API_KEY").is_none());
         assert_eq!(

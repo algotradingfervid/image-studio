@@ -1,0 +1,12 @@
+# Worker runtime dependencies baked into the runtime image (worker/Dockerfile.runtime),
+# on top of ComfyUI v0.39.0's requirements.txt. torch/torchvision/torchaudio are
+# pinned in the Dockerfile (cu128 index), not here.
+# Changing this file rebuilds the runtime image (.github/workflows/runtime-image.yml).
+# Keep in sync with pyproject.toml / uv.lock (the versions the worker tests run with).
+runpod==1.12.0
+requests==2.34.2
+websocket-client==1.9.2
+# Same ceiling upstream worker-comfyui applies: transformers 5.x / huggingface-hub
+# 1.x break ComfyUI at startup.
+transformers>=4.50.3,<5
+huggingface-hub<1.0

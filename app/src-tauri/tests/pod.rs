@@ -210,7 +210,8 @@ async fn create_payload_matches_spec() {
         body,
         json!({
             "name": "image-studio-gpu",
-            "image": "ghcr.io/algotradingfervid/image-studio-worker:latest",
+            // v4: the slim runtime image; code comes from GitHub at WORKER_REF.
+            "image": "ghcr.io/algotradingfervid/image-studio-runtime:latest",
             "cloud": "SECURE",
             "gpu": {"id": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "count": 1},
             // First volume name in priority order that exists wins.
@@ -222,6 +223,7 @@ async fn create_payload_matches_spec() {
                 "MODE": "pod",
                 "API_TOKEN": token,
                 "IDLE_MINUTES": "30",
+                "WORKER_REF": "main",
                 "HF_TOKEN": "{{ RUNPOD_SECRET_image-studio-hf-token }}",
                 "CIVITAI_API_KEY": "{{ RUNPOD_SECRET_image-studio-civitai-key }}",
                 "RUNPOD_TERMINATE_API_KEY": "test-key"

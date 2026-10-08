@@ -40,6 +40,10 @@ pub struct SettingsResponse {
     pub volume_names: Vec<String>,
     pub pass_api_key_to_pod: bool,
     pub fallback_cost_per_hr: f64,
+    /// `WORKER_REF` the pod fetches worker code at (config file only).
+    pub worker_ref: String,
+    /// Pod container image (config file only).
+    pub pod_image: String,
 }
 
 fn settings_response(core: &Core) -> SettingsResponse {
@@ -52,6 +56,8 @@ fn settings_response(core: &Core) -> SettingsResponse {
         volume_names: core.settings.volume_names(),
         pass_api_key_to_pod: core.settings.pass_api_key_to_pod(),
         fallback_cost_per_hr: pod::FALLBACK_COST_PER_HR,
+        worker_ref: core.settings.worker_ref(),
+        pod_image: core.settings.pod_image(),
     }
 }
 

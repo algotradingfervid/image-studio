@@ -26,6 +26,9 @@ pub const DEFAULT_GPU_TYPES: &[&str] = &[
     "NVIDIA GeForce RTX 4090",
     "NVIDIA RTX PRO 4000 Blackwell",
 ];
+/// Git ref the pod's boot script fetches worker code from (`WORKER_REF`): a
+/// branch, tag or commit SHA of the image-studio repo (spec "v4").
+pub const DEFAULT_WORKER_REF: &str = "main";
 pub const MIN_IDLE_MINUTES: u32 = 5;
 pub const MAX_IDLE_MINUTES: u32 = 240;
 
@@ -207,6 +210,23 @@ pub struct AppConfig {
     pub volume_names: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_types: Option<Vec<String>>,
+    /// `WORKER_REF` for the pod (default "main"). Pin a commit SHA for
+    /// stability. Edited in the config file only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_ref: Option<String>,
+    /// Container image override (default `pod::POD_IMAGE`, the runtime image).
+    /// Set to `pod::LEGACY_POD_IMAGE` to go back to the all-in-one image
+    /// without an app rebuild. Edited in the config file only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_image: Option<String>,
+}
+
+/// Trimmed value, or `default` when unset or blank.
+fn str_or(v: Option<&String>, default: &str) -> String {
+    v.map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default)
+        .to_string()
 }
 
 fn list_or(v: Option<&Vec<String>>, default: &[&str]) -> Vec<String> {
@@ -321,6 +341,16 @@ impl Settings {
 
     pub fn gpu_types(&self) -> Vec<String> {
         list_or(self.config.lock().unwrap().gpu_types.as_ref(), DEFAULT_GPU_TYPES)
+    }
+
+    /// `WORKER_REF` passed to the pod (config `workerRef`, default "main").
+    pub fn worker_ref(&self) -> String {
+        str_or(self.config.lock().unwrap().worker_ref.as_ref(), DEFAULT_WORKER_REF)
+    }
+
+    /// Pod container image (config `podImage`, default the runtime image).
+    pub fn pod_image(&self) -> String {
+        str_or(self.config.lock().unwrap().pod_image.as_ref(), crate::pod::POD_IMAGE)
     }
 
     /// The pod token, generated (32 random bytes, hex) and stored on first use.
@@ -578,6 +608,42 @@ mod tests {
         assert_eq!(t.len(), 64);
         assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(r.pod_token().unwrap(), t, "generated once, then reused");
+    }
+
+    #[test]
+    fn worker_ref_and_pod_image_from_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        let store = Arc::new(MemoryStore::default());
+        let s = Settings::new(store.clone(), HashMap::new(), path.clone());
+        assert_eq!(s.worker_ref(), "main");
+        assert_eq!(s.pod_image(), crate::pod::POD_IMAGE);
+        assert!(crate::pod::POD_IMAGE.contains("image-studio-runtime"));
+
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"workerRef": " 0123456789abcdef0123456789abcdef01234567 ", "podImage": "{}"}}"#,
+                crate::pod::LEGACY_POD_IMAGE
+            ),
+        )
+        .unwrap();
+        let r = Settings::new(store.clone(), HashMap::new(), path.clone());
+        assert_eq!(r.worker_ref(), "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(r.pod_image(), crate::pod::LEGACY_POD_IMAGE);
+        // Saving other settings keeps the hand-edited keys.
+        r.save_pod(SavePodSettings {
+            idle_minutes: Some(20),
+            ..Default::default()
+        })
+        .unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("\"workerRef\"") && body.contains("\"podImage\""), "{body}");
+
+        std::fs::write(&path, r#"{"workerRef": "  ", "podImage": ""}"#).unwrap();
+        let b = Settings::new(store, HashMap::new(), path);
+        assert_eq!(b.worker_ref(), DEFAULT_WORKER_REF, "blank → default");
+        assert_eq!(b.pod_image(), crate::pod::POD_IMAGE);
     }
 }
 

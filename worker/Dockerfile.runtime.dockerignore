@@ -1,0 +1,10 @@
+# BuildKit reads <Dockerfile>.dockerignore next to the Dockerfile. The build
+# context is the repo root; the runtime image needs the boot scripts, the
+# runtime requirements and the code it bakes in as the offline fallback.
+*
+!shared/models.json
+!worker/src/
+!worker/boot/
+!worker/requirements-runtime.txt
+**/__pycache__
+**/*.pyc

@@ -10,13 +10,11 @@
 # New GHCR packages are private: make it public once (see docs/setup.md).
 name: worker-image
 
+# LEGACY (since v4, 2026-10-09): manual dispatch only. Pods now run the slim
+# runtime image (runtime-image.yml) and fetch worker code from GitHub at boot.
+# This all-in-one image is kept as a fallback: build it by hand, then set
+# "podImage" in the app's settings file (see worker/README.md).
 on:
-  push:
-    branches: [main]
-    paths:
-      - "worker/**"
-      - "shared/**"
-      - ".github/workflows/worker-image.yml"
   workflow_dispatch:
 
 permissions:
