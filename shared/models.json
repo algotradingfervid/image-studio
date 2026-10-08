@@ -116,7 +116,7 @@
           "filename": "flux-2-klein-9b-fp8.safetensors",
           "url": "https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8/resolve/main/flux-2-klein-9b-fp8.safetensors",
           "sizeBytes": 9433061528,
-          "sha256": null,
+          "sha256": "865ba09f5b4c3cbd3468a4bd3acb9fcb2f8740c54317482f0bcd4ed1d3655cee",
           "gated": true
         },
         {
