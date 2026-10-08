@@ -19,6 +19,10 @@ import runpod_common as rc  # noqa: E402
 import runpod_setup as rs  # noqa: E402
 import runpod_teardown as rt  # noqa: E402
 
+# The planning tests below run against a fixed catalog snapshot, so they use a
+# fixed wanted-GPU list rather than the live config in runpod_setup.WANTED_GPUS.
+FIXTURE_WANTED = ["NVIDIA GeForce RTX 5090", "NVIDIA L40S", "NVIDIA RTX A6000"]
+
 ENV_TEXT = """# RunPod credentials
 # keep me
 
@@ -105,13 +109,13 @@ class EnvFileTests(unittest.TestCase):
 
 class PayloadTests(unittest.TestCase):
     def test_select_gpus_strict(self):
-        g = rs.select_gpus(CATALOG_GPUS, rs.WANTED_GPUS)
+        g = rs.select_gpus(CATALOG_GPUS, FIXTURE_WANTED)
         self.assertEqual(g["pools"], ["ADA_32_PRO", "ADA_48_PRO", "AMPERE_48"])
         self.assertEqual(g["excludedTypes"], ["NVIDIA A40", "NVIDIA L40", "NVIDIA RTX 6000 Ada Generation"])
-        self.assertEqual(sorted(g["types"]), sorted(rs.WANTED_GPUS))
+        self.assertEqual(sorted(g["types"]), sorted(FIXTURE_WANTED))
 
     def test_select_gpus_wide(self):
-        g = rs.select_gpus(CATALOG_GPUS, rs.WANTED_GPUS, wide=True)
+        g = rs.select_gpus(CATALOG_GPUS, FIXTURE_WANTED, wide=True)
         self.assertEqual(g["excludedTypes"], [])
         self.assertIn("NVIDIA A40", g["types"])
         self.assertNotIn("NVIDIA GeForce RTX 4090", g["types"])
@@ -121,12 +125,13 @@ class PayloadTests(unittest.TestCase):
             rs.select_gpus(CATALOG_GPUS, ["NVIDIA Imaginary 9000"])
 
     def test_fallback_catalog_matches_wanted(self):
+        # The real config must resolve against the offline fallback catalog.
         g = rs.select_gpus(rs.fallback_catalog(), rs.WANTED_GPUS)
-        self.assertEqual(g["pools"], ["ADA_32_PRO", "ADA_48_PRO", "AMPERE_48"])
+        self.assertEqual(g["pools"], ["BLACKWELL_32", "ADA_32_PRO", "BLACKWELL_96"])
 
     def test_rank_datacenters(self):
-        types = rs.select_gpus(CATALOG_GPUS, rs.WANTED_GPUS)["types"]
-        ranked = rs.rank_datacenters(DATACENTERS, CATALOG_GPUS, types, rs.WANTED_GPUS)
+        types = rs.select_gpus(CATALOG_GPUS, FIXTURE_WANTED)["types"]
+        ranked = rs.rank_datacenters(DATACENTERS, CATALOG_GPUS, types, FIXTURE_WANTED)
         ids = [r["id"] for r in ranked]
         self.assertEqual(ids, ["EU-RO-1", "US-TX-3"])  # EUR-IS-2 / CA-MTL-1 lack STANDARD volumes
         # EU-RO-1: 5090 LOW (9*1) + A6000 HIGH (1*3) = 12; US-TX-3: L40S MEDIUM (4*2) = 8, L40 excluded
@@ -156,7 +161,7 @@ class PayloadTests(unittest.TestCase):
 
     def _desired(self, **over):
         kw = dict(image="ghcr.io/o/image-studio-worker:latest", env={"HF_TOKEN": "{{ RUNPOD_SECRET_x }}"},
-                  gpu=rs.select_gpus(CATALOG_GPUS, rs.WANTED_GPUS), datacenter="EU-RO-1", volume_id="vol1",
+                  gpu=rs.select_gpus(CATALOG_GPUS, FIXTURE_WANTED), datacenter="EU-RO-1", volume_id="vol1",
                   disk_gb=20, timeout_ms=600000, workers_max=2, idle_timeout=5, min_cuda="12.8",
                   flashboot="FLASHBOOT", registry_id=None)
         kw.update(over)
@@ -274,8 +279,11 @@ class SetupFlowTests(unittest.TestCase):
         os.chmod(self.env, 0o600)
         self._environ = mock.patch.dict(os.environ, {}, clear=True)
         self._environ.start()
+        self._wanted = mock.patch.object(rs, "WANTED_GPUS", FIXTURE_WANTED)
+        self._wanted.start()
 
     def tearDown(self):
+        self._wanted.stop()
         self._environ.stop()
         self.dir.cleanup()
 

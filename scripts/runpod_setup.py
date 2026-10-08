@@ -49,15 +49,22 @@ DEFAULT_VOLUME_GB = 100
 DEFAULT_CONTAINER_DISK_GB = 20  # the image itself is not counted; worker-comfyui "base" needs ~5 GB
 DEFAULT_TIMEOUT_MS = 600_000  # generation; downloads pass policy.executionTimeout per request
 DEFAULT_MIN_CUDA = "12.8"  # RTX 5090 (Blackwell) needs CUDA >= 12.8
-FALLBACK_DATACENTER = "EU-RO-1"
+FALLBACK_DATACENTER = "EU-RO-1"  # image-studio-models volume lives here
 
-# Spec priority: RTX 5090, then L40S, then A6000. Type ids as in GET /v2/catalog/gpus.
-WANTED_GPUS = ["NVIDIA GeForce RTX 5090", "NVIDIA L40S", "NVIDIA RTX A6000"]
+# EU-RO-1 (where the volume lives) has serverless stock for these, cheapest first:
+# RTX PRO 4500 Blackwell 32 GB ($1.15/h), RTX 5090 32 GB ($1.58/h), RTX PRO 6000 96 GB ($3.49/h).
+# Type ids as in GET /v2/catalog/gpus.
+WANTED_GPUS = ["NVIDIA RTX PRO 4500 Blackwell", "NVIDIA GeForce RTX 5090",
+               "NVIDIA RTX PRO 6000 Blackwell Server Edition"]
 
 # Used only when the catalog cannot be read (offline dry run). Snapshot of
 # GET /v2/catalog/gpus on 2026-10-08: serverless pool -> member GPU type ids.
 FALLBACK_POOLS = {
+    "BLACKWELL_32": ["NVIDIA B300 SXM6 AC MIG 1g.34gb", "NVIDIA RTX PRO 4500 Blackwell"],
     "ADA_32_PRO": ["NVIDIA GeForce RTX 5090"],
+    "BLACKWELL_96": ["NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+                     "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"],
     "ADA_48_PRO": ["NVIDIA L40", "NVIDIA L40S", "NVIDIA RTX 6000 Ada Generation",
                    "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 2g.48gb"],
     "AMPERE_48": ["NVIDIA A40", "NVIDIA RTX A6000"],
