@@ -312,3 +312,56 @@ A change only under `worker/src/` or `shared/` builds nothing. Bumping torch, Co
 To switch back to the legacy image without rebuilding the app, set `"podImage": "ghcr.io/algotradingfervid/image-studio-worker:latest"` in the app's settings file (`~/Library/Application Support/com.naren.imagestudio/settings.json`), then Stop and Start the GPU. The legacy image ignores `WORKER_REF`.
 
 **Legacy image:** `worker/Dockerfile` (FROM `runpod/worker-comfyui:5.10.0-base-cuda12.8.1`) is kept unchanged. `.github/workflows/worker-image.yml` now runs by manual dispatch only.
+
+---
+
+## v5 (2026-10-09): video generation — MiniMax H3 + LTX-2.5 (text→video and image→video, with audio)
+
+**Where.** Video runs in **CA-MTL-3** (Canada) on its own volume, `image-studio-video` (`v7hzxkm304`, 150 GB). MiniMax H3's licence excludes running it in the EU, UK, South Korea and USA, so video must never be placed in EU-RO-1 or any `US-*` / `EU-*` datacenter. Images stay in EU-RO-1.
+
+**GPUs.** Pod GPUs are tried in order: **RTX PRO 6000 Blackwell Server Edition 96 GB**, then H200, then H100 80 GB. Only cards with 80 GB or more are listed; the app tries each one that the video datacenter offers.
+
+**Models**, in a new `videoModels` array in `shared/models.json` (same file schema as `models`):
+- **`h3`** — MiniMax H3, from Comfy-Org/MiniMax-H3. Licence: MiniMax H3 Community (excluded territories: EU/UK/KR/US; commercial products over $20M revenue need permission; commercial UIs must display "MiniMax H3").
+  - `unet/minimax_h3_fl2va_pruned_fp8_scaled.safetensors` (20.96 GB)
+  - `clip/qwen3vl_32b_minimax_h3_int8_convrot.safetensors` (27.14 GB)
+  - `vae/minimax_h3_video_vae_fp16.safetensors` (5.21 GB)
+  - `vae/minimax_h3_audio_vae_fp32.safetensors` (0.61 GB)
+  - The worker agent must confirm from the official Comfy H3 templates that `fl2va` (first/last frame → audio + video) covers both text→video and image→video, and must list any other required file.
+- **`ltx25`** — LTX-2.5 distilled, from Lightricks/LTX-2.5 (gated: the licence must be accepted on Hugging Face). Licence: LTX-2.x Community (free under $10M revenue).
+  - `unet/ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors` (21.5 GB)
+  - `clip/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors` (15.4 GB)
+  - `vae/ltx-2.5-video-vae-bf16.safetensors`
+  - `vae/ltx-2.5-audio-vae-bf16.safetensors`
+  - Exact sizes and sha256 come from the Hugging Face tree API.
+
+Each video model entry carries:
+- `modes: ["t2v", "i2v"]`
+- `audio: true`
+- `volume: "image-studio-video"`
+- `defaults: {durationS, fps, resolution, steps, cfg}`, taken from the official templates
+- `limits: {maxDurationS, resolutions: [...], fpsOptions: [...]}`, also from the templates
+
+**Worker.** A new action, `generate_video`:
+- **Input:** `model, prompt, negativePrompt?, initImage?: {name, base64}` (i2v), `durationS, fps, resolution, seed, steps?, cfg?, audio: bool`.
+- **Output:** `{video: {base64, mime: "video/mp4", width, height, fps, frames, durationS, hasAudio}, poster: {base64 (jpeg)}, timings}`.
+- **Graph building:** graphs are built in `workflows.py` from the official Comfy templates for H3 and LTX-2.5, and the MP4 (H.264 + AAC) is saved through ComfyUI's video save nodes.
+- **Progress:** the same stage and progress shape as images, plus `video_decoding`, `audio_decoding` and `encoding_video` stages.
+- **Validation:** checked against the v0.39.0 `object_info` fixture, and any missing node is added from the ComfyUI source.
+
+**App.**
+- **Pods per profile.** The GPU pod manager supports two profiles, each with the full billing-safety logic (adopt, stop-all-by-name, idle auto-stop, quit dialog listing every running pod):
+  - `image` — the existing pod `image-studio-gpu`, volume list `["image-studio-models"]`
+  - `video` — pod `image-studio-video-gpu`, volume list `["image-studio-video"]`, the GPU list above
+- **Header.** The header shows a GPU pill for each profile that is not stopped.
+- **Video screen.** The Create screen gets an **Image / Video** switch. Video mode has:
+  - a model picker (H3, LTX-2.5)
+  - an optional start image (that makes it i2v)
+  - a prompt
+  - duration, resolution and fps selectors (from the model's `limits`)
+  - an audio toggle
+  - seed
+  - an advanced section with steps and cfg
+  - a job card with stages and an ETA
+- **Gallery and storage.** The gallery shows video tiles (poster image plus duration badge; plays muted on hover). The lightbox plays the video with sound and offers Download (.mp4) and Use these settings. Records live in the same `images` table with `kind = 'video'` and extra columns: duration, fps, hasAudio, posterPath.
+- **Models screen.** The Models screen lists the video models under their own heading, showing their region.
