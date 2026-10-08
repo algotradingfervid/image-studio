@@ -39,7 +39,7 @@ from runpod_common import (  # noqa: E402
     write_env_value,
 )
 
-VOLUME_NAME = "image-studio-models-us"  # US-NE-1 (H100); EU-RO-1 copy was image-studio-models
+VOLUME_NAME = "image-studio-models"  # EU-RO-1; the US-NE-1 copy was deleted 2026-10-09
 ENDPOINT_NAME = "image-studio-worker"
 REGISTRY_NAME = "image-studio-ghcr"
 SECRET_NAMES = {"HF_TOKEN": "image-studio-hf-token", "CIVITAI_API_KEY": "image-studio-civitai-key"}
@@ -49,7 +49,7 @@ DEFAULT_VOLUME_GB = 100
 DEFAULT_CONTAINER_DISK_GB = 20  # the image itself is not counted; worker-comfyui "base" needs ~5 GB
 DEFAULT_TIMEOUT_MS = 600_000  # generation; downloads pass policy.executionTimeout per request
 DEFAULT_MIN_CUDA = "12.8"  # RTX 5090 (Blackwell) needs CUDA >= 12.8
-FALLBACK_DATACENTER = "US-NE-1"  # image-studio-models-us volume lives here
+FALLBACK_DATACENTER = "EU-RO-1"  # image-studio-models volume lives here
 
 # US-NE-1 (where the volume lives), fastest first, per the user's choice of speed over cost:
 # H100 80 GB ($4.79/h), RTX PRO 6000 96 GB ($3.49/h), RTX PRO 6000 MIG 48 GB slice ($1.75/h).

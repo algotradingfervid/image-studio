@@ -259,3 +259,5 @@ Reason: in testing, serverless flex workers waited 16.5 min for a free GPU (ever
 4. RTX PRO 4000 Blackwell 24 GB
 
 Both the volume list and the GPU list are configurable. The serverless endpoint is stopped (max workers 0) and detached from all volumes. The US-NE-1 volume `image-studio-models-us` is a temporary backup, pending deletion once EU-RO-1 has produced its first image.
+
+**v3 update (2026-10-09):** the US-NE-1 backup volume was deleted. EU-RO-1 `image-studio-models` is the only volume.
