@@ -127,7 +127,7 @@ class PayloadTests(unittest.TestCase):
     def test_fallback_catalog_matches_wanted(self):
         # The real config must resolve against the offline fallback catalog.
         g = rs.select_gpus(rs.fallback_catalog(), rs.WANTED_GPUS)
-        self.assertEqual(g["pools"], ["BLACKWELL_32", "ADA_32_PRO", "BLACKWELL_96", "ADA_24"])
+        self.assertEqual(g["pools"], ["BLACKWELL_32", "ADA_32_PRO", "BLACKWELL_96", "ADA_24", "AMPERE_80"])
 
     def test_rank_datacenters(self):
         types = rs.select_gpus(CATALOG_GPUS, FIXTURE_WANTED)["types"]
