@@ -13,6 +13,12 @@
 // video model's files are present; default: MiniMax H3 installed, LTX-2.5 not). Video records'
 // `path` is `mock-video://<id>.mp4`, which the browser can't load, so the UI shows the poster.
 //
+// Vault (spec v6): by default no vault exists (first use: "Create vault" migrates the gallery).
+// ?vault — a vault already exists (password "password123", locked) holding a few items;
+// ?fastLock — an auto-lock "minute" lasts 5 s. Wrong passwords reject with WRONG_PASSWORD;
+// unlocking waits ~1 s like Argon2. Vault media are data URLs here (vault:// in the app); a
+// vault reference's refId is a vault://localhost/… URL like the core's, its thumbPath a data URL.
+//
 // Quit flow: a browser tab can't intercept closing with an in-app dialog, so call
 // `window.mockQuit()` from the console to simulate ⌘Q (`quit-requested` when a pod
 // may be billing); `confirm_quit` then logs instead of exiting.
@@ -24,6 +30,9 @@ import type {
   AddLoraInput,
   ConnectionTest,
   DeletePreview,
+  Destination,
+  MigrationProgress,
+  VaultStatus,
   EventMap,
   GenerateInput,
   GenerateVideoInput,
@@ -695,6 +704,129 @@ if (!params.has("empty")) {
   }
 }
 
+// ---------- vault (spec v6) ----------
+
+/** One auto-lock "minute" (?fastLock: 5 s). */
+const VAULT_MINUTE_MS = params.has("fastLock") ? 5000 : 60_000;
+
+const vault = {
+  exists: false,
+  unlocked: false,
+  password: "",
+  autoLockMinutes: 10,
+  /** Sealed items (decrypted only while unlocked in the real core). */
+  items: [] as ImageRecord[],
+  migrating: false,
+  lastTouch: Date.now(),
+};
+
+const vaultStatus = (): VaultStatus => ({
+  exists: vault.exists,
+  unlocked: vault.unlocked,
+  autoLockMinutes: vault.autoLockMinutes,
+  itemCount: vault.unlocked ? vault.items.length : null,
+  migrationPending: vault.migrating && !vault.unlocked,
+});
+
+function emitVault() {
+  emit("vault-update", vaultStatus());
+}
+
+function lockVault() {
+  if (!vault.unlocked) return;
+  vault.unlocked = false;
+  emitVault();
+}
+
+function requireUnlocked() {
+  if (!vault.exists) throw new Error("NO_VAULT: Create a vault first.");
+  if (!vault.unlocked) throw new Error("VAULT_LOCKED: Unlock the vault first.");
+}
+
+/** A vault start image needs the unlocked key (it is decrypted and sent to the pod). */
+function checkVaultStart(id: string | undefined, destination: unknown, refIds: (string | undefined)[] = []) {
+  if (destination === "vault" && !vault.exists) throw new Error("NO_VAULT: Create a vault first.");
+  const vaultRefs = refIds.some((r) => !!r && r.startsWith("vault:"));
+  if (destination !== "vault" && (id || vaultRefs)) throw new Error("A vault start image or reference can only be used when saving to the vault.");
+  if (!id) return;
+  requireUnlocked();
+  const rec = vault.items.find((x) => x.id === id);
+  if (!rec) throw new Error("That vault item no longer exists; please choose another start image");
+  if (rec.kind === "video") throw new Error("A video can't be a start image; choose an image");
+}
+
+/** A record as the vault returns it: `vault: true` plus a grid thumbnail. */
+const asVaultItem = (rec: ImageRecord): ImageRecord => ({ ...rec, vault: true, thumbPath: rec.kind === "video" ? (rec.posterPath ?? null) : rec.path });
+
+function insertNewestFirst(list: ImageRecord[], rec: ImageRecord) {
+  const t = Date.parse(rec.createdAt);
+  const at = list.findIndex((x) => Date.parse(x.createdAt) < t);
+  if (at < 0) list.push(rec);
+  else list.splice(at, 0, rec);
+}
+
+/** A finished output goes to the gallery or is sealed into the vault (locked or not). */
+function saveOutput(rec: ImageRecord, destination: Destination) {
+  if (destination === "vault") {
+    Object.assign(rec, asVaultItem(rec));
+    vault.items.unshift(rec);
+  } else {
+    images.unshift(rec);
+  }
+}
+
+/** One-time migration of every existing gallery record into the vault. */
+async function runMigration() {
+  vault.migrating = true;
+  const total = images.length;
+  const p: MigrationProgress = {
+    phase: "encrypting",
+    done: 0,
+    total,
+    counts: { images: 0, videos: 0, posters: 0, startImages: 0, references: 0 },
+    errors: 0,
+    error: null,
+  };
+  emit("vault-migration", p);
+  while (images.length) {
+    await sleep(total > 30 ? 90 : 160);
+    p.phase = p.done % 3 === 2 ? "verifying" : "encrypting";
+    const rec = images.shift()!;
+    insertNewestFirst(vault.items, asVaultItem(rec));
+    if (rec.kind === "video") p.counts.videos++;
+    else p.counts.images++;
+    if (rec.posterPath) p.counts.posters++;
+    if (rec.initImage) p.counts.startImages++;
+    p.counts.references += rec.references.length;
+    p.done++;
+    emit("vault-migration", p);
+  }
+  p.phase = "cleaning";
+  emit("vault-migration", p);
+  await sleep(600);
+  p.phase = "done";
+  vault.migrating = false;
+  emit("vault-migration", p);
+  emitVault();
+}
+
+// Auto-lock after N minutes without `vault_touch`.
+window.setInterval(() => {
+  if (vault.unlocked && Date.now() - vault.lastTouch >= vault.autoLockMinutes * VAULT_MINUTE_MS) {
+    console.info("[mock] Vault auto-locked after inactivity.");
+    lockVault();
+  }
+}, 1000);
+
+// ?vault: a vault already exists (locked) with a few items moved in.
+if (params.has("vault")) {
+  vault.exists = true;
+  vault.password = "password123";
+  for (const rec of images.splice(2, 6)) vault.items.push(asVaultItem(rec));
+}
+
+(window as unknown as { mockLockVault: () => void }).mockLockVault = lockVault;
+
 // ---------- generate progress (mirror of worker/src/handler.py StageTracker) ----------
 
 const STAGE_PHASE: Record<string, string> = {
@@ -728,7 +860,7 @@ async function pause(ms: number, cancelled: () => boolean): Promise<boolean> {
 async function runStages(job: Job, input: GenerateInput, steps: number, cold: boolean, cancelled: () => boolean): Promise<boolean | "failed"> {
   const warm = loadedModels.image.has(input.model);
   const refsUsed = input.referenceIds.length > 0;
-  const initUsed = !!input.initImageId;
+  const initUsed = !!(input.initImageId || input.initImageVaultId || input.initImageGalleryId);
   const stages = [
     "loading_text_encoder",
     "encoding_prompt",
@@ -837,9 +969,16 @@ async function runJob(jobId: string, input: GenerateInput) {
   const steps = input.steps || m.defaults.steps || 30;
   const cfg = input.cfg ?? (m.defaults.cfg || 4);
   const baseSeed = input.seed ?? nextSeed();
-  const initPath = input.initImageId ? (refs.get(input.initImageId) ?? null) : null;
+  const initPath = input.initImageVaultId
+    ? (vault.items.find((x) => x.id === input.initImageVaultId)?.path ?? null)
+    : input.initImageGalleryId
+      ? (images.find((x) => x.id === input.initImageGalleryId)?.path ?? null)
+      : input.initImageId
+        ? (refs.get(input.initImageId) ?? null)
+        : null;
   const initSize = initPath ? initImageSize(...(await loadImageSize(initPath))) : null;
-  const job: Job = { jobId, kind: "image", status: "queued", total: input.count, completed: 0, progress: null, images: [], error: null };
+  const destination: Destination = input.destination === "vault" ? "vault" : "general";
+  const job: Job = { jobId, kind: "image", status: "queued", total: input.count, completed: 0, progress: null, images: [], error: null, destination };
   const cancelled = () => jobCancel.has(jobId);
   const stop = (status: Job["status"], error: string | null = null) => {
     job.status = status;
@@ -906,11 +1045,12 @@ async function runJob(jobId: string, input: GenerateInput) {
       delayMs,
       executionMs: Date.now() - execStart + 1200,
     });
-    images.unshift(rec);
+    saveOutput(rec, destination);
     job.images = [...job.images, rec];
     job.completed = k + 1;
     warmUntil = Date.now() + 20_000;
     emit("job-update", job);
+    if (destination === "vault") emitVault();
   }
   stop("completed");
 }
@@ -918,7 +1058,7 @@ async function runJob(jobId: string, input: GenerateInput) {
 /** Video stage checklist (same progress shape as runStages). */
 async function runVideoStages(job: Job, input: GenerateVideoInput, steps: number, cancelled: () => boolean): Promise<boolean | "failed"> {
   const warm = loadedModels.video.has(input.model);
-  const initUsed = !!(input.initImageId || input.initImageGalleryId);
+  const initUsed = !!(input.initImageId || input.initImageGalleryId || input.initImageVaultId);
   const stages = [
     "loading_text_encoder",
     "encoding_prompt",
@@ -1010,12 +1150,15 @@ async function runVideoJob(jobId: string, input: GenerateVideoInput) {
   const cfg = input.cfg ?? m.defaults.cfg ?? 5;
   const seed = input.seed ?? nextSeed();
   // Gallery start image: read in place (the record's own file), like the Rust core.
-  const initPath = input.initImageGalleryId
-    ? (images.find((x) => x.id === input.initImageGalleryId)?.path ?? null)
-    : input.initImageId
-      ? (refs.get(input.initImageId) ?? null)
-      : null;
-  const job: Job = { jobId, kind: "video", status: "queued", total: 1, completed: 0, progress: null, images: [], error: null };
+  const initPath = input.initImageVaultId
+    ? (vault.items.find((x) => x.id === input.initImageVaultId)?.path ?? null)
+    : input.initImageGalleryId
+      ? (images.find((x) => x.id === input.initImageGalleryId)?.path ?? null)
+      : input.initImageId
+        ? (refs.get(input.initImageId) ?? null)
+        : null;
+  const destination: Destination = input.destination === "vault" ? "vault" : "general";
+  const job: Job = { jobId, kind: "video", status: "queued", total: 1, completed: 0, progress: null, images: [], error: null, destination };
   const cancelled = () => jobCancel.has(jobId);
   const stop = (status: Job["status"], error: string | null = null) => {
     job.status = status;
@@ -1064,10 +1207,11 @@ async function runVideoJob(jobId: string, input: GenerateVideoInput) {
     executionMs: Date.now() - execStart + 1200,
     initImage: initPath,
   });
-  images.unshift(rec);
+  saveOutput(rec, destination);
   job.images = [rec];
   job.completed = 1;
   emit("job-update", job);
+  if (destination === "vault") emitVault();
   stop("completed");
 }
 
@@ -1076,7 +1220,7 @@ async function runVideoJob(jobId: string, input: GenerateVideoInput) {
 type Handler = (args: Record<string, unknown>) => unknown | Promise<unknown>;
 
 const commands: Record<string, Handler> = {
-  get_settings: () => ({ ...settings }),
+  get_settings: () => ({ ...settings, vaultAutoLockMinutes: vault.autoLockMinutes }),
   save_settings: async (a) => {
     const i = a as SaveSettingsInput;
     await sleep(250);
@@ -1288,16 +1432,19 @@ const commands: Record<string, Handler> = {
   import_reference: async (a) => {
     const path = String(a.path);
     await sleep(120);
-    const refId = uid("ref");
-    refs.set(refId, path);
-    return { refId, thumbPath: path };
+    // A vault:// path (a vault item's start image / reference) always re-imports into the vault.
+    const dest = path.startsWith("vault:") || a.destination === "vault" ? "vault" : "general";
+    return importRef(refs.get(path) ?? path, dest);
   },
   import_reference_bytes: async (a) => {
     await sleep(120);
-    const dataUrl = `data:${String(a.mime)};base64,${String(a.base64)}`;
-    const refId = uid("ref");
-    refs.set(refId, dataUrl);
-    return { refId, thumbPath: dataUrl };
+    return importRef(`data:${String(a.mime)};base64,${String(a.base64)}`, a.destination === "vault" ? "vault" : "general");
+  },
+  seal_reference: async (a) => {
+    const src = refs.get(String(a.refId));
+    if (!src) throw new Error("The reference is missing; please add it again");
+    await sleep(150);
+    return importRef(src, "vault");
   },
   generate: (a) => {
     requireConfigured();
@@ -1308,8 +1455,10 @@ const commands: Record<string, Handler> = {
     if (missing.length) throw new Error(`MODEL_NOT_INSTALLED: ${missing.join(", ")}`);
     if (i.referenceIds.length > m.maxReferences) throw new Error(`${m.name} accepts at most ${m.maxReferences} references.`);
     if (i.loras.length > 3) throw new Error("At most 3 LoRAs per generation.");
-    if (i.initImageId && !m.supportsImg2Img) throw new Error(`${m.name} does not take a start image`);
+    if ((i.initImageId || i.initImageVaultId || i.initImageGalleryId) && !m.supportsImg2Img) throw new Error(`${m.name} does not take a start image`);
     if (i.initImageId && !refs.has(i.initImageId)) throw new Error("The start image is missing; please add it again");
+    if (i.initImageGalleryId && !images.some((x) => x.id === i.initImageGalleryId)) throw new Error("That gallery image no longer exists; please choose another start image");
+    checkVaultStart(i.initImageVaultId, i.destination, [i.initImageId, ...i.referenceIds]);
     const jobId = uid("job");
     void runJob(jobId, i);
     return { jobId };
@@ -1322,7 +1471,8 @@ const commands: Record<string, Handler> = {
     const missing = m.files.filter((f) => !present.has(f.filename)).map((f) => f.filename);
     if (missing.length) throw new Error(`MODEL_NOT_INSTALLED: ${missing.join(", ")}`);
     if (!i.prompt?.trim()) throw new Error("Write a prompt first.");
-    if ((i.initImageId || i.initImageGalleryId) && !(m.modes ?? []).includes("i2v")) throw new Error(`${m.name} does not take a start image`);
+    if ((i.initImageId || i.initImageGalleryId || i.initImageVaultId) && !(m.modes ?? []).includes("i2v")) throw new Error(`${m.name} does not take a start image`);
+    checkVaultStart(i.initImageVaultId, i.destination, [i.initImageId]);
     if (i.initImageId && i.initImageGalleryId) throw new Error("Pass either initImageId or initImageGalleryId, not both.");
     if (i.initImageId && !refs.has(i.initImageId)) throw new Error("The start image is missing; please add it again");
     if (i.initImageGalleryId) {
@@ -1353,23 +1503,129 @@ const commands: Record<string, Handler> = {
     return { items, nextBefore: all.length > limit && last ? Date.parse(String(last.createdAt)) : null };
   },
   delete_image: async (a) => {
+    if (vault.items.some((x) => x.id === a.id)) return commands.delete_vault_item(a);
     await sleep(150);
     const idx = images.findIndex((im) => im.id === a.id);
     if (idx >= 0) images.splice(idx, 1);
   },
+  // ---------- vault (spec v6) ----------
+  vault_status: () => vaultStatus(),
+  vault_create: async (a) => {
+    const password = String(a.password ?? "");
+    if (vault.exists) throw new Error("VAULT_EXISTS: A vault already exists.");
+    if (password.length < 8) throw new Error("WEAK_PASSWORD: Use at least 8 characters.");
+    await sleep(1000); // key generation + Argon2id
+    vault.exists = true;
+    vault.password = password;
+    vault.unlocked = true;
+    vault.lastTouch = Date.now();
+    emitVault();
+    void runMigration();
+    return vaultStatus();
+  },
+  vault_unlock: async (a) => {
+    if (!vault.exists) throw new Error("NO_VAULT: Create a vault first.");
+    await sleep(1000); // Argon2id
+    if (String(a.password ?? "") !== vault.password) throw new Error("WRONG_PASSWORD: The password is incorrect.");
+    vault.unlocked = true;
+    vault.lastTouch = Date.now();
+    emitVault();
+    return vaultStatus();
+  },
+  vault_lock: () => {
+    lockVault();
+    return vaultStatus();
+  },
+  vault_change_password: async (a) => {
+    requireUnlocked();
+    await sleep(1000);
+    if (String(a.oldPassword ?? "") !== vault.password) throw new Error("WRONG_PASSWORD: The current password is incorrect.");
+    const next = String(a.newPassword ?? "");
+    if (next.length < 8) throw new Error("WEAK_PASSWORD: Use at least 8 characters.");
+    vault.password = next;
+    emitVault();
+    return vaultStatus();
+  },
+  vault_set_auto_lock: async (a) => {
+    const n = Number(a.minutes);
+    if (!Number.isInteger(n) || n < 1 || n > 240) throw new Error("Auto-lock must be between 1 and 240 minutes.");
+    await sleep(150);
+    vault.autoLockMinutes = n;
+    vault.lastTouch = Date.now();
+    emitVault();
+    return vaultStatus();
+  },
+  vault_touch: () => {
+    if (vault.unlocked) vault.lastTouch = Date.now();
+  },
+  list_vault_items: async () => {
+    requireUnlocked();
+    await sleep(200);
+    return vault.items;
+  },
+  delete_vault_item: async (a) => {
+    requireUnlocked();
+    await sleep(150);
+    const idx = vault.items.findIndex((x) => x.id === a.id);
+    if (idx < 0) throw new Error("Vault item not found");
+    vault.items.splice(idx, 1);
+    emitVault();
+  },
+  move_to_vault: async (a) => {
+    requireUnlocked();
+    const idx = images.findIndex((x) => x.id === a.id);
+    if (idx < 0) throw new Error("Image not found");
+    await sleep(400); // encrypt, verify, delete the plaintext
+    const [rec] = images.splice(idx, 1);
+    const moved = asVaultItem(rec);
+    insertNewestFirst(vault.items, moved);
+    emitVault();
+    return moved;
+  },
+  move_to_general: async (a) => {
+    requireUnlocked();
+    const idx = vault.items.findIndex((x) => x.id === a.id);
+    if (idx < 0) throw new Error("Vault item not found");
+    await sleep(400);
+    const [rec] = vault.items.splice(idx, 1);
+    const moved: ImageRecord = { ...rec, vault: false, thumbPath: null };
+    insertNewestFirst(images, moved);
+    emitVault();
+    return moved;
+  },
+  export_vault_item: async (a) => {
+    requireUnlocked();
+    const im = vault.items.find((x) => x.id === a.id);
+    if (!im) throw new Error("Vault item not found");
+    downloadRecord(im, String(a.dest));
+  },
+
   export_image: async (a) => {
+    if (vault.items.some((x) => x.id === a.id)) return commands.export_vault_item({ id: a.id, dest: a.destPath });
     const im = images.find((x) => x.id === a.id);
     if (!im) throw new Error("Image not found");
-    if (im.kind === "video") {
-      console.info(`[mock] The .mp4 for ${im.id} would be saved to ${String(a.destPath)}.`);
-      return;
-    }
-    const link = document.createElement("a");
-    link.href = im.path;
-    link.download = String(a.destPath).split("/").pop() || "image.jpg";
-    link.click();
+    downloadRecord(im, String(a.destPath));
   },
 };
+
+/** Mock refs: a vault ref's refId is a vault:// URL (like the core); its thumbPath stays displayable. */
+function importRef(src: string, dest: Destination) {
+  if (dest === "vault" && !vault.exists) throw new Error("NO_VAULT: Create a vault first.");
+  const refId = dest === "vault" ? `vault://localhost/${uid("blob")}.png` : uid("ref");
+  refs.set(refId, src);
+  return { refId, thumbPath: src };
+}
+
+function downloadRecord(im: ImageRecord, dest: string) {
+  if (im.kind === "video") {
+    console.info(`[mock] The .mp4 for ${im.id} would be saved to ${dest}.`);
+    return;
+  }
+  const link = document.createElement("a");
+  link.href = im.path;
+  link.download = dest.split("/").pop() || "image.jpg";
+  link.click();
+}
 
 export function createMockBackend(): Backend {
   console.info("[Image Studio] Running with the in-memory dev mock (not inside Tauri).");

@@ -1,5 +1,6 @@
 // "From gallery" picker: the user's generated images (no videos), searchable by prompt/model,
-// paginated with list_images and infinite scroll like the gallery.
+// paginated with list_images and infinite scroll like the gallery. While the vault is unlocked a
+// General | Vault switch also offers vault images (labelled); they never appear while locked.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "../../api";
@@ -8,6 +9,7 @@ import { Dialog } from "../../components/Dialog";
 import { Icon } from "../../components/Icon";
 import { formatRelative } from "../../lib/format";
 import { useToast } from "../../state/toast";
+import { useVault } from "../../state/vault";
 
 const PAGE = 36;
 
@@ -17,14 +19,20 @@ export function GalleryPicker({
   modelNames,
   onClose,
   onPick,
+  preferVault = false,
 }: {
   open: boolean;
+  /** Start on the Vault source when it's available (Save to = Vault). */
+  preferVault?: boolean;
   title?: string;
   modelNames: Record<string, string>;
   onClose: () => void;
   onPick: (rec: ImageRecord) => void;
 }) {
   const toast = useToast();
+  const vault = useVault();
+  const [source, setSource] = useState<"general" | "vault">("general");
+  const fromVault = source === "vault" && vault.unlocked;
   const [items, setItems] = useState<ImageRecord[]>([]);
   const [loaded, setLoaded] = useState(0);
   const [nextBefore, setNextBefore] = useState<number | null>(null);
@@ -62,6 +70,8 @@ export function GalleryPicker({
   // Fresh list each time the picker opens (new images may have arrived).
   const loadRef = useRef(loadMore);
   loadRef.current = loadMore;
+  const unlockedRef = useRef(vault.unlocked);
+  unlockedRef.current = vault.unlocked;
   useEffect(() => {
     if (!open) return;
     setQuery("");
@@ -69,6 +79,7 @@ export function GalleryPicker({
     setLoaded(0);
     setNextBefore(null);
     setHasMore(true);
+    setSource(preferVault && unlockedRef.current ? "vault" : "general");
     void loadRef.current(true);
     // showModal() focuses the header's Close button; start in the search field instead.
     const h = requestAnimationFrame(() => searchRef.current?.focus());
@@ -76,26 +87,47 @@ export function GalleryPicker({
   }, [open]);
 
   const q = query.trim().toLowerCase();
+  const vaultImages = useMemo(() => (vault.unlocked ? vault.items.filter((r) => r.kind !== "video") : []), [vault.unlocked, vault.items]);
+  const pool = fromVault ? vaultImages : items;
+  const listHasMore = fromVault ? false : hasMore;
   const shown = useMemo(
-    () => (q ? items.filter((r) => r.prompt.toLowerCase().includes(q) || (modelNames[r.model] ?? r.model).toLowerCase().includes(q)) : items),
-    [items, q, modelNames],
+    () => (q ? pool.filter((r) => r.prompt.toLowerCase().includes(q) || (modelNames[r.model] ?? r.model).toLowerCase().includes(q)) : pool),
+    [pool, q, modelNames],
   );
 
   // Infinite scroll; re-armed whenever a page arrives (a page may add nothing that matches).
   useEffect(() => {
     const el = sentinel.current;
-    if (!open || !el || !hasMore) return;
+    if (!open || !el || !hasMore || fromVault) return;
     const io = new IntersectionObserver((es) => es.some((e) => e.isIntersecting) && void loadRef.current(), {
       root: scrollRef.current,
       rootMargin: "400px 0px",
     });
     io.observe(el);
     return () => io.disconnect();
-  }, [open, hasMore, loaded, shown.length]);
+  }, [open, hasMore, loaded, shown.length, fromVault]);
 
   return (
     <Dialog open={open} onClose={onClose} title={title} className="picker">
       <div className="picker__bar">
+        {vault.unlocked && (
+          <div className="segmented picker__source" role="radiogroup" aria-label="Pick from">
+            {(["general", "vault"] as const).map((src) => (
+              <button
+                key={src}
+                type="button"
+                role="radio"
+                aria-checked={source === src}
+                tabIndex={source === src ? 0 : -1}
+                className={source === src ? "is-selected" : ""}
+                onClick={() => setSource(src)}
+              >
+                {src === "vault" && <Icon name="unlock" size={13} />}
+                {src === "general" ? "General" : "Vault"}
+              </button>
+            ))}
+          </div>
+        )}
         <div className="picker__search">
           <Icon name="search" size={14} />
           <input
@@ -110,16 +142,26 @@ export function GalleryPicker({
         </div>
         <span className="hint mono">
           {shown.length}
-          {hasMore ? "+" : ""} image{shown.length === 1 ? "" : "s"}
+          {listHasMore ? "+" : ""} {fromVault ? "vault " : ""}image{shown.length === 1 ? "" : "s"}
         </span>
       </div>
       <div className="picker__scroll" ref={scrollRef}>
         {shown.length > 0 && (
-          <ul className="picker__grid" aria-label="Your images">
+          <ul className="picker__grid" aria-label={fromVault ? "Your vault images" : "Your images"}>
             {shown.map((r) => (
               <li key={r.id}>
-                <button type="button" className="tile picker__tile" onClick={() => onPick(r)} aria-label={`Use as start image: ${r.prompt}`}>
-                  <img src={fileSrc(r.path)} alt="" loading="lazy" decoding="async" />
+                <button
+                  type="button"
+                  className="tile picker__tile"
+                  onClick={() => onPick(r)}
+                  aria-label={`Use as start image${r.vault ? " (from the vault)" : ""}: ${r.prompt}`}
+                >
+                  <img src={fileSrc(r.thumbPath || r.path)} alt="" loading="lazy" decoding="async" />
+                  {r.vault && (
+                    <span className="tile__badge tile__badge--vault">
+                      <Icon name="lock" size={10} /> Vault
+                    </span>
+                  )}
                   <span className="tile__overlay" aria-hidden>
                     <span className="tile__prompt">{r.prompt}</span>
                     <span className="tile__meta">
@@ -131,11 +173,13 @@ export function GalleryPicker({
             ))}
           </ul>
         )}
-        {!loading && shown.length === 0 && !hasMore && (
-          <p className="picker__empty hint">{q ? `No images match “${query.trim()}”.` : "No images yet — generate one in Image mode first."}</p>
+        {(fromVault || !loading) && shown.length === 0 && !listHasMore && (
+          <p className="picker__empty hint">
+            {q ? `No images match “${query.trim()}”.` : fromVault ? "No images in the vault yet." : "No images yet — generate one in Image mode first."}
+          </p>
         )}
         <div ref={sentinel} className="gallery__sentinel" aria-hidden />
-        {loading && (
+        {loading && !fromVault && (
           <div className="gallery__loading" role="status">
             <Icon name="refresh" className="spin" /> Loading…
           </div>

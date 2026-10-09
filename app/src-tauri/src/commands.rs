@@ -4,7 +4,7 @@
 //! Errors are user-readable strings.
 
 use crate::db::ImageRecord;
-use crate::jobs::{self, GenerateRequest, Job, LoraChoice, VideoRequest};
+use crate::jobs::{self, Destination, GenerateRequest, Job, LoraChoice, VideoRequest};
 use crate::links::ResolvedLora;
 use crate::pod::{self, GpuState, Profile};
 use crate::references::{self, ImportedReference};
@@ -13,6 +13,8 @@ use crate::settings::{Backend, SavePodSettings, SaveSettings, SettingsView};
 use crate::state::Core;
 use crate::status::{self, LoraView, StatusView};
 use crate::tasks::{self, DeletePreview, DeleteResult, Task};
+use crate::vault::{KdfParams, VaultStatus};
+use crate::vault_migrate::{self, MigrateOptions};
 use crate::worker::WorkerTarget;
 use base64::Engine;
 use serde::Serialize;
@@ -21,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::State;
+use zeroize::Zeroizing;
 
 type Res<T> = Result<T, String>;
 type CoreState<'a> = State<'a, Arc<Core>>;
@@ -47,6 +50,8 @@ pub struct SettingsResponse {
     /// Video profile GPU list / volumes (config file only; spec v5).
     pub video_gpu_types: Vec<String>,
     pub video_volume_names: Vec<String>,
+    /// Vault auto-lock after this many idle minutes (spec v6; default 10).
+    pub vault_auto_lock_minutes: u32,
 }
 
 fn settings_response(core: &Core) -> SettingsResponse {
@@ -63,6 +68,7 @@ fn settings_response(core: &Core) -> SettingsResponse {
         pod_image: core.settings.pod_image(),
         video_gpu_types: core.settings.gpu_types_for(Profile::Video),
         video_volume_names: core.settings.volume_names_for(Profile::Video),
+        vault_auto_lock_minutes: core.settings.vault_auto_lock_minutes(),
     }
 }
 
@@ -81,7 +87,13 @@ pub fn save_settings(
     idle_minutes: Option<u32>,
     backend: Option<Backend>,
     pass_api_key_to_pod: Option<bool>,
+    vault_auto_lock_minutes: Option<u32>,
 ) -> Res<SettingsResponse> {
+    if let Some(m) = vault_auto_lock_minutes {
+        core.settings.save_vault_auto_lock(m)?;
+        core.vault.set_auto_lock(m);
+        core.emit_vault();
+    }
     core.settings.save_pod(SavePodSettings {
         backend,
         idle_minutes,
@@ -154,6 +166,7 @@ pub async fn confirm_quit(
     if stop_gpu {
         pod::stop_for_quit(&core).await?;
     }
+    core.vault.lock();
     guard.0.store(true, Ordering::SeqCst);
     app.exit(0);
     Ok(())
@@ -288,11 +301,29 @@ pub async fn delete_lora(core: CoreState<'_>, id: String) -> Res<Option<Task>> {
 
 // ----- references -----
 
+/// `destination` (spec v6): "vault" seals the downscaled copy into the vault
+/// instead of writing it to `references/`; a `vault:` source always does.
 #[tauri::command]
-pub async fn import_reference(core: CoreState<'_>, path: String) -> Res<ImportedReference> {
-    let dir = core.cfg.references_dir();
+pub async fn import_reference(
+    core: CoreState<'_>,
+    path: String,
+    destination: Option<String>,
+) -> Res<ImportedReference> {
+    let dest = Destination::parse(destination.as_deref())?;
+    let c = core.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        references::import_path(&dir, &PathBuf::from(path))
+        if crate::vault::is_vault_path(&path) {
+            let bytes = vault_migrate::read_source(&c, &path)?;
+            return vault_migrate::import_reference_to_vault(&c, &bytes);
+        }
+        match dest {
+            Destination::Vault => {
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| format!("Could not open {}: {e}", PathBuf::from(&path).display()))?;
+                vault_migrate::import_reference_to_vault(&c, &bytes)
+            }
+            Destination::General => references::import_path(&c.cfg.references_dir(), &PathBuf::from(path)),
+        }
     })
     .await
     .map_err(|e| e.to_string())?
@@ -303,8 +334,10 @@ pub async fn import_reference_bytes(
     core: CoreState<'_>,
     base64: String,
     mime: Option<String>,
+    destination: Option<String>,
 ) -> Res<ImportedReference> {
     let _ = mime; // format is detected from the bytes
+    let dest = Destination::parse(destination.as_deref())?;
     let data = base64
         .split_once(";base64,")
         .map(|(_, d)| d)
@@ -312,8 +345,21 @@ pub async fn import_reference_bytes(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.trim())
         .map_err(|_| "The pasted image data is not valid base64".to_string())?;
-    let dir = core.cfg.references_dir();
-    tauri::async_runtime::spawn_blocking(move || references::import_bytes(&dir, &bytes))
+    let c = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || match dest {
+        Destination::Vault => vault_migrate::import_reference_to_vault(&c, &bytes),
+        Destination::General => references::import_bytes(&c.cfg.references_dir(), &bytes),
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Moves an imported reference into the vault (for a vault job): the returned
+/// id replaces the old one. Already-vault ids are returned unchanged.
+#[tauri::command]
+pub async fn seal_reference(core: CoreState<'_>, ref_id: String) -> Res<ImportedReference> {
+    let c = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || vault_migrate::seal_plain_reference(&c, &ref_id))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -342,6 +388,9 @@ pub async fn generate(
     loras: Option<Vec<LoraChoice>>,
     init_image_id: Option<String>,
     denoise: Option<f64>,
+    init_image_gallery_id: Option<String>,
+    init_image_vault_id: Option<String>,
+    destination: Option<String>,
 ) -> Res<JobStarted> {
     let req = GenerateRequest {
         model,
@@ -356,6 +405,9 @@ pub async fn generate(
         loras: loras.unwrap_or_default(),
         init_image_id,
         denoise,
+        init_image_gallery_id,
+        init_image_vault_id,
+        destination: Destination::parse(destination.as_deref())?,
     };
     // References are ≤1 MP files, so reading them inline is cheap.
     let job_id = jobs::generate(&core, req)?;
@@ -372,6 +424,7 @@ pub async fn generate_video(
     negative_prompt: Option<String>,
     init_image_id: Option<String>,
     init_image_gallery_id: Option<String>,
+    init_image_vault_id: Option<String>,
     duration_s: f64,
     fps: f64,
     resolution: String,
@@ -379,6 +432,7 @@ pub async fn generate_video(
     steps: Option<u32>,
     cfg: Option<f64>,
     audio: Option<bool>,
+    destination: Option<String>,
 ) -> Res<JobStarted> {
     let req = VideoRequest {
         model,
@@ -386,6 +440,7 @@ pub async fn generate_video(
         negative_prompt,
         init_image_id,
         init_image_gallery_id,
+        init_image_vault_id,
         duration_s,
         fps,
         resolution,
@@ -393,6 +448,7 @@ pub async fn generate_video(
         steps,
         cfg,
         audio: audio.unwrap_or(false),
+        destination: Destination::parse(destination.as_deref())?,
     };
     let job_id = jobs::generate_video(&core, req)?;
     Ok(JobStarted { job_id })
@@ -426,10 +482,15 @@ pub fn list_images(core: CoreState<'_>, limit: Option<u32>, before: Option<i64>)
     Ok(ImagePage { items, next_before })
 }
 
+/// Deletes a general record (and its files) — or, when `id` is a vault item
+/// and the vault is unlocked, that item.
 #[tauri::command]
 pub fn delete_image(core: CoreState<'_>, id: String) -> Res<()> {
     let db = core.db.lock().unwrap();
-    let rec = db.get_image(&id)?.ok_or("Image not found")?;
+    let Some(rec) = db.get_image(&id)? else {
+        drop(db);
+        return delete_vault_item(core, id);
+    };
     db.delete_image(&id)?;
     // Only files the app wrote (images/, videos/) are removed.
     let owned = [core.cfg.images_dir(), core.cfg.videos_dir()];
@@ -446,16 +507,150 @@ pub fn delete_image(core: CoreState<'_>, id: String) -> Res<()> {
 /// dialog plugin's save dialog.
 #[tauri::command]
 pub fn export_image(core: CoreState<'_>, id: String, dest_path: String) -> Res<()> {
-    let rec = core
-        .db
-        .lock()
-        .unwrap()
-        .get_image(&id)?
-        .ok_or("Image not found")?;
+    let rec = core.db.lock().unwrap().get_image(&id)?;
+    let Some(rec) = rec else {
+        return export_vault_item(core, id, dest_path);
+    };
     std::fs::copy(&rec.path, &dest_path)
         .map(|_| ())
         .map_err(|e| {
             let what = if rec.kind == crate::db::KIND_VIDEO { "video" } else { "image" };
             format!("Could not save the {what}: {e}")
         })
+}
+
+// ----- vault (spec v6) -----
+
+fn spawn_migration(core: &Arc<Core>) {
+    let c = core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(e) = vault_migrate::migrate(&c, MigrateOptions::default()) {
+            eprintln!("[vault] migration stopped: {e}");
+        }
+    });
+}
+
+#[tauri::command]
+pub fn vault_status(core: CoreState<'_>) -> VaultStatus {
+    core.vault.status()
+}
+
+/// Creates the vault (Argon2id at the spec cost runs off the main thread) and
+/// starts the one-time migration of every existing gallery item in the background.
+#[tauri::command]
+pub async fn vault_create(core: CoreState<'_>, password: String) -> Res<VaultStatus> {
+    let password = Zeroizing::new(password);
+    let c = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        c.vault.create(password.as_bytes(), KdfParams::PRODUCTION)?;
+        c.emit_vault();
+        spawn_migration(&c);
+        Ok::<_, String>(c.vault.status())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Unlocks; an unfinished migration resumes in the background.
+#[tauri::command]
+pub async fn vault_unlock(core: CoreState<'_>, password: String) -> Res<VaultStatus> {
+    let password = Zeroizing::new(password);
+    let c = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        c.vault.unlock(password.as_bytes())?;
+        c.emit_vault();
+        if vault_migrate::migration_pending(&c) {
+            spawn_migration(&c);
+        }
+        Ok::<_, String>(c.vault.status())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn vault_lock(core: CoreState<'_>) -> VaultStatus {
+    core.vault.lock();
+    core.emit_vault();
+    core.vault.status()
+}
+
+#[tauri::command]
+pub async fn vault_change_password(
+    core: CoreState<'_>,
+    old_password: String,
+    new_password: String,
+) -> Res<VaultStatus> {
+    let current = Zeroizing::new(old_password);
+    let new = Zeroizing::new(new_password);
+    let c = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        c.vault
+            .change_password(current.as_bytes(), new.as_bytes(), KdfParams::PRODUCTION)?;
+        c.emit_vault();
+        Ok::<_, String>(c.vault.status())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Auto-lock after `minutes` without interaction (1–240); persisted in settings.json.
+#[tauri::command]
+pub fn vault_set_auto_lock(core: CoreState<'_>, minutes: u32) -> Res<VaultStatus> {
+    core.settings.save_vault_auto_lock(minutes)?;
+    core.vault.set_auto_lock(minutes);
+    core.emit_vault();
+    Ok(core.vault.status())
+}
+
+/// Decrypted vault items, newest first (error while locked).
+#[tauri::command]
+pub fn list_vault_items(core: CoreState<'_>) -> Res<Vec<ImageRecord>> {
+    core.vault.touch();
+    Ok(core.vault.items()?.iter().map(|i| i.to_record()).collect())
+}
+
+#[tauri::command]
+pub async fn move_to_vault(core: CoreState<'_>, id: String) -> Res<ImageRecord> {
+    let c = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let r = vault_migrate::move_to_vault(&c, &id)?;
+        c.emit_vault();
+        Ok::<_, String>(r)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn move_to_general(core: CoreState<'_>, id: String) -> Res<ImageRecord> {
+    let c = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let r = vault_migrate::move_to_general(&c, &id)?;
+        c.emit_vault();
+        Ok::<_, String>(r)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Writes an unencrypted copy of a vault item's media to a user-chosen path.
+#[tauri::command]
+pub fn export_vault_item(core: CoreState<'_>, id: String, dest: String) -> Res<()> {
+    core.vault.touch();
+    vault_migrate::export_item(&core, &id, &PathBuf::from(dest))
+}
+
+#[tauri::command]
+pub fn delete_vault_item(core: CoreState<'_>, id: String) -> Res<()> {
+    core.vault.touch();
+    core.vault.delete_item(&id)?;
+    core.emit_vault();
+    Ok(())
+}
+
+/// User interaction: resets the auto-lock timer.
+#[tauri::command]
+pub fn vault_touch(core: CoreState<'_>) {
+    core.vault.touch();
 }

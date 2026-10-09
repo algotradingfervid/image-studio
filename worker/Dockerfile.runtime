@@ -4,7 +4,7 @@
 #
 #   ghcr.io/algotradingfervid/image-studio-runtime:{latest,sha-<commit>}
 #
-# Holds only what changes rarely: Python 3.12, torch (cu128 wheels), ComfyUI
+# Holds only what changes rarely: Python 3.12, torch (cu130 wheels), ComfyUI
 # v0.39.0 and the worker's third-party dependencies. The worker code
 # (worker/src + shared/models.json) is downloaded from GitHub by
 # worker/boot/boot.py at every container start; the copy baked in below
@@ -14,11 +14,18 @@
 #   docker buildx build --platform linux/amd64 -f worker/Dockerfile.runtime \
 #     --build-arg GIT_SHA=$(git rev-parse HEAD) -t <image> .
 #
-# No CUDA toolkit in the image: torch's cu128 wheels bundle the CUDA 12.8
-# runtime libraries (nvidia-*-cu12 wheels: cuBLAS, cuDNN 9, NCCL, ...), and the
-# host driver (libcuda, nvidia-smi) is mounted by the NVIDIA container runtime.
-# cu128 builds include sm_120 kernels (Blackwell: RTX PRO 4000/4500/6000,
-# RTX 5090) as well as Ada (sm_89) and Ampere (sm_80/86); they need driver >= 570.
+# No CUDA toolkit in the image: torch's cu130 wheels pull the CUDA 13.0 runtime
+# libraries as wheels (cuda-toolkit[cublas,cudart,...]==13.0.2 -> nvidia-cublas,
+# nvidia-cuda-runtime, ... under site-packages/nvidia/cu13/lib, plus
+# nvidia-cudnn-cu13, nvidia-nccl-cu13), and the host driver (libcuda,
+# nvidia-smi) is mounted by the NVIDIA container runtime.
+# Why cu130 and not cu128: ComfyUI v0.39.0 disables comfy-kitchen's CUDA
+# backend (fused int8/fp8 kernels) when torch.version.cuda < 13
+# (comfy/quant_ops.py). comfy-kitchen dlopens libcublasLt.so.13 from
+# nvidia/cu13/lib (the nvidia-cublas wheel above).
+# cu130 builds include sm_120 kernels (Blackwell: RTX PRO 4000/4500/6000,
+# RTX 5090) as well as Ada (sm_89) and Ampere (sm_80/86); they need host
+# driver >= 580 (the app filters pods by CUDA version).
 #
 # The legacy all-in-one image (worker/Dockerfile, ~14.8 GB compressed) is kept
 # as a fallback; see worker/README.md.
@@ -30,7 +37,7 @@ ARG COMFYUI_COMMIT=b0b743566f65daafc423b4fea8a2fbda94b3384a
 ARG TORCH_VERSION=2.11.0
 ARG TORCHVISION_VERSION=0.26.0
 ARG TORCHAUDIO_VERSION=2.11.0
-ARG TORCH_CUDA=cu128
+ARG TORCH_CUDA=cu130
 
 # NVIDIA_*: nvidia/cuda base images set these; without NVIDIA_VISIBLE_DEVICES
 # the NVIDIA container runtime exposes no GPU to a non-CUDA image.
@@ -73,7 +80,7 @@ tf.extractall("/comfyui", members=members, filter="data")
 print(f"ComfyUI {tag} ({got}) -> /comfyui, {len(members)} entries")
 EOF
 
-# 3. torch from the cu128 index, in its own layer (~4 GB compressed): ComfyUI
+# 3. torch from the cu130 index, in its own layer (~4 GB compressed): ComfyUI
 #    or worker dependency changes don't invalidate it, so CI rebuilds and
 #    pod-side pulls of a new runtime image skip it.
 RUN --mount=from=ghcr.io/astral-sh/uv:0.11.7,source=/uv,target=/bin/uv \
@@ -86,11 +93,12 @@ RUN --mount=from=ghcr.io/astral-sh/uv:0.11.7,source=/uv,target=/bin/uv \
 flags = getattr(torch._C, '_cuda_getArchFlags', lambda: None)(); \
 print('torch', v, 'cuda', torch.version.cuda, 'archs', flags); \
 assert v == '${TORCH_VERSION}+${TORCH_CUDA}', v; \
+assert str(torch.version.cuda).startswith('13'), 'torch CUDA is ' + str(torch.version.cuda) + ', need 13.x (ComfyUI disables comfy-kitchen CUDA kernels below 13)'; \
 assert flags is None or 'sm_120' in flags, 'no Blackwell (sm_120) kernels: ' + str(flags)"
 
 # 4. ComfyUI's requirements + the worker's runtime deps (worker/requirements-
 #    runtime.txt), with torch frozen by the constraints file so ComfyUI's bare
-#    `torch` can never pull PyPI's CUDA 13 builds (driver >= 580). The
+#    `torch` can never be replaced by a PyPI build (wrong CUDA). The
 #    workflow-template media packages (~0.5 GB of example images/videos for
 #    the ComfyUI web UI's template browser) are removed: this worker only uses
 #    the API on 127.0.0.1; ComfyUI starts fine without them.
@@ -105,6 +113,33 @@ RUN --mount=from=ghcr.io/astral-sh/uv:0.11.7,source=/uv,target=/bin/uv \
     && rm /tmp/requirements-runtime.txt \
     && python -c "import torch, runpod, aiohttp, requests, websocket; v = torch.__version__; \
 assert v == '${TORCH_VERSION}+${TORCH_CUDA}', v; print('torch', v, 'runpod', runpod.__version__)"
+
+# 4b. comfy-kitchen's CUDA extension must load and find cuBLASLt 13. No GPU is
+#     needed: _C.abi3.so links no CUDA library (cudart is static, libcuda and
+#     libcublasLt.so.13 are dlopened). Whether the backend is actually ENABLED
+#     needs a GPU; worker/src/cuda_info.py logs it at boot and reports it as
+#     /health cudaKernels. A load error that only names the driver (libcuda) is
+#     a warning, anything else fails the build.
+RUN python - <<'EOF'
+import glob, os, sys, ctypes
+import torch
+import comfy_kitchen
+from importlib import metadata
+import comfy_kitchen.backends.cuda as b
+import nvidia.cu13
+libs = [p for d in nvidia.cu13.__path__ for p in glob.glob(os.path.join(d, "lib", "libcublasLt.so.13*"))]
+assert libs, f"libcublasLt.so.13 not found under {list(nvidia.cu13.__path__)}"
+ctypes.CDLL(libs[0])
+print("comfy-kitchen", metadata.version("comfy-kitchen"), "torch CUDA", torch.version.cuda,
+      "| cuda ext:", b._EXT_AVAILABLE, b._EXT_ERROR, "| cublasLt:", b._CUBLASLT_AVAILABLE, libs[0])
+if not b._EXT_AVAILABLE:
+    if "libcuda" in str(b._EXT_ERROR):
+        print("WARNING: comfy-kitchen CUDA extension needs the driver to load; checked at boot", file=sys.stderr)
+    else:
+        sys.exit(f"comfy-kitchen CUDA extension failed to load: {b._EXT_ERROR}")
+elif not b._CUBLASLT_AVAILABLE:
+    sys.exit("comfy-kitchen CUDA extension built without cuBLASLt")
+EOF
 
 # 5. Smoke tests on CPU (no GPU at build time): the version is right, ComfyUI
 #    starts (upstream's --quick-test-for-ci), and every node class our graphs

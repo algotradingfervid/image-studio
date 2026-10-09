@@ -3,13 +3,14 @@
 
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import * as api from "../../api";
-import { isConfigured, resolutionId, type GenerateVideoInput, type ImageRecord, type ModelView, type VideoDefaults, type VideoResolutionOption } from "../../api";
+import { isConfigured, isVaultUrl, resolutionId, type Destination, type GenerateVideoInput, type ImageRecord, type ModelView, type VideoDefaults, type VideoResolutionOption } from "../../api";
 import { AspectShape, Icon } from "../../components/Icon";
 import { radioKeys } from "../../components/radio";
 import { pct } from "../../lib/format";
 import { useGpu } from "../../state/gpu";
 import { useLibrary } from "../../state/library";
 import { useToast } from "../../state/toast";
+import { useVault } from "../../state/vault";
 import type { Tab } from "../../App";
 import { Advanced, advancedDefaults, StartImage, type AdvancedValues, type RefItem } from "./Controls";
 import { GalleryPicker } from "./GalleryPicker";
@@ -83,15 +84,22 @@ function readLast(): string {
   }
 }
 
-/** The i2v start image: imported (`refId` → initImageId) or a gallery image used in place (`galleryId` → initImageGalleryId). */
+/**
+ * The i2v start image: imported (`refId` → initImageId), a gallery image used in place
+ * (`galleryId` → initImageGalleryId) or a vault item used in place (`vaultId` → initImageVaultId, spec v6).
+ */
 export interface VideoStart {
   refId: string | null;
   galleryId: string | null;
+  vaultId?: string | null;
   thumbPath: string;
 }
 
 const fromRef = (r: RefItem): VideoStart => ({ refId: r.refId, galleryId: null, thumbPath: r.thumbPath });
-const fromGallery = (rec: ImageRecord): VideoStart => ({ refId: null, galleryId: rec.id, thumbPath: rec.path });
+const fromGallery = (rec: ImageRecord): VideoStart =>
+  rec.vault ? { refId: null, galleryId: null, vaultId: rec.id, thumbPath: rec.thumbPath || rec.path } : { refId: null, galleryId: rec.id, thumbPath: rec.path };
+/** The start image is vault content (a vault item, or a reference sealed into the vault). */
+export const startIsVault = (s: VideoStart | null) => !!s && (!!s.vaultId || isVaultUrl(s.refId));
 
 export interface VideoPanelHandle {
   /** "Use these settings" for a video record; `galleryStart` = the gallery image its start frame came from, if known. */
@@ -107,13 +115,19 @@ export const VideoPanel = forwardRef<
     active: boolean;
     hidden: boolean;
     modeSwitch: ReactNode;
+    /** Where outputs go (spec v6) and the shared Save-to switch. */
+    saveTo: Destination;
+    saveToSwitch: ReactNode;
+    /** Reports whether the start image is vault content (forces Save to = Vault). */
+    onVaultStart: (vault: boolean) => void;
     onNavigate: (t: Tab) => void;
     onQueued: (job: JobView) => void;
     activeJobs: number;
     modelNames: Record<string, string>;
   }
->(function VideoPanel({ active, hidden, modeSwitch, onNavigate, onQueued, activeJobs, modelNames }, ref) {
+>(function VideoPanel({ active, hidden, modeSwitch, saveTo, saveToSwitch, onVaultStart, onNavigate, onQueued, activeJobs, modelNames }, ref) {
   const lib = useLibrary();
+  const vault = useVault();
   const toast = useToast();
   const gpu = useGpu();
   const vgpu = gpu.profiles.video;
@@ -133,6 +147,17 @@ export const VideoPanel = forwardRef<
   const [submitting, setSubmitting] = useState(false);
   const promptRef = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+
+  // Report vault start images upward; drop them when the vault locks.
+  const vaultStart = startIsVault(startImage);
+  useEffect(() => onVaultStart(vaultStart), [vaultStart, onVaultStart]);
+  const lockEpoch = useRef(vault.lockEpoch);
+  useEffect(() => {
+    if (lockEpoch.current === vault.lockEpoch) return;
+    lockEpoch.current = vault.lockEpoch;
+    setPickerOpen(false);
+    setStartImage((s) => (startIsVault(s) ? null : s));
+  }, [vault.lockEpoch]);
 
   const model = models.find((m) => m.id === modelId);
   const i2v = !!model?.modes?.includes("i2v");
@@ -187,13 +212,13 @@ export const VideoPanel = forwardRef<
     const f = files[0];
     if (!f) return;
     if (files.length > 1) toast.info("Only one start image is used", "The first image was added.");
-    await setStartFrom(async () => api.importReferenceBytes(await api.blobToBase64(f), f.type || "image/png"));
+    await setStartFrom(async () => api.importReferenceBytes(await api.blobToBase64(f), f.type || "image/png", saveTo));
   };
   const addStartPaths = async (paths: string[]) => {
     const imgs = paths.filter((p) => IMAGE_EXT.test(p));
     if (!imgs.length) return toast.info("That isn't an image file", "The start image must be a PNG, JPEG, WebP or similar.");
     if (imgs.length > 1) toast.info("Only one start image is used", "The first image was added.");
-    await setStartFrom(() => api.importReference(imgs[0]));
+    await setStartFrom(() => api.importReference(imgs[0], saveTo));
   };
   const pickStart = async () => {
     try {
@@ -255,6 +280,8 @@ export const VideoPanel = forwardRef<
       requestAnimationFrame(() => promptRef.current?.focus());
     },
     async applySettings(rec: ImageRecord, galleryStart?: ImageRecord | null) {
+      // A vault record's start image re-imports into the vault (its vault:// path always does).
+      const dest: Destination = rec.vault ? "vault" : saveTo;
       const m = models.find((x) => x.id === rec.model);
       if (!m) {
         toast.error("That video model is no longer available", rec.model);
@@ -290,7 +317,7 @@ export const VideoPanel = forwardRef<
       } else if (rec.initImage && m.modes?.includes("i2v")) {
         setStartBusy(true);
         try {
-          setStartImage(fromRef(await api.importReference(rec.initImage)));
+          setStartImage(fromRef(await api.importReference(rec.initImage, dest)));
         } catch {
           startFailed = true;
         } finally {
@@ -341,8 +368,10 @@ export const VideoPanel = forwardRef<
     if (!adv.randomSeed && adv.seed !== "") input.seed = Number(adv.seed);
     if (adv.steps !== "" && Number(adv.steps) > 0) input.steps = Math.round(Number(adv.steps));
     if (adv.cfg !== "" && !isNaN(Number(adv.cfg))) input.cfg = Number(adv.cfg);
-    if (i2v && startImage?.galleryId) input.initImageGalleryId = startImage.galleryId;
+    if (i2v && startImage?.vaultId) input.initImageVaultId = startImage.vaultId;
+    else if (i2v && startImage?.galleryId) input.initImageGalleryId = startImage.galleryId;
     else if (i2v && startImage?.refId) input.initImageId = startImage.refId;
+    input.destination = saveTo;
 
     setSubmitting(true);
     try {
@@ -359,6 +388,7 @@ export const VideoPanel = forwardRef<
         startedAt: Date.now(),
         modelName: model.name,
         prompt: input.prompt,
+        destination: saveTo,
       });
     } catch (e) {
       toast.error("Couldn't start the video", e);
@@ -436,7 +466,13 @@ export const VideoPanel = forwardRef<
               image={startImage}
               busy={startBusy}
               dragActive={dragActive}
-              note={startImage?.galleryId ? "From your gallery — the video starts from this frame." : "The video starts from this frame."}
+              note={
+                startImage?.vaultId
+                  ? "From your vault — the video starts from this frame and is saved to the vault."
+                  : startImage?.galleryId
+                    ? "From your gallery — the video starts from this frame."
+                    : "The video starts from this frame."
+              }
               onRemove={() => setStartImage(null)}
               onFiles={addStartFiles}
               onPick={pickStart}
@@ -583,6 +619,7 @@ export const VideoPanel = forwardRef<
       </div>
 
       <div className="panel__foot">
+        {saveToSwitch}
         <button
           type="submit"
           className="btn btn--generate"
@@ -609,6 +646,7 @@ export const VideoPanel = forwardRef<
 
       <GalleryPicker
         open={pickerOpen}
+        preferVault={saveTo === "vault"}
         modelNames={modelNames}
         onClose={() => setPickerOpen(false)}
         onPick={(rec) => {

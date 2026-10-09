@@ -7,6 +7,8 @@ import {
   gpuIsOff,
   isConfigured,
   isJobActive,
+  isVaultUrl,
+  type Destination,
   type GenerateInput,
   type ImageRecord,
   type Job,
@@ -16,6 +18,7 @@ import { radioKeys } from "../../components/radio";
 import { useGpu } from "../../state/gpu";
 import { useLibrary } from "../../state/library";
 import { useToast } from "../../state/toast";
+import { useVault } from "../../state/vault";
 import type { Tab } from "../../App";
 import {
   Advanced,
@@ -38,6 +41,7 @@ import { GalleryPicker } from "./GalleryPicker";
 import { JobCard, type JobView } from "./JobCard";
 import { Lightbox } from "./Lightbox";
 import { VideoPanel, type VideoPanelHandle } from "./VideoPanel";
+import { MigrationView, SaveToSwitch, VaultCreate, VaultLockScreen } from "./VaultViews";
 
 const PAGE = 24;
 const LAST_MODEL_KEY = "imagestudio.lastModel";
@@ -63,13 +67,19 @@ function readMode(): CreateMode {
 const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
 
 export type GalleryFilter = "all" | "image" | "video";
+export type GalleryTab = "general" | "vault";
 const isVideo = (im: ImageRecord) => im.kind === "video";
+const applyFilter = (list: ImageRecord[], f: GalleryFilter) => (f === "all" ? list : list.filter((im) => (f === "video") === isVideo(im)));
+
+/** img2img start image: imported (`refId`) or a vault item used in place (`vaultId`, spec v6). */
+type StartPick = RefItem & { vaultId?: string };
 
 export function CreateScreen({ active, onNavigate }: { active: boolean; onNavigate: (t: Tab) => void }) {
   const lib = useLibrary();
   const toast = useToast();
   const configured = isConfigured(lib.settings);
   const gpu = useGpu();
+  const vault = useVault();
   // Pod backend with the GPU off: Generate auto-starts it first.
   const startsGpu = gpu.podMode && gpuIsOff(gpu.state);
   const imageModels = lib.imageModels;
@@ -87,6 +97,11 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   const videoRef = useRef<VideoPanelHandle>(null);
   const modeSwitch = <ModeSwitch value={mode} onChange={setMode} />;
 
+  // ---------- Save to: General | Vault (spec v6; remembered for the session) ----------
+  const [saveChoice, setSaveChoice] = useState<Destination | null>(null);
+  /** Video mode's start image is vault content (reported by VideoPanel). */
+  const [videoVaultStart, setVideoVaultStart] = useState(false);
+
   // ---------- form state ----------
   const [modelId, setModelId] = useState<string>(readLastModel);
   const [prompt, setPrompt] = useState("");
@@ -95,7 +110,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   const [dragActive, setDragActive] = useState(false);
   const [loraPicks, setLoraPicks] = useState<LoraPick[]>([]);
   // img2img start image (models with supportsImg2Img) and its strength.
-  const [startImage, setStartImage] = useState<RefItem | null>(null);
+  const [startImage, setStartImage] = useState<StartPick | null>(null);
   const [startBusy, setStartBusy] = useState(false);
   const [startPickerOpen, setStartPickerOpen] = useState(false);
   const [denoise, setDenoise] = useState(DENOISE_DEFAULT);
@@ -112,6 +127,25 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   const maxRefs = model?.maxReferences ?? 0;
   const img2img = !!model?.supportsImg2Img;
   const startActive = img2img && !!startImage;
+
+  // A vault start image or reference keeps the output in the vault (the core refuses "general").
+  const vaultInputs =
+    mode === "video"
+      ? videoVaultStart
+      : (startActive && !!startImage && (!!startImage.vaultId || isVaultUrl(startImage.refId))) || refs.slice(0, maxRefs).some((r) => isVaultUrl(r.refId));
+  // Until the user picks: Vault while unlocked, else General. Vault while locked is allowed (outputs are sealed).
+  const saveTo: Destination = !vault.exists ? "general" : vaultInputs ? "vault" : (saveChoice ?? (vault.unlocked ? "vault" : "general"));
+  const saveToSwitch = (
+    <SaveToSwitch
+      value={saveTo}
+      onChange={setSaveChoice}
+      forcedReason={vaultInputs ? "The start image or a reference comes from the vault, so the output stays in the vault." : null}
+      onCreateVault={() => {
+        setGalleryTabState("vault");
+        setLightboxId(null);
+      }}
+    />
+  );
   const modelNames = useMemo(() => Object.fromEntries(lib.models.map((m) => [m.id, m.name])), [lib.models]);
 
   // Pick an initial model once the registry arrives.
@@ -174,7 +208,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     try {
       for (const f of files.slice(0, slots)) {
         const b64 = await api.blobToBase64(f);
-        const r = await api.importReferenceBytes(b64, f.type || "image/png");
+        const r = await api.importReferenceBytes(b64, f.type || "image/png", saveTo);
         setRefs((rs) => [...rs, r]);
       }
     } catch (e) {
@@ -194,7 +228,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     setRefBusy(true);
     try {
       for (const p of imgs.slice(0, slots)) {
-        const r = await api.importReference(p);
+        const r = await api.importReference(p, saveTo);
         setRefs((rs) => [...rs, r]);
       }
     } catch (e) {
@@ -216,7 +250,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
 
   // ---------- start image (img2img) ----------
   // Same import pipeline as references (downscaled to ≤1 MP); one image, replaced on re-add.
-  const setStartFrom = async (load: () => Promise<RefItem>) => {
+  const setStartFrom = async (load: () => Promise<StartPick>) => {
     setStartBusy(true);
     try {
       setStartImage(await load());
@@ -231,14 +265,14 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     const f = files[0];
     if (!f) return;
     if (files.length > 1) toast.info("Only one start image is used", "The first image was added.");
-    await setStartFrom(async () => api.importReferenceBytes(await api.blobToBase64(f), f.type || "image/png"));
+    await setStartFrom(async () => api.importReferenceBytes(await api.blobToBase64(f), f.type || "image/png", saveTo));
   };
 
   const addStartPaths = async (paths: string[]) => {
     const imgs = paths.filter((p) => IMAGE_EXT.test(p));
     if (!imgs.length) return toast.info("That isn't an image file", "The start image must be a PNG, JPEG, WebP or similar.");
     if (imgs.length > 1) toast.info("Only one start image is used", "The first image was added.");
-    await setStartFrom(() => api.importReference(imgs[0]));
+    await setStartFrom(() => api.importReference(imgs[0], saveTo));
   };
 
   const pickStart = async () => {
@@ -313,36 +347,42 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   const [hasMore, setHasMore] = useState(true);
   const [loadingImages, setLoadingImages] = useState(false);
   const loadingRef = useRef(false);
-  const [lightbox, setLightbox] = useState<number | null>(null);
+  /** The open lightbox item, by id (the list it belongs to is the visible gallery tab). */
+  const [lightboxId, setLightboxId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLElement>(null);
 
   const imagesRef = useRef(images);
   imagesRef.current = images;
-  /** The gallery filter (declared below); the lightbox index points into the filtered list. */
-  const filterRef = useRef<GalleryFilter>("all");
-  const matches = (im: ImageRecord) => filterRef.current === "all" || (filterRef.current === "video") === isVideo(im);
+  const unlockedRef = useRef(vault.unlocked);
+  unlockedRef.current = vault.unlocked;
+  const addVaultLocal = vault.addLocal;
 
   const prependImages = useCallback((recs: ImageRecord[]) => {
-    const fresh = recs.filter((r) => !imagesRef.current.some((p) => p.id === r.id));
+    // Vault outputs never enter the General list.
+    const fresh = recs.filter((r) => !r.vault && !imagesRef.current.some((p) => p.id === r.id));
     if (!fresh.length) return;
     imagesRef.current = [...fresh.reverse(), ...imagesRef.current];
     setImages(imagesRef.current);
-    const shift = fresh.filter(matches).length;
-    setLightbox((i) => (i == null ? i : i + shift));
   }, []);
 
   useEffect(() => {
     const un = api.onEvent("job-update", (job: Job) => {
+      // A vault job while locked: keep no prompt or outputs in memory.
+      const sealed = (job.destination === "vault" || job.images.some((r) => r.vault)) && !unlockedRef.current;
+      const payload: Job = sealed ? { ...job, images: [] } : job;
       setJobs((js) => {
         const ex = js.find((j) => j.jobId === job.jobId);
-        if (!ex) return [...js, { ...job, modelName: "", prompt: "", startedAt: Date.now() }];
-        return js.map((j) => (j.jobId === job.jobId ? { ...j, ...job } : j));
+        if (!ex) return [...js, { ...payload, modelName: "", prompt: "", startedAt: Date.now() }];
+        return js.map((j) => (j.jobId === job.jobId ? { ...j, ...payload, ...(sealed ? { prompt: "" } : {}) } : j));
       });
-      if (job.images.length) prependImages(job.images);
+      if (payload.images.length) {
+        prependImages(payload.images);
+        addVaultLocal(payload.images.filter((r) => r.vault));
+      }
       if (job.status === "failed") toast.error("Generation failed", job.error ?? undefined);
     });
     return () => void un.then((f) => f());
-  }, [prependImages, toast]);
+  }, [prependImages, addVaultLocal, toast]);
 
   // Restore cards for jobs that were already running (e.g. after a reload).
   useEffect(() => {
@@ -403,6 +443,36 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     void loadMore();
   }, [loadMore]);
 
+  // Vault work changed the General gallery (the migration moved it into the vault): reload page one.
+  const generalEpoch = useRef(vault.generalEpoch);
+  useEffect(() => {
+    if (generalEpoch.current === vault.generalEpoch) return;
+    generalEpoch.current = vault.generalEpoch;
+    void (async () => {
+      try {
+        const page = await api.listImages({ limit: PAGE, before: null });
+        imagesRef.current = page.items;
+        setImages(page.items);
+        setNextBefore(page.nextBefore);
+        setHasMore(page.nextBefore != null && page.items.length > 0);
+      } catch (e) {
+        toast.error("Couldn't reload the gallery", e);
+      }
+    })();
+  }, [vault.generalEpoch, toast]);
+
+  // On lock: drop every vault record this screen holds (open lightbox, start image, job card prompts/outputs).
+  const lockEpoch = useRef(vault.lockEpoch);
+  useEffect(() => {
+    if (lockEpoch.current === vault.lockEpoch) return;
+    lockEpoch.current = vault.lockEpoch;
+    setLightboxId((id) => (id && imagesRef.current.some((x) => x.id === id) ? id : null));
+    setStartImage((s) => (s && (s.vaultId || isVaultUrl(s.refId)) ? null : s));
+    setRefs((rs) => (rs.some((r) => isVaultUrl(r.refId)) ? rs.filter((r) => !isVaultUrl(r.refId)) : rs));
+    setStartPickerOpen(false);
+    setJobs((js) => js.map((j) => (j.destination === "vault" ? { ...j, prompt: "", images: [] } : j)));
+  }, [vault.lockEpoch]);
+
   // ---------- generate ----------
   const blocker = !model
     ? "Choose a model"
@@ -439,14 +509,16 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     if (adv.steps !== "" && Number(adv.steps) > 0) input.steps = Math.round(Number(adv.steps));
     if (adv.cfg !== "" && !isNaN(Number(adv.cfg))) input.cfg = Number(adv.cfg);
     if (startActive && startImage) {
-      input.initImageId = startImage.refId;
+      if (startImage.vaultId) input.initImageVaultId = startImage.vaultId;
+      else input.initImageId = startImage.refId;
       input.denoise = denoise;
     }
+    input.destination = saveTo;
 
     setSubmitting(true);
     try {
       const { jobId } = await api.generate(input);
-      const meta = { modelName: model.name, prompt: input.prompt };
+      const meta = { modelName: model.name, prompt: input.prompt, destination: saveTo };
       setJobs((js) =>
         js.some((j) => j.jobId === jobId)
           ? js.map((j) => (j.jobId === jobId ? { ...j, ...meta } : j))
@@ -469,17 +541,21 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
 
   // ---------- restore ----------
   const applySettings = async (im: ImageRecord) => {
+    // Settings from a vault item keep the new outputs in the vault.
+    if (im.vault) setSaveChoice("vault");
+    const dest: Destination = im.vault ? "vault" : saveTo;
     if (isVideo(im)) {
-      setLightbox(null);
+      setLightboxId(null);
       setMode("video");
-      // A start frame taken from the gallery is re-selected in place (matched by its file path).
-      const galleryStart = im.initImage ? (imagesRef.current.find((x) => x.kind !== "video" && x.path === im.initImage) ?? null) : null;
+      // A start frame taken from the gallery (or vault) is re-selected in place (matched by its file path).
+      const pool = im.vault ? vault.items : imagesRef.current;
+      const galleryStart = im.initImage ? (pool.find((x) => x.kind !== "video" && x.path === im.initImage) ?? null) : null;
       await videoRef.current?.applySettings(im, galleryStart);
       return;
     }
     const m = imageModels.find((x) => x.id === im.model);
     if (!m) return toast.error("That model is no longer available", im.model);
-    setLightbox(null);
+    setLightboxId(null);
     setMode("image");
     setModelId(m.id);
     setPrompt(im.prompt);
@@ -510,7 +586,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
       setDenoise(Math.min(DENOISE_MAX, Math.max(DENOISE_MIN, im.denoise ?? DENOISE_DEFAULT)));
       setStartBusy(true);
       try {
-        setStartImage(await api.importReference(im.initImage));
+        setStartImage(await api.importReference(im.initImage, dest));
       } catch {
         startFailed = true;
       } finally {
@@ -525,7 +601,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
       const restored: RefItem[] = [];
       for (const p of im.references.slice(0, m.maxReferences)) {
         try {
-          restored.push(await api.importReference(p));
+          restored.push(await api.importReference(p, dest));
         } catch {
           refFails++;
         }
@@ -543,12 +619,31 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     requestAnimationFrame(() => promptRef.current?.focus());
   };
 
-  const onDeleted = (id: string) => {
-    const next = imagesRef.current.filter((x) => x.id !== id);
+  /** An item left the visible list (deleted, or moved to the other tab): show its neighbour. */
+  const onRemoved = (id: string) => {
+    const i = shown.findIndex((x) => x.id === id);
+    const neighbour = i >= 0 ? (shown[i + 1] ?? shown[i - 1]) : undefined;
+    setLightboxId((cur) => (cur === id ? (neighbour?.id ?? null) : cur));
+    if (galleryTab === "vault") {
+      vault.removeLocal(id);
+    } else {
+      const next = imagesRef.current.filter((x) => x.id !== id);
+      imagesRef.current = next;
+      setImages(next);
+    }
+  };
+
+  /** A vault item moved to General: slot it into the loaded General list by date. */
+  const onMovedToGeneral = (rec: ImageRecord) => {
+    onRemoved(rec.id);
+    const list = imagesRef.current;
+    if (list.some((x) => x.id === rec.id)) return;
+    const t = Date.parse(rec.createdAt);
+    const at = list.findIndex((x) => Date.parse(x.createdAt) < t);
+    if (at < 0 && hasMore) return; // older than what's loaded: arrives with a later page
+    const next = at < 0 ? [...list, rec] : [...list.slice(0, at), rec, ...list.slice(at)];
     imagesRef.current = next;
     setImages(next);
-    const left = next.filter(matches).length;
-    setLightbox((i) => (i == null || left === 0 ? null : Math.min(i, left - 1)));
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
@@ -564,19 +659,38 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   const onVideoQueued = useCallback((job: JobView) => {
     setJobs((js) =>
       js.some((j) => j.jobId === job.jobId)
-        ? js.map((j) => (j.jobId === job.jobId ? { ...j, modelName: job.modelName, prompt: job.prompt, kind: "video" } : j))
+        ? js.map((j) => (j.jobId === job.jobId ? { ...j, modelName: job.modelName, prompt: job.prompt, kind: "video", destination: job.destination } : j))
         : [...js, job],
     );
   }, []);
 
-  // ---------- gallery filter ----------
-  const [filter, setFilter] = useState<GalleryFilter>("all");
-  filterRef.current = filter;
-  const shown = useMemo(
-    () => (filter === "all" ? images : images.filter((im) => (filter === "video") === isVideo(im))),
-    [images, filter],
-  );
-  const videoCount = useMemo(() => images.filter(isVideo).length, [images]);
+  // ---------- gallery tabs (General | Vault) and filters ----------
+  const [galleryTab, setGalleryTabState] = useState<GalleryTab>("general");
+  const [filters, setFilters] = useState<Record<GalleryTab, GalleryFilter>>({ general: "all", vault: "all" });
+  const filter = filters[galleryTab];
+  const setFilter = (f: GalleryFilter, tab: GalleryTab = galleryTab) => setFilters((x) => ({ ...x, [tab]: f }));
+  const setGalleryTab = (t: GalleryTab) => {
+    setGalleryTabState(t);
+    setLightboxId(null);
+  };
+  // Vault items are listed only while unlocked (the provider empties them on lock).
+  const tabItems = galleryTab === "vault" ? (vault.unlocked ? vault.items : []) : images;
+  const shown = useMemo(() => applyFilter(tabItems, filter), [tabItems, filter]);
+  const videoCount = useMemo(() => tabItems.filter(isVideo).length, [tabItems]);
+  const tabHasMore = galleryTab === "vault" ? false : hasMore;
+  const migrating = !!vault.migration && vault.migration.phase !== "done" && vault.migration.phase !== "error";
+  const lightboxIndex = lightboxId ? shown.findIndex((x) => x.id === lightboxId) : -1;
+
+  /** Job card thumbnail → open it in the right tab (clearing a filter that hides it). */
+  const openFromJob = (id: string) => {
+    const inVault = vault.unlocked && vault.items.some((x) => x.id === id);
+    const tab: GalleryTab = inVault ? "vault" : "general";
+    const list = inVault ? vault.items : images;
+    if (!list.some((x) => x.id === id)) return;
+    setGalleryTabState(tab);
+    if (!applyFilter(list, filters[tab]).some((x) => x.id === id)) setFilter("all", tab);
+    setLightboxId(id);
+  };
 
   /** The video GPU's start note on video job cards while that GPU is off or starting. */
   const vgpu = gpu.profiles.video;
@@ -592,6 +706,9 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         hidden={mode !== "video"}
         active={active && mode === "video"}
         modeSwitch={modeSwitch}
+        saveTo={saveTo}
+        saveToSwitch={saveToSwitch}
+        onVaultStart={setVideoVaultStart}
         onNavigate={onNavigate}
         onQueued={onVideoQueued}
         activeJobs={activeVideoJobs}
@@ -723,6 +840,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         </div>
 
         <div className="panel__foot">
+          {saveToSwitch}
           <button type="submit" className="btn btn--generate" disabled={submitting || (!!blocker && blocker !== "Write a prompt")} aria-describedby="gen-hint">
             <Icon name="spark" size={18} />
             <span>
@@ -754,61 +872,108 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
               <JobCard
                 key={j.jobId}
                 job={j}
+                sealed={j.destination === "vault" && !vault.unlocked}
                 podMode={gpu.podMode}
                 gpuNote={j.kind === "video" && (j.status === "queued" || j.status === "starting") ? videoGpuNote : null}
                 onCancel={() => cancelJob(j.jobId)}
                 onDismiss={() => setJobs((js) => js.filter((x) => x.jobId !== j.jobId))}
-                onOpenImage={(id) => {
-                  let i = shown.findIndex((x) => x.id === id);
-                  if (i < 0) {
-                    // Hidden by the gallery filter: show everything, then open it.
-                    setFilter("all");
-                    i = images.findIndex((x) => x.id === id);
-                  }
-                  if (i >= 0) setLightbox(i);
-                }}
+                onOpenImage={openFromJob}
               />
             ))}
           </div>
         )}
         <div className="canvas__head">
           <h2 className="canvas__title">Gallery</h2>
-          <GalleryFilterChips value={filter} onChange={(f) => {
-            setFilter(f);
-            setLightbox(null);
-          }} />
+          <GalleryTabs value={galleryTab} onChange={setGalleryTab} unlocked={vault.unlocked} />
+          {(galleryTab === "general" || (vault.unlocked && !migrating)) && (
+            <GalleryFilterChips
+              value={filter}
+              onChange={(f) => {
+                setFilter(f);
+                setLightboxId(null);
+              }}
+            />
+          )}
           <span className="hint canvas__count">
-            {images.length
+            {tabItems.length && !(galleryTab === "vault" && migrating)
               ? filter === "all"
-                ? `${images.length}${hasMore ? "+" : ""} items${videoCount ? ` · ${videoCount} video${videoCount === 1 ? "" : "s"}` : ""}`
-                : `${shown.length}${hasMore ? "+" : ""} ${filter === "video" ? (shown.length === 1 ? "video" : "videos") : shown.length === 1 ? "image" : "images"}`
+                ? `${tabItems.length}${tabHasMore ? "+" : ""} item${tabItems.length === 1 ? "" : "s"}${videoCount ? ` · ${videoCount} video${videoCount === 1 ? "" : "s"}` : ""}`
+                : `${shown.length}${tabHasMore ? "+" : ""} ${filter === "video" ? (shown.length === 1 ? "video" : "videos") : shown.length === 1 ? "image" : "images"}`
               : ""}
           </span>
+          {vault.unlocked && (
+            <button type="button" className="btn btn--sm vault-lock-btn" onClick={() => void vault.lock()} title="Lock the vault now — its items disappear until you unlock">
+              <Icon name="lock" size={14} /> Lock vault
+            </button>
+          )}
         </div>
-        <Gallery
-          items={shown}
-          filter={filter}
-          loadedCount={images.length}
-          modelNames={modelNames}
-          loading={loadingImages}
-          hasMore={hasMore}
-          onLoadMore={loadMore}
-          onOpen={setLightbox}
-          scrollRoot={scrollRef}
-        />
+        <div id="gallery-panel" role="tabpanel" aria-labelledby={`gallery-tab-${galleryTab}`}>
+          {galleryTab === "general" ? (
+            <Gallery
+              items={shown}
+              filter={filter}
+              loadedCount={images.length}
+              modelNames={modelNames}
+              loading={loadingImages}
+              hasMore={hasMore}
+              onLoadMore={loadMore}
+              onOpen={(i) => setLightboxId(shown[i]?.id ?? null)}
+              scrollRoot={scrollRef}
+            />
+          ) : (
+            <>
+              {vault.migration && (vault.unlocked || migrating) && (
+                <MigrationView progress={vault.migration} onDone={vault.dismissMigration} />
+              )}
+              {!vault.status ? (
+                <div className="gallery__loading" role="status">
+                  <Icon name="refresh" className="spin" /> Loading…
+                </div>
+              ) : !vault.exists ? (
+                <VaultCreate generalCount={images.length} generalMore={hasMore} />
+              ) : !vault.unlocked ? (
+                <VaultLockScreen />
+              ) : !migrating ? (
+                <Gallery
+                  items={shown}
+                  filter={filter}
+                  loadedCount={vault.items.length}
+                  modelNames={modelNames}
+                  loading={vault.loading && vault.items.length === 0}
+                  hasMore={false}
+                  onLoadMore={() => {}}
+                  onOpen={(i) => setLightboxId(shown[i]?.id ?? null)}
+                  scrollRoot={scrollRef}
+                  empty={
+                    filter === "video"
+                      ? { icon: "video", title: "No videos in the vault", text: "Set Save to: Vault before generating a video, or move one in from General." }
+                      : filter === "image"
+                        ? { icon: "image", title: "No images in the vault", text: "Set Save to: Vault before generating, or move images in from General." }
+                        : { icon: "lock", title: "Your vault is empty", text: "Set Save to: Vault on the Create panel, or open an item in General and choose Move to vault." }
+                  }
+                />
+              ) : null}
+            </>
+          )}
+        </div>
       </main>
 
       <Lightbox
         items={shown}
-        index={lightbox}
-        onIndex={setLightbox}
-        onClose={() => setLightbox(null)}
-        onDeleted={onDeleted}
+        index={lightboxIndex >= 0 ? lightboxIndex : null}
+        onIndex={(i) => setLightboxId(shown[i]?.id ?? null)}
+        onClose={() => setLightboxId(null)}
+        onDeleted={onRemoved}
+        onMovedToVault={onRemoved}
+        onMovedToGeneral={onMovedToGeneral}
+        vaultExists={vault.exists}
+        vaultUnlocked={vault.unlocked}
         onUseSettings={applySettings}
         onMakeVideo={
           lib.videoModels.some((m) => m.modes?.includes("i2v"))
             ? (im) => {
-                setLightbox(null);
+                setLightboxId(null);
+                if (im.vault) setSaveChoice("vault");
                 setMode("video");
                 videoRef.current?.startFromImage(im);
               }
@@ -819,12 +984,19 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
 
       <GalleryPicker
         open={startPickerOpen}
+        preferVault={saveTo === "vault"}
         modelNames={modelNames}
         onClose={() => setStartPickerOpen(false)}
         onPick={(rec) => {
           setStartPickerOpen(false);
+          // A vault item is used in place (decrypted in memory by the backend, `initImageVaultId`).
+          if (rec.vault) {
+            setSaveChoice("vault");
+            setStartImage({ refId: "", thumbPath: rec.thumbPath || rec.path, vaultId: rec.id });
+            return;
+          }
           // Image mode has no gallery-id argument: import the gallery file like any other start image.
-          void setStartFrom(() => api.importReference(rec.path));
+          void setStartFrom(() => api.importReference(rec.path, saveTo));
         }}
       />
 
@@ -851,6 +1023,38 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
           if (files.length) void addFiles(files);
         }}
       />
+    </div>
+  );
+}
+
+const GALLERY_TABS: GalleryTab[] = ["general", "vault"];
+
+function GalleryTabs({ value, onChange, unlocked }: { value: GalleryTab; onChange: (t: GalleryTab) => void; unlocked: boolean }) {
+  return (
+    <div className="gallery-tabs" role="tablist" aria-label="Gallery" onKeyDown={radioKeys(GALLERY_TABS, value, onChange)}>
+      {GALLERY_TABS.map((t) => (
+        <button
+          key={t}
+          id={`gallery-tab-${t}`}
+          type="button"
+          role="tab"
+          aria-selected={t === value}
+          aria-controls="gallery-panel"
+          tabIndex={t === value ? 0 : -1}
+          className={`gallery-tab ${t === value ? "is-active" : ""}`}
+          onClick={() => onChange(t)}
+        >
+          {t === "general" ? (
+            "General"
+          ) : (
+            <>
+              <Icon name={unlocked ? "unlock" : "lock"} size={14} />
+              Vault
+              <span className="visually-hidden">{unlocked ? " (unlocked)" : " (locked)"}</span>
+            </>
+          )}
+        </button>
+      ))}
     </div>
   );
 }

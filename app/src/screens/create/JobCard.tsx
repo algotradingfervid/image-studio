@@ -19,6 +19,7 @@ const PHASE: Record<string, string> = {
 };
 
 const STAGE_LABEL: Record<string, string> = {
+  copying_models: "Copying model to fast disk",
   loading_text_encoder: "Loading text encoder",
   encoding_prompt: "Encoding prompt",
   loading_model: "Loading model",
@@ -75,6 +76,7 @@ function etaText(seconds: number): string {
 
 export function JobCard({
   job,
+  sealed = false,
   podMode,
   gpuNote,
   onCancel,
@@ -82,6 +84,8 @@ export function JobCard({
   onOpenImage,
 }: {
   job: JobView;
+  /** A vault job while the vault is locked: no prompt, no thumbnails (spec v6). */
+  sealed?: boolean;
   /** Dedicated GPU pod backend (vs legacy serverless): changes what "starting" means. */
   podMode: boolean;
   /** Video jobs: the cost note while the video GPU is off/starting. */
@@ -201,7 +205,10 @@ export function JobCard({
   const promptLine = `${job.modelName}${job.prompt ? ` · ${job.prompt}` : ""}`;
 
   return (
-    <article className={`job-card job-card--${job.status}`} aria-label={`${video ? "Video" : "Generation"}: ${job.prompt}`}>
+    <article
+      className={`job-card job-card--${job.status} ${sealed ? "job-card--sealed" : ""}`}
+      aria-label={sealed ? `${video ? "Video" : "Generation"} saved to the vault` : `${video ? "Video" : "Generation"}: ${job.prompt}`}
+    >
       <div className="job-card__head">
         <div className="job-card__status">
           {active ? <span className="pulse" aria-hidden /> : <Icon name={job.status === "completed" ? "check" : job.status === "failed" ? "alert" : "stop"} />}
@@ -266,11 +273,24 @@ export function JobCard({
       )}
 
       <div className="job-card__foot">
-        <p className="job-card__prompt" title={promptLine}>
-          <strong>{job.modelName}</strong>
-          {job.prompt ? ` · ${job.prompt}` : ""}
-        </p>
-        {job.images.length > 0 && (
+        {sealed ? (
+          <p className="job-card__prompt job-card__sealed">
+            <Icon name="lock" size={13} /> Saved to vault
+            <span className="hint"> · unlock to see it</span>
+          </p>
+        ) : (
+          <p className="job-card__prompt" title={promptLine}>
+            <strong>{job.modelName}</strong>
+            {job.prompt ? ` · ${job.prompt}` : ""}
+            {job.destination === "vault" && (
+              <span className="job-card__dest" title="Saved to the vault">
+                {" "}
+                <Icon name="lock" size={11} label="Vault" />
+              </span>
+            )}
+          </p>
+        )}
+        {!sealed && job.images.length > 0 && (
           <div className="job-card__thumbs">
             {job.images.map((im) => (
               <button key={im.id} type="button" className="job-thumb" onClick={() => onOpenImage(im.id)} aria-label={`Open ${im.kind === "video" ? "video" : "image"} seed ${im.seed}`}>
@@ -293,7 +313,10 @@ function stageSteps(p: JobProgress, sinceUpdate: number): StepItem[] {
   const times = p.stageTimes ?? {};
   const cached = new Set(p.cachedStages ?? []);
   return list.map((s) => {
-    const label = STAGE_LABEL[s] ?? s.replace(/_/g, " ");
+    let label = STAGE_LABEL[s] ?? s.replace(/_/g, " ");
+    if (s === "copying_models" && s === current && p.copyPercent != null) {
+      label += ` · ${Math.round(p.copyPercent)}%`;
+    }
     if (s === current) {
       return { key: s, label, state: "current", time: secs((p.stageElapsedMs ?? 0) + sinceUpdate) };
     }

@@ -5,6 +5,8 @@ import { Icon } from "../../components/Icon";
 import { shortGpuName } from "../../lib/format";
 import { useLibrary } from "../../state/library";
 import { useToast } from "../../state/toast";
+import { useVault } from "../../state/vault";
+import { PasswordField } from "../create/VaultViews";
 
 function SecretField({
   id,
@@ -117,6 +119,199 @@ function TestResult({ result }: { result: ConnectionTest }) {
       <Icon name="check" />
       <div>{body}</div>
     </div>
+  );
+}
+
+function parseAutoLock(v: string): number | null {
+  if (!/^\d+$/.test(v.trim())) return null;
+  const n = Number(v.trim());
+  return n >= api.VAULT_AUTOLOCK_MIN && n <= api.VAULT_AUTOLOCK_MAX ? n : null;
+}
+
+/** Vault (spec v6): auto-lock minutes, change password, lock now. */
+function VaultSettings() {
+  const vault = useVault();
+  const toast = useToast();
+  const st = vault.status;
+  const [minutes, setMinutes] = useState("10");
+  const [savingMin, setSavingMin] = useState(false);
+  const [oldPw, setOldPw] = useState("");
+  const [newPw, setNewPw] = useState("");
+  const [confirmPw, setConfirmPw] = useState("");
+  const [pwBusy, setPwBusy] = useState(false);
+  const [pwError, setPwError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (st) setMinutes(String(st.autoLockMinutes));
+  }, [st?.autoLockMinutes]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const minN = parseAutoLock(minutes);
+  const minDirty = !!st && minN !== st.autoLockMinutes;
+
+  const saveMinutes = async (e: FormEvent) => {
+    e.preventDefault();
+    if (minN == null || !minDirty) return;
+    setSavingMin(true);
+    try {
+      await vault.setAutoLock(minN);
+      toast.success("Auto-lock saved", `The vault locks after ${minN} minute${minN === 1 ? "" : "s"} without activity.`);
+    } catch (err) {
+      toast.error("Couldn't save the auto-lock time", err);
+    } finally {
+      setSavingMin(false);
+    }
+  };
+
+  const short = newPw.length > 0 && newPw.length < api.VAULT_PASSWORD_MIN;
+  const mismatch = confirmPw.length > 0 && confirmPw !== newPw;
+  const pwValid = !!oldPw && newPw.length >= api.VAULT_PASSWORD_MIN && confirmPw === newPw;
+
+  const changePw = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!pwValid || pwBusy) return;
+    setPwBusy(true);
+    setPwError(null);
+    try {
+      await vault.changePassword(oldPw, newPw);
+      setOldPw("");
+      setNewPw("");
+      setConfirmPw("");
+      toast.success("Vault password changed", "Use the new password from now on — the old one no longer works.");
+    } catch (err) {
+      const code = api.errorCode(err);
+      setPwError(
+        code === "WRONG_PASSWORD"
+          ? "The current password is wrong."
+          : code === "WEAK_PASSWORD"
+            ? `Use at least ${api.VAULT_PASSWORD_MIN} characters.`
+            : code === "VAULT_LOCKED"
+              ? "The vault locked. Unlock it and try again."
+              : api.errorMessage(err),
+      );
+    } finally {
+      setPwBusy(false);
+    }
+  };
+
+  return (
+    <section className="card settings vault-settings" aria-labelledby="vault-settings-title">
+      <h2 id="vault-settings-title" className="card__title">
+        <Icon name="shield" /> Vault
+        {st?.exists && (
+          <span className={`badge ${st.unlocked ? "badge--accent" : "badge--muted"} vault-settings__state`}>
+            <Icon name={st.unlocked ? "unlock" : "lock"} size={11} /> {st.unlocked ? "Unlocked" : "Locked"}
+          </span>
+        )}
+      </h2>
+      {!st ? (
+        <p className="hint">Loading…</p>
+      ) : !st.exists ? (
+        <p className="hint">No vault yet. Create one from the Vault tab of the gallery on the Create screen.</p>
+      ) : (
+        <>
+          <form className="field" onSubmit={saveMinutes}>
+            <label className="field__label" htmlFor="vault-autolock">
+              Auto-lock after N minutes without activity
+            </label>
+            <div className="vault-settings__row">
+              <div className="input-suffix">
+                <input
+                  id="vault-autolock"
+                  className="input mono"
+                  type="number"
+                  inputMode="numeric"
+                  min={api.VAULT_AUTOLOCK_MIN}
+                  max={api.VAULT_AUTOLOCK_MAX}
+                  step={1}
+                  value={minutes}
+                  onChange={(e) => setMinutes(e.target.value)}
+                  aria-invalid={minN == null}
+                  aria-describedby="vault-autolock-help"
+                />
+                <span className="input-suffix__unit">min</span>
+              </div>
+              <button type="submit" className="btn" disabled={minN == null || !minDirty || savingMin}>
+                {savingMin ? "Saving…" : "Save"}
+              </button>
+            </div>
+            <p id="vault-autolock-help" className={`hint ${minN == null ? "hint--error" : ""}`}>
+              {minN == null
+                ? `Enter a whole number from ${api.VAULT_AUTOLOCK_MIN} to ${api.VAULT_AUTOLOCK_MAX}.`
+                : "The vault also locks when the app quits and when the Mac sleeps or locks its screen. Default 10."}
+            </p>
+          </form>
+
+          <h3 className="card__title card__title--sub">
+            <Icon name="key" /> Change password
+          </h3>
+          {st.unlocked ? (
+            <form onSubmit={changePw} aria-label="Change the vault password">
+              <PasswordField id="vault-old-pw" label="Current password" value={oldPw} onChange={setOldPw} disabled={pwBusy} />
+              <div className="field-row vault-settings__pw">
+                <div>
+                  <PasswordField
+                    id="vault-new-pw"
+                    label="New password"
+                    value={newPw}
+                    onChange={setNewPw}
+                    disabled={pwBusy}
+                    invalid={short}
+                    describedBy="vault-new-pw-help"
+                    autoComplete="new-password"
+                  />
+                  <p id="vault-new-pw-help" className={`hint ${short ? "hint--error" : ""}`}>
+                    At least {api.VAULT_PASSWORD_MIN} characters.
+                  </p>
+                </div>
+                <div>
+                  <PasswordField
+                    id="vault-confirm-pw"
+                    label="Confirm new password"
+                    value={confirmPw}
+                    onChange={setConfirmPw}
+                    disabled={pwBusy}
+                    invalid={mismatch}
+                    describedBy="vault-confirm-pw-help"
+                    autoComplete="new-password"
+                  />
+                  <p id="vault-confirm-pw-help" className={`hint ${mismatch ? "hint--error" : ""}`}>
+                    {mismatch ? "The passwords don't match." : "Type it again."}
+                  </p>
+                </div>
+              </div>
+              {pwError && (
+                <p className="vault-gate__status is-error" role="alert">
+                  <Icon name="alert" size={14} /> {pwError}
+                </p>
+              )}
+              <p className="hint">There is still no recovery: if you forget the new password, the content is gone.</p>
+              <div className="settings__actions">
+                <button type="submit" className="btn btn--primary" disabled={!pwValid || pwBusy}>
+                  {pwBusy ? <Icon name="refresh" className="spin" /> : null}
+                  {pwBusy ? "Changing…" : "Change password"}
+                </button>
+              </div>
+            </form>
+          ) : (
+            <p className="hint">Unlock the vault (Create → Gallery → Vault) to change its password.</p>
+          )}
+
+          {st.unlocked && (
+            <>
+              <h3 className="card__title card__title--sub">
+                <Icon name="lock" /> Lock
+              </h3>
+              <div className="vault-settings__row">
+                <p className="hint vault-settings__grow">Locking wipes the key and every decrypted item from memory. Vault items disappear until you unlock again.</p>
+                <button type="button" className="btn" onClick={() => void vault.lock()}>
+                  <Icon name="lock" /> Lock now
+                </button>
+              </div>
+            </>
+          )}
+        </>
+      )}
+    </section>
   );
 }
 
@@ -385,6 +580,8 @@ export function SettingsScreen() {
 
           {result && <TestResult result={result} />}
         </form>
+
+        <VaultSettings />
 
         <section className="card note" aria-labelledby="cost-title">
           <h2 id="cost-title" className="card__title">

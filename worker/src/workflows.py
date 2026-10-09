@@ -697,6 +697,9 @@ def is_video_graph(graph: dict) -> bool:
 # depends on the graph, so consumers should mark stages done from the
 # reported stage times rather than from their position in this list.
 STAGES: tuple[str, ...] = (
+    # Pod mode only: the handler waits for the model's files to be copied to
+    # the container disk (local_models.py). Never part of a graph.
+    "copying_models",
     "loading_text_encoder",
     "encoding_prompt",
     "loading_model",
@@ -712,6 +715,7 @@ STAGES: tuple[str, ...] = (
 
 # Back-compat "phase" of each stage (the v1 progress protocol).
 STAGE_PHASE: dict[str, str] = {
+    "copying_models": "loading",
     "loading_text_encoder": "loading",
     "encoding_prompt": "loading",
     "loading_model": "loading",

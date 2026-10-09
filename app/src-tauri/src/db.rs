@@ -56,6 +56,14 @@ pub struct ImageRecord {
     /// Video poster frame (JPEG).
     #[serde(default)]
     pub poster_path: Option<String>,
+    /// True for vault items (spec v6): `path`, `poster_path`, `init_image` and
+    /// `references` are then `vault:<uuid>.<ext>` and the record never touches
+    /// this database.
+    #[serde(default)]
+    pub vault: bool,
+    /// Small preview to show in grids (vault items only; `vault:` path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumb_path: Option<String>,
 }
 
 pub const KIND_IMAGE: &str = "image";
@@ -203,6 +211,9 @@ impl Db {
 
     fn init(conn: Connection) -> Result<Db, String> {
         conn.pragma_update(None, "journal_mode", "WAL").ok();
+        // Deleted rows are overwritten with zeros (a record moved into the
+        // vault must leave no residue in the database file).
+        conn.pragma_update(None, "secure_delete", "ON").ok();
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(e)?;
@@ -287,6 +298,8 @@ impl Db {
                 fps: row.get("fps")?,
                 has_audio: row.get("has_audio")?,
                 poster_path: row.get("poster_path")?,
+                vault: false,
+                thumb_path: None,
             },
         ))
     }
@@ -337,6 +350,43 @@ impl Db {
             .execute("DELETE FROM images WHERE id = ?1", [id])
             .map_err(e)?;
         Ok(())
+    }
+
+    /// Removes residue of deleted rows from the database and WAL files
+    /// (after moving records into the vault).
+    pub fn scrub(&self) -> Result<(), String> {
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
+            .map_err(e)
+    }
+
+    /// How many records use `path` as their start image or as a reference
+    /// (shared `references/` files are only deleted when this drops to zero).
+    pub fn path_use_count(&self, path: &str) -> Result<usize, String> {
+        let quoted = serde_json::to_string(path).unwrap();
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM images WHERE init_image = ?1 OR instr(references_json, ?2) > 0",
+                params![path, quoted],
+                |r| r.get(0),
+            )
+            .map_err(e)?;
+        Ok(n.max(0) as usize)
+    }
+
+    /// Every record id, oldest first (for the vault migration).
+    pub fn all_image_ids(&self) -> Result<Vec<String>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM images ORDER BY seq ASC")
+            .map_err(e)?;
+        let ids = stmt
+            .query_map([], |r| r.get(0))
+            .map_err(e)?
+            .collect::<Result<_, _>>()
+            .map_err(e)?;
+        Ok(ids)
     }
 
     // ----- loras -----
@@ -531,7 +581,28 @@ mod tests {
             fps: None,
             has_audio: None,
             poster_path: None,
+            vault: false,
+            thumb_path: None,
         }
+    }
+
+    #[test]
+    fn path_use_counts_start_images_and_references() {
+        let db = Db::open_in_memory().unwrap();
+        let mut a = img("a", 1);
+        a.init_image = Some("/r/s.png".into());
+        a.references = vec!["/r/a.jpg".into(), "/r/b.jpg".into()];
+        db.insert_image(&a).unwrap();
+        db.insert_image(&img("b", 2)).unwrap(); // references /r/a.jpg
+        assert_eq!(db.path_use_count("/r/a.jpg").unwrap(), 2);
+        assert_eq!(db.path_use_count("/r/b.jpg").unwrap(), 1);
+        assert_eq!(db.path_use_count("/r/s.png").unwrap(), 1);
+        assert_eq!(db.path_use_count("/r/").unwrap(), 0, "no substring matches");
+        assert_eq!(db.all_image_ids().unwrap(), vec!["a".to_string(), "b".to_string()]);
+        // vault flags never reach the database
+        let j = serde_json::to_value(&a).unwrap();
+        assert_eq!(j["vault"], false);
+        assert!(j.get("thumbPath").is_none());
     }
 
     #[test]

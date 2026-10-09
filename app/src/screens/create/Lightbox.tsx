@@ -22,6 +22,10 @@ export function Lightbox({
   onIndex,
   onClose,
   onDeleted,
+  onMovedToVault,
+  onMovedToGeneral,
+  vaultExists = false,
+  vaultUnlocked = false,
   onUseSettings,
   onMakeVideo,
   modelNames,
@@ -31,6 +35,14 @@ export function Lightbox({
   onIndex: (i: number) => void;
   onClose: () => void;
   onDeleted: (id: string) => void;
+  /** A General item was moved into the vault (spec v6). */
+  onMovedToVault?: (id: string) => void;
+  /** A vault item was moved to General; gets the new General record. */
+  onMovedToGeneral?: (rec: ImageRecord) => void;
+  /** Offer "Move to vault" on General items. */
+  vaultExists?: boolean;
+  /** Moving in needs the unlocked vault (the encrypted copy is verified by decrypting it). */
+  vaultUnlocked?: boolean;
   onUseSettings: (im: ImageRecord) => void;
   /** Image records: open Create in Video mode with this image as the start frame. */
   onMakeVideo?: (im: ImageRecord) => void;
@@ -38,17 +50,20 @@ export function Lightbox({
 }) {
   const toast = useToast();
   const im = index != null ? items[index] : undefined;
-  const [confirming, setConfirming] = useState(false);
+  /** Which inline confirmation is open: delete, move to General, or export (vault). */
+  const [confirming, setConfirmingState] = useState<"delete" | "general" | "export" | null>(null);
+  const setConfirming = (v: boolean | "delete" | "general" | "export") => setConfirmingState(v === true ? "delete" : v === false ? null : v);
   const [busy, setBusy] = useState(false);
   const [videoFailed, setVideoFailed] = useState(false);
   const video = im?.kind === "video";
+  const inVault = !!im?.vault;
   const noun = video ? "video" : "image";
   const Noun = video ? "Video" : "Image";
 
   useEffect(() => {
-    setConfirming(false);
+    setConfirmingState(null);
     setVideoFailed(false);
-  }, [index]);
+  }, [index, im?.id]);
 
   const go = (d: number) => {
     if (index == null) return;
@@ -62,10 +77,45 @@ export function Lightbox({
       const name = `image-studio-${im.model}-${im.seed}.${extOf(im.path, video)}`;
       const dest = await api.pickSavePath(name);
       if (!dest) return;
-      await api.exportImage({ id: im.id, destPath: dest });
-      toast.success(`${Noun} saved`, dest);
+      if (inVault) {
+        await api.exportVaultItem({ id: im.id, dest });
+        setConfirming(false);
+        toast.success(`${Noun} exported — not encrypted`, dest);
+      } else {
+        await api.exportImage({ id: im.id, destPath: dest });
+        toast.success(`${Noun} saved`, dest);
+      }
     } catch (e) {
       toast.error(`Couldn't save the ${noun}`, e);
+    }
+  };
+
+  const moveToVault = async () => {
+    if (!im) return;
+    setBusy(true);
+    try {
+      await api.moveToVault(im.id);
+      onMovedToVault?.(im.id);
+      toast.success(`${Noun} moved to the vault`, "Encrypted and verified; the unencrypted file was deleted.");
+    } catch (e) {
+      toast.error(`Couldn't move the ${noun} to the vault`, e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const moveToGeneral = async () => {
+    if (!im) return;
+    setBusy(true);
+    try {
+      const rec = await api.moveToGeneral(im.id);
+      onMovedToGeneral?.(rec);
+      toast.success(`${Noun} moved to General`, "It's no longer encrypted.");
+    } catch (e) {
+      toast.error(`Couldn't move the ${noun} to General`, e);
+    } finally {
+      setBusy(false);
+      setConfirming(false);
     }
   };
 
@@ -83,7 +133,8 @@ export function Lightbox({
     if (!im) return;
     setBusy(true);
     try {
-      await api.deleteImage(im.id);
+      if (inVault) await api.deleteVaultItem(im.id);
+      else await api.deleteImage(im.id);
       onDeleted(im.id);
       toast.info(`${Noun} deleted`);
     } catch (e) {
@@ -156,7 +207,14 @@ export function Lightbox({
 
           <aside className="lightbox__side" aria-label={`${Noun} settings`}>
             <header className="lightbox__head">
-              <span className="eyebrow">{modelNames[im.model] ?? im.model}</span>
+              <span className="eyebrow">
+                {inVault && (
+                  <span className="badge badge--vault">
+                    <Icon name="lock" size={11} /> Vault
+                  </span>
+                )}
+                {modelNames[im.model] ?? im.model}
+              </span>
               <button type="button" className="icon-btn" aria-label="Close (Esc)" onClick={onClose} autoFocus>
                 <Icon name="x" />
               </button>
@@ -280,19 +338,74 @@ export function Lightbox({
                 <Icon name="restore" /> Use these settings
               </button>
               <div className="btn-row">
-                <button type="button" className="btn" onClick={download}>
-                  <Icon name="download" /> {video ? "Download .mp4" : "Download"}
-                </button>
+                {inVault ? (
+                  <button type="button" className="btn" onClick={() => setConfirming("export")} aria-expanded={confirming === "export"}>
+                    <Icon name="download" /> Export…
+                  </button>
+                ) : (
+                  <button type="button" className="btn" onClick={download}>
+                    <Icon name="download" /> {video ? "Download .mp4" : "Download"}
+                  </button>
+                )}
                 <button type="button" className="btn" onClick={copyPrompt}>
                   <Icon name="copy" /> Copy prompt
                 </button>
               </div>
+              {confirming === "export" && (
+                <div className="confirm confirm--note" role="group" aria-label="Export from the vault">
+                  <span>
+                    <Icon name="alert" size={13} /> The exported copy is <strong>not encrypted</strong> — anyone with access to where you save it can open it.
+                  </span>
+                  <div className="btn-row">
+                    <button type="button" className="btn btn--sm" onClick={() => setConfirming(false)}>
+                      Cancel
+                    </button>
+                    <button type="button" className="btn btn--primary btn--sm" onClick={download} autoFocus>
+                      <Icon name="download" size={13} /> Choose where to save…
+                    </button>
+                  </div>
+                </div>
+              )}
               {!video && onMakeVideo && (
                 <button type="button" className="btn" onClick={() => onMakeVideo(im)}>
                   <Icon name="video" /> Make video
                 </button>
               )}
-              {confirming ? (
+              {!inVault && vaultExists && (
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={moveToVault}
+                  disabled={busy || !vaultUnlocked}
+                  aria-describedby={vaultUnlocked ? undefined : "lightbox-move-note"}
+                >
+                  <Icon name={busy ? "refresh" : "lock"} className={busy ? "spin" : ""} /> {busy ? "Moving…" : "Move to vault"}
+                </button>
+              )}
+              {!inVault && vaultExists && !vaultUnlocked && (
+                <p id="lightbox-move-note" className="hint lightbox__note">
+                  <Icon name="info" size={12} /> Unlock the vault to move items.
+                </p>
+              )}
+              {inVault &&
+                (confirming === "general" ? (
+                  <div className="confirm confirm--note" role="group" aria-label="Confirm move to General">
+                    <span>Move this {noun} out of the vault? It's decrypted and saved unencrypted in General, visible without a password.</span>
+                    <div className="btn-row">
+                      <button type="button" className="btn btn--sm" onClick={() => setConfirming(false)} autoFocus>
+                        Keep in vault
+                      </button>
+                      <button type="button" className="btn btn--primary btn--sm" onClick={moveToGeneral} disabled={busy}>
+                        {busy ? "Moving…" : "Move to General"}
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <button type="button" className="btn" onClick={() => setConfirming("general")}>
+                    <Icon name="unlock" /> Move to General
+                  </button>
+                ))}
+              {confirming === "delete" ? (
                 <div className="confirm" role="group" aria-label="Confirm delete">
                   <span>Delete this {noun} permanently?</span>
                   <div className="btn-row">

@@ -213,10 +213,13 @@ async fn create_payload_matches_spec() {
             // v4: the slim runtime image; code comes from GitHub at WORKER_REF.
             "image": "ghcr.io/algotradingfervid/image-studio-runtime:latest",
             "cloud": "SECURE",
-            "gpu": {"id": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "count": 1},
+            // Only hosts with CUDA >= 13.0 (runtime image built on torch cu130).
+            "gpu": {"id": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "count": 1,
+                    "minCudaVersion": "13.0"},
             // First volume name in priority order that exists wins.
             "dataCenterIds": ["EU-RO-1"],
-            "disk": 20,
+            // Holds local copies of the models (worker/src/local_models.py).
+            "disk": 100,
             "mounts": {"network": [{"volumeId": "xzrw5sl5ho", "path": "/runpod-volume"}]},
             "ports": ["8000/http"],
             "env": {
@@ -226,6 +229,9 @@ async fn create_payload_matches_spec() {
                 "WORKER_REF": "main",
                 "HF_TOKEN": "{{ RUNPOD_SECRET_image-studio-hf-token }}",
                 "CIVITAI_API_KEY": "{{ RUNPOD_SECRET_image-studio-civitai-key }}",
+                "COMFY_LOG_LEVEL": "INFO",
+                // No model generated yet: nothing to prefetch.
+                "PREFETCH_MODELS": "",
                 "RUNPOD_TERMINATE_API_KEY": "test-key"
             }
         })
@@ -500,6 +506,7 @@ async fn auto_stops_after_idle_minutes() {
     let job = Job {
         job_id: "j".into(),
         kind: Default::default(), // an image job (image profile)
+        destination: Default::default(),
         status: JobState::Running,
         total: 1,
         completed: 0,

@@ -10,6 +10,8 @@ use crate::runpod::{RunpodClient, DEFAULT_API_ROOT};
 use crate::settings::Settings;
 use crate::status::StatusView;
 use crate::tasks::{Task, TaskEntry};
+use crate::vault::{Vault, VaultStatus};
+use crate::vault_migrate::MigrationProgress;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -19,12 +21,16 @@ pub const EVENT_JOB: &str = "job-update";
 pub const EVENT_TASK: &str = "task-update";
 pub const EVENT_STATUS: &str = "status-update";
 pub const EVENT_GPU: &str = "gpu-update";
+pub const EVENT_VAULT: &str = "vault-update";
+pub const EVENT_VAULT_MIGRATION: &str = "vault-migration";
 
 pub trait EventSink: Send + Sync {
     fn job_update(&self, job: &Job);
     fn task_update(&self, task: &Task);
     fn status_update(&self, status: &StatusView);
     fn gpu_update(&self, _gpu: &GpuState) {}
+    fn vault_update(&self, _status: &VaultStatus) {}
+    fn vault_migration(&self, _progress: &MigrationProgress) {}
 }
 
 /// Injectable wall clock (tests drive the idle auto-stop with it).
@@ -93,6 +99,8 @@ pub struct Core {
     /// video GPU to start; it must not block image refreshes).
     pub video_refresh_lock: tokio::sync::Mutex<()>,
     pub gpu: Gpu,
+    /// Encrypted vault (spec v6), at `<data_dir>/vault/`.
+    pub vault: Vault,
 }
 
 impl Core {
@@ -108,8 +116,10 @@ impl Core {
                 .map_err(|e| format!("Could not create {}: {e}", d.display()))?;
         }
         let gpu = Gpu::new(settings.idle_minutes(), (cfg.clock)());
+        let vault = Vault::new(cfg.vault_dir(), settings.vault_auto_lock_minutes());
         Ok(Arc::new(Core {
             gpu,
+            vault,
             registry,
             db: Mutex::new(db),
             settings,
@@ -153,6 +163,17 @@ impl CoreConfig {
     /// Video files (.mp4) and their posters (spec v5).
     pub fn videos_dir(&self) -> PathBuf {
         self.data_dir.join("videos")
+    }
+    /// Encrypted vault files (spec v6).
+    pub fn vault_dir(&self) -> PathBuf {
+        self.data_dir.join("vault")
+    }
+}
+
+impl Core {
+    /// Emits the current vault status to the UI.
+    pub fn emit_vault(&self) {
+        self.sink.vault_update(&self.vault.status());
     }
 }
 

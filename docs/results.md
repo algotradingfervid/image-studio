@@ -17,3 +17,15 @@
 
 ## Still to measure
 Cold start, seconds per image per model, and cost per image. Filled in after the end-to-end run.
+
+## 2026-10-09 — video (v5) measurements and gotchas
+- **Video volume:** `image-studio-video` (`v7hzxkm304`), 150 GB, CA-MTL-3.
+- **MiniMax H3 download:** 4 files, 53.9 GB, all sha256-verified. Took 445 s at 121 MB/s average, on an RTX PRO 6000 fill pod at $2.49/h (about $0.30).
+- **LTX-2.5 download:** 8 files, 41.4 GB, all sha256-verified. Took 297 s at 140 MB/s average, on an H200 fill pod at $5.29/h, because no cheaper GPU was available in CA-MTL-3 after 9 GPU types were tried.
+- **LTX-2.5 is gated:** the Hugging Face licence must be accepted first, or downloads return HTTP 403.
+- **First real H3 video:** image→video, 15.08 s, 736×576, 24 fps, H.264 + AAC, 4.6 MB. Worker total time was 893.7 s (about 14.9 min) on an H200 in CA-MTL-3. Most of that time went to loading weights from the network volume; GPU memory grew at roughly 30–150 MB/s. The pod lived from 23:53:29 to 00:11:04 UTC (about 17.6 min, roughly $1.55).
+- **Pod boot with the runtime image cached on the host:** the server was up 71 s after the pod was created.
+
+## Video gotchas
+- **Pods load worker code from GitHub `main` at boot.** A pod started before `git push` ran the old code and failed with `UNKNOWN_ACTION: 'generate_video'`. Fix: push first, then Stop and Start the GPU.
+- **RTX PRO 6000 was often unavailable in CA-MTL-3,** so the app fell back to an H200 at $5.29/h.

@@ -11,6 +11,9 @@ pub mod settings;
 pub mod state;
 pub mod status;
 pub mod tasks;
+pub mod vault;
+pub mod vault_macos;
+pub mod vault_migrate;
 pub mod worker;
 
 use commands::QuitGuard;
@@ -38,6 +41,43 @@ impl state::EventSink for TauriSink {
     fn gpu_update(&self, s: &pod::GpuState) {
         let _ = self.0.emit(state::EVENT_GPU, s);
     }
+    fn vault_update(&self, s: &vault::VaultStatus) {
+        let _ = self.0.emit(state::EVENT_VAULT, s);
+    }
+    fn vault_migration(&self, p: &vault_migrate::MigrationProgress) {
+        let _ = self.0.emit(state::EVENT_VAULT_MIGRATION, p);
+    }
+}
+
+/// `vault://<uuid>.<ext>`: decrypted bytes from memory, with Range support,
+/// `Cache-Control: no-store`, and 403 while the vault is locked.
+fn vault_protocol<R: Runtime>(
+    ctx: tauri::UriSchemeContext<'_, R>,
+    request: tauri::http::Request<Vec<u8>>,
+) -> tauri::http::Response<Vec<u8>> {
+    let range = request
+        .headers()
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let served = match ctx.app_handle().try_state::<Arc<state::Core>>() {
+        Some(core) => core.vault.serve(request.uri().path(), range.as_deref()),
+        None => vault::Served {
+            status: 503,
+            headers: vec![],
+            body: vec![],
+        },
+    };
+    let mut b = tauri::http::Response::builder().status(served.status);
+    for (k, v) in &served.headers {
+        b = b.header(*k, v);
+    }
+    b.body(served.body).unwrap_or_else(|_| {
+        tauri::http::Response::builder()
+            .status(500)
+            .body(Vec::new())
+            .unwrap()
+    })
 }
 
 fn build_core(app: &tauri::App) -> Result<Arc<state::Core>, String> {
@@ -133,6 +173,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(QuitGuard::default())
+        .register_uri_scheme_protocol("vault", vault_protocol)
         .menu(app_menu)
         .on_menu_event(|app, event| {
             if event.id() == QUIT_MENU_ID {
@@ -151,6 +192,25 @@ pub fn run() {
         .setup(|app| {
             let core = build_core(app)?;
             app.manage(core.clone());
+            // Vault auto-lock: inactivity timer (every 10 s), plus macOS sleep /
+            // screen-lock / session hooks when available.
+            let lock_core = core.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    if lock_core.vault.lock_if_idle(std::time::Instant::now()) {
+                        lock_core.emit_vault();
+                    }
+                }
+            });
+            let hook_core = core.clone();
+            if !vault_macos::install(move || {
+                if hook_core.vault.lock() {
+                    hook_core.emit_vault();
+                }
+            }) {
+                eprintln!("[vault] no system sleep/lock hook on this platform; the inactivity timer locks the vault");
+            }
             // GPU pod: re-adopt a pod left running, cache the volume size,
             // and run the idle/error auto-stop and liveness monitor (it
             // never creates pods).
@@ -231,17 +291,40 @@ pub fn run() {
             commands::list_images,
             commands::delete_image,
             commands::export_image,
+            commands::seal_reference,
+            commands::vault_status,
+            commands::vault_create,
+            commands::vault_unlock,
+            commands::vault_lock,
+            commands::vault_change_password,
+            commands::vault_set_auto_lock,
+            commands::list_vault_items,
+            commands::move_to_vault,
+            commands::move_to_general,
+            commands::export_vault_item,
+            commands::delete_vault_item,
+            commands::vault_touch,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
             // Last window closed or a programmatic exit: confirm first while
             // a pod may be billing (`QuitGuard` lets a confirmed exit through).
-            if let RunEvent::ExitRequested { api, .. } = event {
-                if must_confirm_quit(app) {
-                    api.prevent_exit();
-                    ask_quit(app);
+            match event {
+                RunEvent::ExitRequested { api, .. } => {
+                    if must_confirm_quit(app) {
+                        api.prevent_exit();
+                        ask_quit(app);
+                    }
                 }
+                // The vault locks on quit (the key would die with the process
+                // anyway; this also drops the decrypted item cache first).
+                RunEvent::Exit => {
+                    if let Some(core) = app.try_state::<Arc<state::Core>>() {
+                        core.vault.lock();
+                    }
+                }
+                _ => {}
             }
         });
 }

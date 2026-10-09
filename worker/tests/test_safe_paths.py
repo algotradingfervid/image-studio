@@ -82,14 +82,70 @@ def test_extra_model_paths_maps_every_whitelisted_folder():
 
     from safe_paths import BASE_FOLDERS
 
-    text = (Path(__file__).resolve().parents[1] / "src" / "extra_model_paths.yaml").read_text()
-    entries = {}
-    for line in text.splitlines():
-        if line.startswith("  ") and ":" in line and not line.lstrip().startswith("#"):
-            k, v = line.strip().split(":", 1)
-            entries[k] = v.strip()
+    sections = _yaml_sections()
+    entries = sections["image_studio"]
     assert entries["base_path"] == "/runpod-volume/models"
+    assert "is_default" not in entries
     for folder in BASE_FOLDERS:
         assert entries[folder] == f"{folder}/", folder
     assert entries["loras"] == "loras/"
     assert entries["latent_upscale_models"] == "latent_upscale_models/"
+
+
+def _yaml_sections() -> dict[str, dict[str, str]]:
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[1] / "src" / "extra_model_paths.yaml").read_text()
+    sections: dict[str, dict[str, str]] = {}
+    current = None
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not line.startswith(" ") and line.rstrip().endswith(":"):
+            current = sections.setdefault(line.rstrip()[:-1], {})
+        elif current is not None and ":" in line:
+            k, v = line.strip().split(":", 1)
+            current[k] = v.strip()
+    return sections
+
+
+def test_extra_model_paths_lists_local_copies_first():
+    """/models-local (local_models.py) is a default (searched-first) base path
+    for the folders the copier fills; LoRAs stay on the volume only."""
+    local = _yaml_sections()["image_studio_local"]
+    assert local["base_path"] == "/models-local"
+    assert local["is_default"] == "true"
+    for folder in ("unet", "clip", "vae", "latent_upscale_models"):
+        assert local[folder] == f"{folder}/", folder
+    assert local["diffusion_models"] == "unet/" and local["text_encoders"] == "clip/"
+    assert "loras" not in local
+
+
+def test_extra_model_paths_parses_with_comfyui_semantics():
+    """Same parsing as ComfyUI's utils/extra_config.py (yaml.safe_load, pop
+    base_path / is_default): local folders end up first in the search list."""
+    yaml = pytest.importorskip("yaml")
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[1] / "src" / "extra_model_paths.yaml").read_text()
+    paths: dict[str, list[str]] = {}
+    legacy = {"unet": "diffusion_models", "clip": "text_encoders"}
+    for conf in yaml.safe_load(text).values():
+        conf = dict(conf)
+        base = conf.pop("base_path")
+        default = conf.pop("is_default", False)
+        for folder, rel in conf.items():
+            lst = paths.setdefault(legacy.get(folder, folder), [])
+            full = f"{base}/{rel.rstrip('/')}"
+            if full in lst:
+                if default and lst[0] != full:
+                    lst.remove(full)
+                    lst.insert(0, full)
+            elif default:
+                lst.insert(0, full)
+            else:
+                lst.append(full)
+    assert paths["diffusion_models"] == ["/models-local/unet", "/runpod-volume/models/unet"]
+    assert paths["text_encoders"] == ["/models-local/clip", "/runpod-volume/models/clip"]
+    assert paths["vae"] == ["/models-local/vae", "/runpod-volume/models/vae"]
+    assert paths["loras"] == ["/runpod-volume/models/loras"]

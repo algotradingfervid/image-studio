@@ -61,6 +61,7 @@ from typing import Any, Callable
 
 import runpod
 
+import local_models
 from comfy_client import ComfyClient, ComfyError
 from downloader import DownloadConfig, DownloadError, download_file
 from registry import get_model, get_video_model, load_registry, model_ids, video_model_ids
@@ -78,6 +79,10 @@ GENERATE_TIMEOUT_S = float(os.environ.get("GENERATE_TIMEOUT_S", "590"))
 VIDEO_TIMEOUT_S = float(os.environ.get("VIDEO_TIMEOUT_S", "3000"))
 PROGRESS_MIN_INTERVAL_S = 0.5   # <= 2 progress updates per second
 DOWNLOAD_CONCURRENCY = int(os.environ.get("DOWNLOAD_CONCURRENCY", "3"))
+# Longest a job waits for its model's local copies (pod mode, local_models.py)
+# before loading the rest from the network volume.
+LOCAL_COPY_WAIT_S = local_models.wait_timeout_s()
+COPY_STAGE = "copying_models"
 
 MAX_LORAS = 3
 MAX_SEED = 2**64 - 1
@@ -369,13 +374,18 @@ class StageTracker:
                       (weights already in memory)
       cachedStages    the stages whose nodes were all cached (instant)
       stageTimes      {stage: ms} accumulated time of the stages already left
+    and, only while/after a "copying_models" stage (pod mode, local_models.py):
+      copyPercent, copyBytes, copyTotalBytes
 
     Stage transitions are sent immediately (forced); step updates go through
     the Throttle (<= 2/s) except the final step.
     """
 
-    def __init__(self, progress: Throttle, graph: dict, total_steps: int, t0: float):
+    def __init__(self, progress: Throttle, graph: dict, total_steps: int, t0: float,
+                 pre_stages: tuple[str, ...] = ()):
         self.progress = progress
+        self.pre_stages = list(pre_stages)
+        self.copy: dict | None = None
         self.job = progress.job
         self.t0 = t0
         self.total = total_steps
@@ -388,7 +398,7 @@ class StageTracker:
 
     def set_graph(self, graph: dict) -> None:
         self.node_stages = graph_node_stages(graph)
-        self.stages = graph_stages(graph)
+        self.stages = self.pre_stages + graph_stages(graph)
 
     def payload(self) -> dict:
         now = clock()
@@ -403,6 +413,7 @@ class StageTracker:
             "cached": bool(self.cached_stages & LOADER_STAGES),
             "cachedStages": [s for s in self.stages if s in self.cached_stages],
             "stageTimes": dict(self.times),
+            **(self.copy or {}),
         }
 
     def send(self, force: bool = False) -> None:
@@ -417,6 +428,18 @@ class StageTracker:
         if stage in ("decoding", "video_decoding", "audio_decoding", "encoding_video", "saving"):
             self.step = self.total
         self.send(force=True)
+
+    def on_copy_progress(self, done: int, total: int) -> None:
+        pct = 100 if total <= 0 else min(100, int(done * 100 // total))
+        before = self.copy
+        self.copy = {"copyPercent": pct, "copyBytes": done, "copyTotalBytes": total}
+        if before != self.copy:
+            self.send(force=pct >= 100)
+
+    def leave_pre_stages(self) -> None:
+        """After the copy wait: move to the first graph stage."""
+        if self.stage in self.pre_stages and len(self.stages) > len(self.pre_stages):
+            self.enter(self.stages[len(self.pre_stages)])
 
     def on_executing(self, node: str) -> None:
         stage = self.node_stages.get(node)
@@ -525,6 +548,27 @@ def _history_error(hist: dict) -> str:
     return "COMFYUI_EXECUTION_ERROR: unknown error"
 
 
+def _wait_local_copies(job: dict, entries: list, tracker: StageTracker) -> dict | None:
+    """Pod mode: waits for the job's model files to reach the container disk
+    (stage "copying_models"). Never fails the job because of the copier: on a
+    copier error or after LOCAL_COPY_WAIT_S the remaining files load from the
+    network volume. Returns an error dict only when the job was cancelled."""
+    try:
+        m = local_models.get()
+        if m is not None:
+            res = m.wait(entries, timeout=LOCAL_COPY_WAIT_S, cancel=job.get(CANCEL_EVENT),
+                         on_progress=tracker.on_copy_progress)
+            if res["fallback"]:
+                print(f"local copy: loading {', '.join(res['fallback'])} from the network volume"
+                      + (" (wait timed out)" if res["timedOut"] else ""), flush=True)
+    except Exception:  # the copier must never fail a job
+        traceback.print_exc()
+    if cancelled(job):
+        return {"error": "CANCELLED: cancelled while copying the model to local disk"}
+    tracker.leave_pre_stages()
+    return None
+
+
 def do_generate(job: dict, inp: dict) -> dict:
     t0 = clock()
     registry = load_registry()
@@ -549,8 +593,14 @@ def do_generate(job: dict, inp: dict) -> dict:
         {**params, "references": [f"ref{i}" for i in range(len(params["references"]))],
          "initImage": graph_init("init")},
         registry)
-    tracker = StageTracker(progress, preview, steps, t0)
+    copies = local_models.begin_for_job(params["model"])
+    tracker = StageTracker(progress, preview, steps, t0,
+                           pre_stages=(COPY_STAGE,) if copies else ())
     tracker.send(force=True)
+    if copies:
+        err = _wait_local_copies(job, copies, tracker)
+        if err:
+            return err
 
     client = make_client()
     client.wait_ready(COMFY_READY_TIMEOUT_S)
@@ -786,8 +836,14 @@ def do_generate_video(job: dict, inp: dict) -> dict:
 
     progress = Throttle(job)
     preview, info = build_video_workflow(graph_params("init"), registry)
-    tracker = StageTracker(progress, preview, info["totalSteps"], t0)
+    copies = local_models.begin_for_job(params["model"])
+    tracker = StageTracker(progress, preview, info["totalSteps"], t0,
+                           pre_stages=(COPY_STAGE,) if copies else ())
     tracker.send(force=True)
+    if copies:
+        err = _wait_local_copies(job, copies, tracker)
+        if err:
+            return err
 
     client = make_client()
     client.wait_ready(COMFY_READY_TIMEOUT_S)
@@ -1003,6 +1059,8 @@ def _run_downloads(job: dict, plan: list[tuple[Path, str, int | None, str | None
                 state[key]["status"] = "failed"
             snapshot(force=True, current=name)
             raise
+        if did:
+            _invalidate_local(dest)
         final = dest.stat().st_size
         with lock:
             state[key].update(bytes=final, totalBytes=final,
@@ -1031,6 +1089,19 @@ def _run_downloads(job: dict, plan: list[tuple[Path, str, int | None, str | None
             "elapsedMs": _ms(elapsed), "avgMBps": round(moved / 1e6 / elapsed, 2)}
 
 
+def _invalidate_local(path: Path) -> None:
+    """The volume file at `path` changed or is going away: drop its local
+    copy (pod mode) so it can't shadow the new content. Best effort."""
+    m = local_models.get()
+    if m is None:
+        return
+    try:
+        rel = path.relative_to(MODELS_ROOT)
+        m.invalidate(rel.parent.as_posix(), rel.name)
+    except Exception:
+        traceback.print_exc()
+
+
 def do_delete(job: dict, inp: dict) -> dict:
     registry = load_registry()
     ids = model_ids(registry)
@@ -1038,6 +1109,7 @@ def do_delete(job: dict, inp: dict) -> dict:
                for f in _file_list(inp)]
     deleted, missing = [], []
     for path in targets:
+        _invalidate_local(path)
         part = path.with_name(path.name + ".part")
         part.unlink(missing_ok=True)
         if path.is_file():

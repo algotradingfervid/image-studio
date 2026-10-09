@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { fileSrc, inTauri, type ImageRecord } from "../../api";
-import { Icon } from "../../components/Icon";
+import { Icon, type IconName } from "../../components/Icon";
 import { formatRelative } from "../../lib/format";
 
 /** "5 s", "1:05". */
@@ -26,6 +26,7 @@ export function Gallery({
   onLoadMore,
   onOpen,
   scrollRoot,
+  empty,
 }: {
   items: ImageRecord[];
   /** Which kinds `items` was filtered to (for the empty state). */
@@ -38,6 +39,8 @@ export function Gallery({
   onLoadMore: () => void;
   onOpen: (index: number) => void;
   scrollRoot: React.RefObject<HTMLElement | null>;
+  /** Empty-state override (the Vault tab). */
+  empty?: { icon: IconName; title: string; text: string };
 }) {
   const sentinel = useRef<HTMLDivElement>(null);
   const loadRef = useRef(onLoadMore);
@@ -55,6 +58,18 @@ export function Gallery({
     io.observe(el);
     return () => io.disconnect();
   }, [hasMore, scrollRoot, items.length, loadedCount]);
+
+  if (!loading && items.length === 0 && empty) {
+    return (
+      <div className="empty">
+        <div className="empty__art" aria-hidden>
+          <Icon name={empty.icon} size={28} />
+        </div>
+        <h3>{empty.title}</h3>
+        <p>{empty.text}</p>
+      </div>
+    );
+  }
 
   if (!loading && items.length === 0 && filter !== "all") {
     return (
@@ -95,7 +110,7 @@ export function Gallery({
           ) : (
           <li key={im.id} className="gallery__item">
             <button type="button" className="tile" onClick={() => onOpen(i)} aria-label={`Open image${im.initImage ? " (img2img)" : ""}: ${im.prompt}`}>
-              <img src={fileSrc(im.path)} alt="" loading="lazy" decoding="async" />
+              <img src={fileSrc(im.thumbPath || im.path)} alt="" loading="lazy" decoding="async" />
               {im.initImage && (
                 <span className="tile__badge" title={`From a start image${im.denoise != null ? ` · strength ${im.denoise.toFixed(2)}` : ""}`}>
                   img2img

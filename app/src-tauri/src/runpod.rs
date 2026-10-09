@@ -87,6 +87,9 @@ pub struct Progress {
     /// Milliseconds spent in each stage already left.
     #[serde(default)]
     pub stage_times: Option<BTreeMap<String, u64>>,
+    /// Stage `copying_models`: percent of the model files copied to local disk.
+    #[serde(default)]
+    pub copy_percent: Option<f64>,
 }
 
 /// runpod-python's `progress_update` posts `{"status":"IN_PROGRESS","output":<progress>}`,

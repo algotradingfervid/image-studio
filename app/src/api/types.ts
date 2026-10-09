@@ -113,6 +113,8 @@ export interface Settings {
   /** Video profile (spec v5): GPU priority list and volume names (settings file `videoGpuTypes` / `videoVolumeNames`). */
   videoGpuTypes: string[];
   videoVolumeNames: string[];
+  /** Vault auto-lock minutes (spec v6; same value as `VaultStatus.autoLockMinutes`). */
+  vaultAutoLockMinutes?: number;
 }
 
 export interface SaveSettingsInput {
@@ -262,8 +264,14 @@ export interface GenerateInput {
   loras: { loraId: string; strength: number }[];
   /** img2img start image: an id from `import_reference(_bytes)` (models with `supportsImg2Img`). */
   initImageId?: string;
-  /** img2img strength, 0.05–1.0 (backend default 0.6). Ignored without `initImageId`. */
+  /** img2img start image picked "From gallery": a General record id (read in place). */
+  initImageGalleryId?: string;
+  /** img2img start image that is a vault item (spec v6; needs the vault unlocked). Excludes `initImageId`. */
+  initImageVaultId?: string;
+  /** img2img strength, 0.05–1.0 (backend default 0.6). Ignored without a start image. */
   denoise?: number;
+  /** Where the outputs are saved (spec v6). Backend default "general". */
+  destination?: Destination;
 }
 
 /** `generate_video` (spec v5). One pod job per video; runs on the video GPU profile (auto-started). */
@@ -278,6 +286,8 @@ export interface GenerateVideoInput {
    * the gallery file in place (no copy). Mutually exclusive with `initImageId`.
    */
   initImageGalleryId?: string;
+  /** i2v start image that is a vault item (spec v6; needs the vault unlocked). */
+  initImageVaultId?: string;
   durationS: number;
   fps: number;
   /** A resolution id from the model's `limits.resolutions` (see `resolutionId`). */
@@ -286,6 +296,8 @@ export interface GenerateVideoInput {
   steps?: number;
   cfg?: number;
   audio: boolean;
+  /** Where the video is saved (spec v6). Backend default "general". */
+  destination?: Destination;
 }
 
 /** img2img strength slider ("How much to change"). */
@@ -323,6 +335,13 @@ export interface ImageRecord {
   hasAudio?: boolean | null;
   /** JPEG poster frame for video tiles. */
   posterPath?: string | null;
+  /**
+   * Vault item (spec v6): `path`, `posterPath`, `initImage` and `references` are `vault://localhost/<blobId>`
+   * URLs, used directly (never through convertFileSrc). General records: false or absent.
+   */
+  vault?: boolean;
+  /** Vault items: small JPEG preview for grid tiles (videos reuse the poster). */
+  thumbPath?: string | null;
 }
 
 export interface ImagePage {
@@ -330,6 +349,49 @@ export interface ImagePage {
   /** Numeric cursor for the next `list_images({before})`, null at the end. */
   nextBefore: number | null;
 }
+
+// ---------- Vault (spec v6, docs/vault-contract.md) ----------
+
+export type Destination = "general" | "vault";
+
+export interface VaultStatus {
+  /** A vault has been created. */
+  exists: boolean;
+  unlocked: boolean;
+  /** 1..240, default 10. */
+  autoLockMinutes: number;
+  /** null while locked. */
+  itemCount: number | null;
+  /** A started migration has items left (resumes on unlock). */
+  migrationPending: boolean;
+}
+
+export type MigrationPhase = "encrypting" | "verifying" | "cleaning" | "done" | "error";
+
+export interface MigrationProgress {
+  phase: MigrationPhase | string;
+  done: number;
+  total: number;
+  counts: { images: number; videos: number; posters: number; startImages: number; references: number };
+  errors: number;
+  error: string | null;
+}
+
+/** Vault error codes: the backend's error strings start with `"<CODE>: "`. */
+export type VaultErrorCode = "WRONG_PASSWORD" | "WEAK_PASSWORD" | "VAULT_EXISTS" | "NO_VAULT" | "VAULT_LOCKED";
+
+export const VAULT_PASSWORD_MIN = 8;
+export const VAULT_AUTOLOCK_MIN = 1;
+export const VAULT_AUTOLOCK_MAX = 240;
+
+/** The error code prefix of a failed command ("WRONG_PASSWORD: …" → "WRONG_PASSWORD"), or null. */
+export function errorCode(e: unknown): string | null {
+  const m = (e instanceof Error ? e.message : typeof e === "string" ? e : "").match(/^([A-Z][A-Z0-9_]+)(?::|$)/);
+  return m ? m[1] : null;
+}
+
+/** A vault media URL (`vault://…`, or the Windows-style `http://vault.localhost/…`). */
+export const isVaultUrl = (p: string | null | undefined): boolean => !!p && (p.startsWith("vault:") || p.startsWith("http://vault.localhost/"));
 
 // ---------- Events ----------
 
@@ -370,6 +432,8 @@ export interface JobProgress {
   cachedStages?: string[];
   /** Milliseconds spent in each stage already finished. */
   stageTimes?: Record<string, number>;
+  /** Stage `copying_models`: percent of the model files copied to the pod's local disk. */
+  copyPercent?: number;
 }
 
 export interface Job {
@@ -383,6 +447,8 @@ export interface Job {
   progress: JobProgress | null;
   images: ImageRecord[];
   error: string | null;
+  /** Where the outputs go (spec v6). Absent from older cores → "general". */
+  destination?: Destination;
 }
 
 export type TaskStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
@@ -409,6 +475,10 @@ export interface EventMap {
    * Payload: the state of EVERY profile (image, video); list the ones not stopped.
    */
   "quit-requested": GpuState[];
+  /** Vault state on create / unlock / lock / auto-lock / password change, and whenever vault items change. */
+  "vault-update": VaultStatus;
+  /** Migration of the pre-v6 content into the vault (on create, or resumed on unlock). */
+  "vault-migration": MigrationProgress;
 }
 
 export const isTaskActive = (t: Task | null | undefined): t is Task =>

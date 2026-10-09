@@ -79,6 +79,25 @@ pub fn process(bytes: &[u8]) -> Result<(Vec<u8>, &'static str), String> {
     }
 }
 
+/// Small JPEG preview (longest side ≤ `THUMB_SIDE`) for grid tiles; None when
+/// the bytes are not a decodable image.
+pub const THUMB_SIDE: u32 = 512;
+
+pub fn thumbnail(bytes: &[u8]) -> Option<Vec<u8>> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let small = if img.width().max(img.height()) > THUMB_SIDE {
+        img.thumbnail(THUMB_SIDE, THUMB_SIDE)
+    } else {
+        img
+    };
+    let rgb = small.to_rgb8();
+    let mut out = Vec::new();
+    JpegEncoder::new_with_quality(&mut out, 82)
+        .encode_image(&rgb)
+        .ok()?;
+    Some(out)
+}
+
 pub fn import_bytes(dir: &Path, bytes: &[u8]) -> Result<ImportedReference, String> {
     let (out, ext) = process(bytes)?;
     std::fs::create_dir_all(dir).map_err(|e| format!("Could not create references folder: {e}"))?;
@@ -159,6 +178,16 @@ mod tests {
         let o = RgbaImage::from_pixel(64, 64, Rgba([1, 2, 3, 255]));
         let (_, ext) = process(&encode(DynamicImage::ImageRgba8(o), ImageFormat::Png)).unwrap();
         assert_eq!(ext, "jpg");
+    }
+
+    #[test]
+    fn thumbnails_fit_512_and_reject_garbage() {
+        let img = RgbImage::from_pixel(1600, 800, Rgb([9, 9, 9]));
+        let t = thumbnail(&encode(DynamicImage::ImageRgb8(img), ImageFormat::Png)).unwrap();
+        let dec = image::load_from_memory(&t).unwrap();
+        assert_eq!(image::guess_format(&t).unwrap(), ImageFormat::Jpeg);
+        assert_eq!(dec.dimensions(), (512, 256));
+        assert!(thumbnail(b"nope").is_none());
     }
 
     #[test]

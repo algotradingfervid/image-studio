@@ -1,5 +1,8 @@
 # Installed as /comfyui/extra_model_paths.yaml (ComfyUI auto-loads this file
 # from its own directory at startup). Replaces the upstream worker-comfyui file.
+# The runtime image's boot.py passes this file from the GitHub-fetched code dir
+# (--extra-model-paths-config <code>/src/extra_model_paths.yaml), so editing it
+# needs no image rebuild.
 #
 # Network volume layout (spec "Paths and models"):
 #   /runpod-volume/models/unet/            diffusion models
@@ -19,4 +22,20 @@ image_studio:
   clip: clip/
   vae: vae/
   loras: loras/
+  latent_upscale_models: latent_upscale_models/
+
+# Pod mode: local copies on the container disk (worker/src/local_models.py).
+# is_default puts these folders FIRST in ComfyUI's search list
+# (folder_paths.add_model_folder_path inserts at index 0), and get_full_path
+# returns the first folder where the file exists. A finished copy is used; a
+# file still copying (a ".part" name ComfyUI ignores), failed or skipped falls
+# back to the volume above. A missing /models-local is harmless.
+image_studio_local:
+  base_path: /models-local
+  is_default: true
+  diffusion_models: unet/
+  unet: unet/
+  text_encoders: clip/
+  clip: clip/
+  vae: vae/
   latent_upscale_models: latent_upscale_models/

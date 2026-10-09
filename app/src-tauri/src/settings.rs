@@ -38,6 +38,8 @@ pub const DEFAULT_VIDEO_GPU_TYPES: &[&str] = &[
 /// branch, tag or commit SHA of the image-studio repo (spec "v4").
 pub const DEFAULT_WORKER_REF: &str = "main";
 pub const MIN_IDLE_MINUTES: u32 = 5;
+/// Vault auto-lock after this many minutes without interaction (spec v6).
+pub const DEFAULT_VAULT_AUTO_LOCK_MINUTES: u32 = crate::vault::DEFAULT_AUTO_LOCK_MINUTES;
 pub const MAX_IDLE_MINUTES: u32 = 240;
 
 pub const ENV_RUNPOD_KEY: &str = "RUNPOD_API_KEY";
@@ -232,6 +234,9 @@ pub struct AppConfig {
     /// without an app rebuild. Edited in the config file only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_image: Option<String>,
+    /// Vault auto-lock minutes (spec v6; default 10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_auto_lock_minutes: Option<u32>,
 }
 
 /// Trimmed value, or `default` when unset or blank.
@@ -386,6 +391,32 @@ impl Settings {
     /// Pod container image (config `podImage`, default the runtime image).
     pub fn pod_image(&self) -> String {
         str_or(self.config.lock().unwrap().pod_image.as_ref(), crate::pod::POD_IMAGE)
+    }
+
+    /// Minutes without interaction before the vault locks itself (1–240, default 10).
+    pub fn vault_auto_lock_minutes(&self) -> u32 {
+        self.config
+            .lock()
+            .unwrap()
+            .vault_auto_lock_minutes
+            .unwrap_or(DEFAULT_VAULT_AUTO_LOCK_MINUTES)
+            .clamp(
+                crate::vault::MIN_AUTO_LOCK_MINUTES,
+                crate::vault::MAX_AUTO_LOCK_MINUTES,
+            )
+    }
+
+    pub fn save_vault_auto_lock(&self, minutes: u32) -> Result<(), String> {
+        if !(crate::vault::MIN_AUTO_LOCK_MINUTES..=crate::vault::MAX_AUTO_LOCK_MINUTES).contains(&minutes) {
+            return Err(format!(
+                "Auto-lock must be between {} and {} minutes",
+                crate::vault::MIN_AUTO_LOCK_MINUTES,
+                crate::vault::MAX_AUTO_LOCK_MINUTES
+            ));
+        }
+        let mut cfg = self.config.lock().unwrap();
+        cfg.vault_auto_lock_minutes = Some(minutes);
+        self.write_config(&cfg)
     }
 
     /// The pod token, generated (32 random bytes, hex) and stored on first use.
@@ -679,6 +710,20 @@ mod tests {
         let b = Settings::new(store, HashMap::new(), path);
         assert_eq!(b.worker_ref(), DEFAULT_WORKER_REF, "blank → default");
         assert_eq!(b.pod_image(), crate::pod::POD_IMAGE);
+    }
+
+    #[test]
+    fn vault_auto_lock_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        let store = Arc::new(MemoryStore::default());
+        let s = Settings::new(store.clone(), HashMap::new(), path.clone());
+        assert_eq!(s.vault_auto_lock_minutes(), 10);
+        assert!(s.save_vault_auto_lock(0).is_err());
+        assert!(s.save_vault_auto_lock(241).is_err());
+        s.save_vault_auto_lock(25).unwrap();
+        let r = Settings::new(store, HashMap::new(), path);
+        assert_eq!(r.vault_auto_lock_minutes(), 25);
     }
 }
 

@@ -10,6 +10,7 @@ import { SettingsScreen } from "./screens/settings/SettingsScreen";
 import { GpuProvider, PROFILE_LABEL, PROFILES, useGpu } from "./state/gpu";
 import { LibraryProvider, useLibrary } from "./state/library";
 import { ToastProvider } from "./state/toast";
+import { VaultProvider } from "./state/vault";
 
 export type Tab = "create" | "models" | "settings";
 
@@ -169,7 +170,9 @@ export default function App() {
       <ToastProvider>
         <LibraryProvider>
           <GpuProvider>
-            <Shell />
+            <VaultProvider>
+              <Shell />
+            </VaultProvider>
           </GpuProvider>
         </LibraryProvider>
       </ToastProvider>

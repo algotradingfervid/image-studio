@@ -34,6 +34,22 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rand = "0.8"
 url = "2"
+http = "1"
+# Vault (spec v6): audited RustCrypto / dalek crates, exact versions pinned.
+argon2 = { version = "=0.5.3", default-features = false, features = ["alloc", "zeroize"] }
+chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc", "stream"] }
+x25519-dalek = { version = "=2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
+hkdf = "=0.12.4"
+sha2 = "=0.10.9"
+rand_core = { version = "=0.6.4", features = ["getrandom"] }
+zeroize = { version = "=1.9.1", features = ["zeroize_derive"] }
+
+# macOS sleep / screen-lock / session hooks that lock the vault (spec v6).
+# Same versions Tauri already pulls in (see Cargo.lock).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { version = "=0.3.2", features = ["block2", "NSDistributedNotificationCenter", "NSNotification", "NSObject", "NSOperation", "NSString"] }
+objc2-app-kit = { version = "=0.3.2", features = ["NSWorkspace"] }
+block2 = "=0.6.2"
 
 [dev-dependencies]
 wiremock = "0.6"

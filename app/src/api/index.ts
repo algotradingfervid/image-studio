@@ -8,8 +8,10 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getBackend, inTauri, type Unlisten } from "./backend";
 import type {
+  ImageRecord,
   AddLoraInput,
   ConnectionTest,
+  Destination,
   DeletePreview,
   DeleteResult,
   EventMap,
@@ -27,7 +29,9 @@ import type {
   Settings,
   StatusSnapshot,
   Task,
+  VaultStatus,
 } from "./types";
+import { isVaultUrl } from "./types";
 
 export * from "./types";
 export { inTauri };
@@ -100,9 +104,11 @@ export const deleteLora = (id: string) => call<Task | null>("delete_lora", { id 
 
 // ---------- Generation and gallery ----------
 
-export const importReference = (path: string) => call<ImportedReference>("import_reference", { path });
-export const importReferenceBytes = (base64: string, mime: string) =>
-  call<ImportedReference>("import_reference_bytes", { base64, mime });
+/** `destination: "vault"` stores the imported start image / reference encrypted in the vault (spec v6). */
+export const importReference = (path: string, destination: Destination = "general") =>
+  call<ImportedReference>("import_reference", { path, destination });
+export const importReferenceBytes = (base64: string, mime: string, destination: Destination = "general") =>
+  call<ImportedReference>("import_reference_bytes", { base64, mime, destination });
 /** With `initImageId` (img2img), the output size follows the start image; `aspectRatio` is still required but ignored. */
 export const generate = (input: GenerateInput) => callObj<{ jobId: string }>("generate", input);
 /** Video job (spec v5); starts the video GPU when stopped. Progress arrives as `job-update` with kind "video". */
@@ -116,6 +122,31 @@ export const deleteImage = (id: string) => call<void>("delete_image", { id });
 /** Copies the stored image (or video .mp4) file to `destPath` (chosen in the save dialog). */
 export const exportImage = (input: { id: string; destPath: string }) => callObj<void>("export_image", input);
 
+// ---------- Vault (spec v6, docs/vault-contract.md) ----------
+
+export const vaultStatus = () => call<VaultStatus>("vault_status");
+/** Returns the unlocked status, then migrates the existing content (`vault-migration` events). */
+export const vaultCreate = (password: string) => call<VaultStatus>("vault_create", { password });
+/** Argon2id: takes about a second. Rejects with `WRONG_PASSWORD: …` / `NO_VAULT: …`. */
+export const vaultUnlock = (password: string) => call<VaultStatus>("vault_unlock", { password });
+export const vaultLock = () => call<VaultStatus>("vault_lock");
+export const vaultChangePassword = (oldPassword: string, newPassword: string) =>
+  call<VaultStatus>("vault_change_password", { oldPassword, newPassword });
+export const vaultSetAutoLock = (minutes: number) => call<VaultStatus>("vault_set_auto_lock", { minutes });
+/** Resets the inactivity timer (the UI calls it on user input, at most every 30 s). */
+export const vaultTouch = () => call<void>("vault_touch");
+/** Newest first; rejects with `VAULT_LOCKED` while locked. */
+export const listVaultItems = () => call<ImageRecord[]>("list_vault_items");
+export const deleteVaultItem = (id: string) => call<void>("delete_vault_item", { id });
+/** General → Vault (encrypt, verify by decrypting, delete the plaintext); needs the vault unlocked. */
+export const moveToVault = (id: string) => call<ImageRecord>("move_to_vault", { id });
+/** Vault → General (decrypted, stored unencrypted); needs the vault unlocked. */
+export const moveToGeneral = (id: string) => call<ImageRecord>("move_to_general", { id });
+/** Moves an already-imported plain reference into the vault (new refId = a vault:// URL). */
+export const sealReference = (refId: string) => call<ImportedReference>("seal_reference", { refId });
+/** Writes an UNENCRYPTED copy to `dest` (chosen in the save dialog). */
+export const exportVaultItem = (input: { id: string; dest: string }) => callObj<void>("export_vault_item", input);
+
 // ---------- Events ----------
 
 export async function onEvent<K extends keyof EventMap>(
@@ -128,10 +159,13 @@ export async function onEvent<K extends keyof EventMap>(
 
 // ---------- Native helpers ----------
 
-/** URL for an image stored on disk (Tauri asset protocol), or passthrough in the mock. */
+/**
+ * URL for an image stored on disk (Tauri asset protocol), or passthrough in the mock.
+ * Vault media (`vault://…`) is served by its own URI scheme and is used as it is.
+ */
 export function fileSrc(path: string): string {
   if (!path) return "";
-  if (!inTauri || path.startsWith("data:") || path.startsWith("http") || path.startsWith("blob:")) return path;
+  if (!inTauri || isVaultUrl(path) || path.startsWith("data:") || path.startsWith("http") || path.startsWith("blob:")) return path;
   return convertFileSrc(path);
 }
 

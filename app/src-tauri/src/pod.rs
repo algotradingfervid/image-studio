@@ -35,6 +35,9 @@ use tokio::sync::watch;
 
 pub const DEFAULT_REST_ROOT: &str = "https://api.runpod.io";
 pub const DEFAULT_PROXY_TEMPLATE: &str = "https://{podId}-8000.proxy.runpod.net";
+/// Upper bound on `GET /v2/pods` pages followed (up to 1000 pods each);
+/// hitting it fails the listing rather than silently truncating it.
+pub const LIST_PODS_MAX_PAGES: usize = 50;
 pub const POD_NAME: &str = "image-studio-gpu";
 /// The video profile's pod (spec v5).
 pub const VIDEO_POD_NAME: &str = "image-studio-video-gpu";
@@ -52,7 +55,23 @@ pub const VOLUME_PATH: &str = "/runpod-volume";
 /// Display fallback before a pod reports its GPU (first default priority).
 pub const GPU_TYPE: &str = crate::settings::DEFAULT_GPU_TYPES[0];
 pub const VIDEO_GPU_TYPE: &str = crate::settings::DEFAULT_VIDEO_GPU_TYPES[0];
-pub const CONTAINER_DISK_GB: u32 = 20;
+/// Container disk (GB) per profile. The pod worker copies the models it
+/// uses from the network volume to this disk (`/models-local`,
+/// worker/src/local_models.py), so it must hold the profile's models plus
+/// headroom: image ≈ 76 GB for all four image models, video ≈ 94 GB for
+/// H3 + LTX-2.5. RunPod documents the container disk as ephemeral (wiped on
+/// restart); the app terminates pods rather than stopping them anyway.
+pub const CONTAINER_DISK_GB_IMAGE: u32 = 100;
+pub const CONTAINER_DISK_GB_VIDEO: u32 = 120;
+/// ComfyUI log level on the pod (`COMFY_LOG_LEVEL`, read by worker/boot/boot.py;
+/// its default is DEBUG, which floods the log with per-layer lines).
+pub const COMFY_LOG_LEVEL: &str = "INFO";
+/// Host CUDA floor for the runtime image (torch cu130 needs CUDA 13, i.e. a
+/// host driver >= 580). `gpu.minCudaVersion` of `CreateGpuConfig` in
+/// https://api.runpod.io/v2/openapi.json: "Lowest acceptable CUDA version for
+/// the host machine, as `major.minor`, compared numerically" (an open floor,
+/// unlike the exact-match `allowedCudaVersions`).
+pub const MIN_CUDA_VERSION: &str = "13.0";
 pub const FALLBACK_COST_PER_HR: f64 = 2.49;
 pub const HF_SECRET_REF: &str = "{{ RUNPOD_SECRET_image-studio-hf-token }}";
 pub const CIVITAI_SECRET_REF: &str = "{{ RUNPOD_SECRET_image-studio-civitai-key }}";
@@ -75,6 +94,10 @@ pub const DB_POD_ID: &str = "gpu_pod_id";
 pub const DB_VOLUME_SIZE_GB: &str = "gpu_volume_size_gb";
 pub const DB_VIDEO_POD_ID: &str = "video_gpu_pod_id";
 pub const DB_VIDEO_VOLUME_SIZE_GB: &str = "video_gpu_volume_size_gb";
+/// The model id last generated with on each profile; sent to the next pod as
+/// `PREFETCH_MODELS` so it copies (and warms up) that model at boot.
+pub const DB_LAST_MODEL_IMAGE: &str = "last_model_image";
+pub const DB_LAST_MODEL_VIDEO: &str = "last_model_video";
 
 /// A GPU pod profile (spec v5).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
@@ -107,6 +130,21 @@ impl Profile {
         match self {
             Profile::Image => DB_VOLUME_SIZE_GB,
             Profile::Video => DB_VIDEO_VOLUME_SIZE_GB,
+        }
+    }
+
+    pub fn db_last_model(self) -> &'static str {
+        match self {
+            Profile::Image => DB_LAST_MODEL_IMAGE,
+            Profile::Video => DB_LAST_MODEL_VIDEO,
+        }
+    }
+
+    /// Container disk size (GB) for this profile's pods.
+    pub fn container_disk_gb(self) -> u32 {
+        match self {
+            Profile::Image => CONTAINER_DISK_GB_IMAGE,
+            Profile::Video => CONTAINER_DISK_GB_VIDEO,
         }
     }
 
@@ -394,14 +432,51 @@ impl RestClient {
         })
     }
 
+    /// Every pod on the account (`GET /v2/pods`), following the cursor
+    /// pagination to the end: `pagination.nextCursor` is passed back as the
+    /// `cursor` query parameter while `pagination.hasNextPage` is true. Any
+    /// failed or malformed page, or more than [`LIST_PODS_MAX_PAGES`] pages,
+    /// fails the whole listing so callers never mistake a partial list for
+    /// "no such pod".
     pub async fn list_pods(&self) -> Result<Vec<Value>, RestError> {
-        let v = self
-            .send(self.http.get(format!("{}/v2/pods", self.root)))
-            .await?;
-        Ok(v.get("pods")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default())
+        let url = format!("{}/v2/pods", self.root);
+        let mut pods = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..LIST_PODS_MAX_PAGES {
+            let mut req = self.http.get(&url);
+            if let Some(c) = &cursor {
+                req = req.query(&[("cursor", c.as_str())]);
+            }
+            let v = self.send(req).await?;
+            let page = v.get("pods").and_then(Value::as_array).ok_or_else(|| RestError {
+                status: None,
+                message: "The RunPod API returned a pod list without pods".into(),
+            })?;
+            pods.extend(page.iter().cloned());
+            let pg = v.get("pagination");
+            if !pg
+                .and_then(|p| p.get("hasNextPage"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return Ok(pods);
+            }
+            let next = pg
+                .and_then(|p| p.get("nextCursor"))
+                .and_then(Value::as_str)
+                .filter(|c| !c.is_empty())
+                .ok_or_else(|| RestError {
+                    status: None,
+                    message: "The RunPod API said more pods exist but gave no cursor for them".into(),
+                })?;
+            cursor = Some(next.to_string());
+        }
+        Err(RestError {
+            status: None,
+            message: format!(
+                "The RunPod pod list is longer than {LIST_PODS_MAX_PAGES} pages; refusing to use a partial list"
+            ),
+        })
     }
 
     /// Pods named exactly `name` that are not TERMINATED.
@@ -476,6 +551,8 @@ impl RestClient {
 /// self-terminate watchdog (RunPod injects its own `RUNPOD_API_KEY`).
 /// `image` is `Settings::pod_image`; `worker_ref` (`WORKER_REF`) is the git
 /// ref the runtime image's boot script fetches the worker code from.
+/// `prefetch` (`PREFETCH_MODELS`, comma-separated model ids, may be empty)
+/// is what the pod copies to its local disk and warms up at boot.
 #[allow(clippy::too_many_arguments)]
 pub fn create_payload_for(
     p: Profile,
@@ -486,6 +563,7 @@ pub fn create_payload_for(
     api_key: Option<&str>,
     image: &str,
     worker_ref: &str,
+    prefetch: &str,
 ) -> Value {
     let mut env = Map::new();
     env.insert("MODE".into(), json!("pod"));
@@ -494,6 +572,8 @@ pub fn create_payload_for(
     env.insert("WORKER_REF".into(), json!(worker_ref));
     env.insert("HF_TOKEN".into(), json!(HF_SECRET_REF));
     env.insert("CIVITAI_API_KEY".into(), json!(CIVITAI_SECRET_REF));
+    env.insert("COMFY_LOG_LEVEL".into(), json!(COMFY_LOG_LEVEL));
+    env.insert("PREFETCH_MODELS".into(), json!(prefetch));
     if let Some(k) = api_key {
         env.insert("RUNPOD_TERMINATE_API_KEY".into(), json!(k));
     }
@@ -501,9 +581,9 @@ pub fn create_payload_for(
         "name": p.pod_name(),
         "image": image,
         "cloud": "SECURE",
-        "gpu": {"id": gpu_type, "count": 1},
+        "gpu": {"id": gpu_type, "count": 1, "minCudaVersion": MIN_CUDA_VERSION},
         "dataCenterIds": [vol.data_center],
-        "disk": CONTAINER_DISK_GB,
+        "disk": p.container_disk_gb(),
         "mounts": {"network": [{"volumeId": vol.id, "path": VOLUME_PATH}]},
         "ports": ["8000/http"],
         "env": env,
@@ -529,6 +609,7 @@ pub fn create_payload(
         api_key,
         image,
         worker_ref,
+        "",
     )
 }
 
@@ -642,6 +723,49 @@ fn persist_pod_id(core: &Core, p: Profile, id: Option<&str>) {
     if let Err(e) = r {
         eprintln!("[pod:{}] could not persist the pod id: {e}", p.as_str());
     }
+}
+
+/// A model id is safe to pass on in `PREFETCH_MODELS`: non-empty, short, and
+/// only `[A-Za-z0-9._-]` (no commas or whitespace).
+fn valid_model_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Remembers `model_id` as profile `p`'s last generated model (DB setting
+/// `last_model_image` / `last_model_video`); the next pod of that profile
+/// prefetches it. Call on each generate. Invalid ids are ignored; a DB error
+/// is logged, never returned (the generate must not fail because of it).
+pub fn record_last_model(core: &Core, p: Profile, model_id: &str) {
+    let id = model_id.trim();
+    if !valid_model_id(id) {
+        eprintln!("[pod:{}] not recording invalid model id {id:?}", p.as_str());
+        return;
+    }
+    let db = core.db.lock().unwrap();
+    if db.get_setting(p.db_last_model()).ok().flatten().as_deref() == Some(id) {
+        return;
+    }
+    if let Err(e) = db.set_setting(p.db_last_model(), id) {
+        eprintln!("[pod:{}] could not record the last model: {e}", p.as_str());
+    }
+}
+
+/// `PREFETCH_MODELS` for profile `p`'s next pod: the recorded last model, or
+/// "" when none is recorded (or the stored value is not a valid id).
+pub fn prefetch_models(core: &Core, p: Profile) -> String {
+    core.db
+        .lock()
+        .unwrap()
+        .get_setting(p.db_last_model())
+        .ok()
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| valid_model_id(s))
+        .unwrap_or_default()
 }
 
 fn stored_pod_id(core: &Core, p: Profile) -> Option<String> {
@@ -1013,7 +1137,8 @@ async fn create_with_fallback(
     let gpus = core.settings.gpu_types_for(p);
     let image = core.settings.pod_image();
     let worker_ref = core.settings.worker_ref();
-    eprintln!("[pod] image {image}, WORKER_REF {worker_ref}");
+    let prefetch = prefetch_models(core, p);
+    eprintln!("[pod] image {image}, WORKER_REF {worker_ref}, PREFETCH_MODELS {prefetch:?}");
     let mut last = String::new();
     for gpu in &gpus {
         let body = create_payload_for(
@@ -1025,6 +1150,7 @@ async fn create_with_fallback(
             api_key,
             &image,
             &worker_ref,
+            &prefetch,
         );
         match rest.create_pod(&body).await {
             Ok(pod) if pod_str(&pod, "id").is_some() => return Ok((pod, gpu.clone())),
@@ -1050,7 +1176,7 @@ async fn create_with_fallback(
     }
     Err(CreateError {
         message: format!(
-            "No GPU is available in {} right now (tried {}). Last error: {last}. Try again in a few minutes.",
+            "No GPU is available in {} right now (tried {}; only hosts with CUDA {MIN_CUDA_VERSION} or newer qualify, gpu.minCudaVersion). Last error: {last}. Try again in a few minutes.",
             vol.data_center,
             gpus.join(", ")
         ),
@@ -1684,7 +1810,13 @@ mod tests {
             size_gb: 100,
         };
         let p = create_payload(&vol, "G", "tok", 30, None, POD_IMAGE, "main");
-        assert_eq!(p["gpu"], json!({"id": "G", "count": 1}));
+        assert_eq!(
+            p["gpu"],
+            json!({"id": "G", "count": 1, "minCudaVersion": "13.0"})
+        );
+        assert_eq!(p["disk"], 100);
+        assert_eq!(p["env"]["COMFY_LOG_LEVEL"], "INFO");
+        assert_eq!(p["env"]["PREFETCH_MODELS"], "");
         assert_eq!(p["image"], POD_IMAGE);
         assert_eq!(p["env"]["IDLE_MINUTES"], "30");
         assert_eq!(p["env"]["WORKER_REF"], "main");

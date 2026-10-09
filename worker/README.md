@@ -42,30 +42,35 @@ Pinned versions:
 | Component | Version | Source |
 |---|---|---|
 | Base | `python:3.12.15-slim-bookworm@sha256:34386ef0…7258` | Docker Hub |
-| torch / torchvision / torchaudio | 2.11.0 / 0.26.0 / 2.11.0 `+cu128` | `download.pytorch.org/whl/cu128` |
+| torch / torchvision / torchaudio | 2.11.0 / 0.26.0 / 2.11.0 `+cu130` | `download.pytorch.org/whl/cu130` |
 | ComfyUI | v0.39.0, commit `b0b743566f65…` (checked at build) | codeload tag tarball |
 | Worker deps (`requirements-runtime.txt`) | runpod 1.12.0, requests 2.34.2, websocket-client 1.9.2, transformers <5, huggingface-hub <1.0 | PyPI |
 | uv (build only, bind-mounted, not in the image) | 0.11.7 | `ghcr.io/astral-sh/uv` |
 | apt | `libtcmalloc-minimal4` only | Debian bookworm |
 
-There is no CUDA toolkit in the image. The cu128 torch wheels pull `nvidia-*-cu12` wheels
-(CUDA 12.8 runtime, cuBLAS, cuDNN 9, NCCL…), and the NVIDIA container runtime mounts the host
-driver. The image sets `NVIDIA_VISIBLE_DEVICES=all` and
+There is no CUDA toolkit in the image. The cu130 torch wheels pull the CUDA 13.0 runtime as wheels
+(`cuda-toolkit[cublas,cudart,…]==13.0.2`, installed under `site-packages/nvidia/cu13/lib`, plus
+`nvidia-cudnn-cu13`, `nvidia-nccl-cu13`), and the NVIDIA container runtime mounts the host
+driver. cu130 rather than cu128 because ComfyUI v0.39.0 disables comfy-kitchen's CUDA backend
+(the fused int8/fp8 kernels) when `torch.version.cuda` is below 13; comfy-kitchen dlopens
+`libcublasLt.so.13` from the `nvidia-cublas` wheel. The pod server logs at boot whether that
+backend is enabled and reports it as `cudaKernels` in `/health` (`src/cuda_info.py`). The image sets `NVIDIA_VISIBLE_DEVICES=all` and
 `NVIDIA_DRIVER_CAPABILITIES=compute,utility`, as the `nvidia/cuda` images do.
 
-The cu128 kernels cover sm_75/80/86/90/100/120:
+The cu130 kernels cover sm_75 through sm_120:
 
 - Blackwell RTX PRO 4000/4500/6000 is sm_120.
 - Ada (RTX 4090) runs the sm_86 kernels.
 
-They need driver ≥ 570.
+They need host driver ≥ 580 (CUDA 13.0).
 
 **What the Dockerfile does:**
 
 1. Installs tcmalloc from apt.
 2. Downloads the ComfyUI tag tarball and checks its commit.
-3. Installs torch in its own layer from the cu128 index. It asserts the version and that sm_120 kernels are present.
+3. Installs torch in its own layer from the cu130 index. It asserts the version, that `torch.version.cuda` is 13.x and that sm_120 kernels are present.
 4. Installs ComfyUI's requirements and `requirements-runtime.txt`, with torch frozen by a constraints file. It then removes the six `comfyui-workflow-templates-media-*` packages, about 0.5 GB of example media for the web UI, which this worker never serves.
+   Step 4b then checks, without a GPU, that comfy-kitchen's CUDA extension loads and finds `libcublasLt.so.13`.
 5. Runs the CPU smoke tests:
    - checks the ComfyUI version
    - runs `main.py --quick-test-for-ci --cpu`
@@ -172,6 +177,11 @@ The entrypoint (`boot.py`, or `/start.sh` on the legacy image) starts ComfyUI
 | `PORT` | Default 8000. |
 | `WORKER_REF` | Runtime image only: the git ref the code was loaded from (see [Boot sequence](#boot-sequence-bootbootpy-standard-library-only)). |
 | `HF_TOKEN`, `CIVITAI_API_KEY`, … | As in serverless mode. |
+| `PREFETCH_MODELS` | Comma-separated model ids to copy to the local disk at boot; the first one is also warmed up (see [Local model copies](#local-model-copies-and-warm-up)). The app sends the profile's last generated model. |
+| `COMFY_LOG_LEVEL` | ComfyUI `--verbose` level (boot.py default `DEBUG`); the app sends `INFO`. |
+| `LOCAL_MODELS` | `0` turns the local copies off. |
+| `LOCAL_MODELS_ROOT`, `LOCAL_COPY_THREADS`, `LOCAL_COPY_CHUNK_MB`, `LOCAL_COPY_RESERVE_GB`, `LOCAL_COPY_WAIT_S` | Copier tuning: default `/models-local`, 16 threads, 64 MB ranges, 4 GB kept free, a job waits at most 1800 s for its copies. |
+| `WARMUP` | `0` turns the boot warm-up off. |
 
 Secrets are never logged. The startup line names only the key variables that are set.
 
@@ -245,6 +255,52 @@ is reported as `"read"`.
 | `lastError` | The last terminate failure, else the arm-check error, else `null`. It names key variables, never key values. |
 
 Terminating releases the GPU and detaches the network volume without deleting it.
+
+### Local model copies and warm-up
+
+ComfyUI v0.39.0 reads weights lazily during the first forward pass with small
+blocking reads, which ran at 30-150 MB/s from the network volume. In pod mode,
+`src/local_models.py` therefore copies a model's files from
+`/runpod-volume/models/<folder>/<file>` to the container disk at
+`/models-local/<folder>/<file>`, one file at a time. Each file is read with 16
+parallel `os.pread` calls of 64 MB and written with `os.pwrite` into
+`<file>.<random>.part`. The part file is renamed only after its size matches
+the source. Within a model the order is text encoder, then unet, then VAEs and
+the upscaler. LoRAs stay on the volume.
+
+`src/extra_model_paths.yaml` lists `/models-local` as `is_default`, so ComfyUI
+searches it first. A file that is still copying, failed, or was skipped for
+space is simply not there yet, and ComfyUI loads it from the volume.
+`--fast-disk` is not set: it is a global switch and would also force the slow
+disk-backed path for files that fall back to the volume.
+
+- **On demand.** A `generate` / `generate_video` job requests its model with
+  priority. Its files jump the queue, and a copy of another model's file that
+  is already in progress is paused and restarted later. The job waits in
+  progress stage `copying_models` (`phase: "loading"`, plus `copyPercent`,
+  `copyBytes` and `copyTotalBytes`) for at most `LOCAL_COPY_WAIT_S`. A copy
+  error never fails the job; those files load from the volume.
+- **Prefetch.** `PREFETCH_MODELS` is queued right after the server starts.
+- **Warm-up.** Once the first prefetched model is copied and ComfyUI is up, the
+  server runs one 1-step job through the normal handler and discards its
+  output. Image jobs are 256x256; video jobs use the smallest resolution and
+  the minimum duration. The warm-up is skipped once any real generate job has
+  been submitted, and a job that arrives during it waits only for that
+  warm-up. It is not a job: it is not listed or counted and does not reset the
+  idle watchdog.
+- **Idempotent.** A local file with the source's size counts as done, including
+  after a restart. Two requests for the same file share one copy. Stale
+  `.part` files are deleted at boot. `download` and `delete` drop the local
+  copy of any volume file they change.
+- **Space.** Before each file the copier checks free space, keeping
+  `LOCAL_COPY_RESERVE_GB` spare. A file that does not fit is skipped and logged.
+
+`GET /health` adds the following fields:
+
+- `localModels: {<model>: {state, doneBytes, totalBytes, MBps, files: [{folder, filename, state, doneBytes, totalBytes, MBps, error?}]}}`.
+  The model state is one of `queued`, `copying`, `done`, `failed`, `skipped`,
+  `missing` or `idle`.
+- `warmup: {model, state, detail?, elapsedMs?}`.
 
 ## Volume layout
 

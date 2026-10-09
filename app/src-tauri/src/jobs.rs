@@ -12,6 +12,8 @@ use crate::runpod::{
 };
 use crate::state::{now_rfc3339, Core};
 use crate::status::{has_cache, has_cache_for, lora_folder, present_set, present_set_for};
+use crate::vault::{BlobRef, ERR_LOCKED, ERR_NO_VAULT};
+use crate::vault_migrate;
 use base64::Engine;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -49,6 +51,26 @@ impl JobKind {
     }
 }
 
+/// Where a job's outputs are saved (spec v6): the general gallery (plaintext
+/// files + SQLite) or the encrypted vault.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Destination {
+    #[default]
+    General,
+    Vault,
+}
+
+impl Destination {
+    pub fn parse(s: Option<&str>) -> Result<Destination, String> {
+        match s.map(str::trim) {
+            None | Some("") | Some("general") => Ok(Destination::General),
+            Some("vault") => Ok(Destination::Vault),
+            Some(other) => Err(format!("Unknown destination \"{other}\" (use general or vault)")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum JobState {
@@ -82,6 +104,9 @@ pub struct JobProgress {
     pub cached_stages: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stage_times: Option<BTreeMap<String, u64>>,
+    /// Stage `copying_models`: the model files' copy to the pod's local disk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copy_percent: Option<f64>,
 }
 
 impl JobProgress {
@@ -98,6 +123,7 @@ impl JobProgress {
             cached: None,
             cached_stages: None,
             stage_times: None,
+            copy_percent: None,
         }
     }
 }
@@ -115,6 +141,7 @@ impl From<Progress> for JobProgress {
             cached: p.cached,
             cached_stages: p.cached_stages,
             stage_times: p.stage_times,
+            copy_percent: p.copy_percent,
         }
     }
 }
@@ -125,6 +152,8 @@ pub struct Job {
     pub job_id: String,
     /// "image" or "video" (additive, spec v5).
     pub kind: JobKind,
+    /// "general" or "vault" (spec v6).
+    pub destination: Destination,
     pub status: JobState,
     pub total: u32,
     pub completed: u32,
@@ -166,6 +195,17 @@ pub struct GenerateRequest {
     /// img2img strength, clamped to 0.05..=1.0 (default 0.6); ignored without a start image.
     #[serde(default)]
     pub denoise: Option<f64>,
+    /// img2img start image picked from the general gallery (a record id,
+    /// kind "image"); exclusive with the other start-image fields.
+    #[serde(default)]
+    pub init_image_gallery_id: Option<String>,
+    /// img2img start image that is a vault item (needs the unlocked vault and
+    /// `destination: vault`).
+    #[serde(default)]
+    pub init_image_vault_id: Option<String>,
+    /// Where the outputs go (spec v6); default general.
+    #[serde(default)]
+    pub destination: Destination,
 }
 
 /// The strength sent with a start image: clamped, default when absent or not finite.
@@ -188,6 +228,7 @@ pub fn expand_seeds(seed: Option<u64>, count: u32) -> Result<Vec<u64>, String> {
 /// Everything resolved for the per-image `generate` inputs.
 struct Plan {
     kind: JobKind,
+    destination: Destination,
     template: Value,
     seeds: Vec<u64>,
     record: ImageRecord, // template record; id/path/seed/times filled per image
@@ -210,6 +251,9 @@ pub struct VideoRequest {
     /// `init_image_id`.
     #[serde(default)]
     pub init_image_gallery_id: Option<String>,
+    /// i2v start image that is a vault item (needs the unlocked vault).
+    #[serde(default)]
+    pub init_image_vault_id: Option<String>,
     pub duration_s: f64,
     pub fps: f64,
     pub resolution: String,
@@ -221,6 +265,9 @@ pub struct VideoRequest {
     pub cfg: Option<f64>,
     #[serde(default)]
     pub audio: bool,
+    /// Where the output goes (spec v6); default general.
+    #[serde(default)]
+    pub destination: Destination,
 }
 
 /// A whole number as an integer JSON value, else a float.
@@ -238,27 +285,130 @@ fn parse_wh(s: &str) -> Option<(u32, u32)> {
     Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
 }
 
-/// A gallery image as the i2v start image: read in place (never copied),
-/// downscaled in memory to ≤1 MP like imported references. Returns the
-/// worker payload and the gallery file's path (recorded as `init_image`).
-fn gallery_start_image(core: &Core, image_id: &str) -> Result<(Value, String), String> {
-    let rec = core
-        .db
-        .lock()
-        .unwrap()
-        .get_image(image_id)?
-        .ok_or("That gallery image no longer exists")?;
-    if rec.kind != KIND_IMAGE {
+fn b64(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Vault jobs need a vault to seal into (not necessarily unlocked).
+fn check_destination(core: &Core, dest: Destination) -> Result<(), String> {
+    if dest == Destination::Vault && !core.vault.exists() {
+        return Err(format!("{ERR_NO_VAULT}: Create the vault first (Gallery → Vault)"));
+    }
+    Ok(())
+}
+
+/// Worker payload + the path recorded for one imported reference or start
+/// image. `vault:` ids need the unlocked vault and a vault job; plain ids are
+/// read from `references/` and, for a vault job, moved into the vault.
+fn load_reference(
+    core: &Core,
+    id: &str,
+    dest: Destination,
+    what: &str,
+) -> Result<(Value, String), String> {
+    if let Some(b) = BlobRef::parse(id) {
+        if dest != Destination::Vault {
+            return Err(format!(
+                "A {what} from the vault can only be used when saving to the vault"
+            ));
+        }
+        let bytes = core
+            .vault
+            .open_blob(&b.id)
+            .map_err(|_| format!("{ERR_LOCKED}: Unlock the vault to use that {what}"))?;
+        let payload = json!({
+            "name": format!("{}.{}", b.id, b.ext),
+            "base64": b64(&bytes),
+        });
+        return Ok((payload, b.path()));
+    }
+    let p = crate::references::find(&core.cfg.references_dir(), id)
+        .map_err(|_| format!("The {what} is missing; please add it again"))?;
+    let bytes = std::fs::read(&p).map_err(|e| format!("Could not read the {what}: {e}"))?;
+    let payload = json!({
+        "name": p.file_name().unwrap().to_string_lossy(),
+        "base64": b64(&bytes),
+    });
+    let path = if dest == Destination::Vault {
+        vault_migrate::seal_plain_reference(core, id)?.ref_id
+    } else {
+        p.to_string_lossy().into_owned()
+    };
+    Ok((payload, path))
+}
+
+/// A gallery image (general or vault) as the start image: read in place,
+/// downscaled in memory to ≤1 MP like imported references. For a vault job a
+/// general image is also sealed into the vault so the item is self-contained.
+fn gallery_start_image(
+    core: &Core,
+    image_id: &str,
+    dest: Destination,
+) -> Result<(Value, String), String> {
+    let general = core.db.lock().unwrap().get_image(image_id)?;
+    if let Some(rec) = general {
+        if rec.kind != KIND_IMAGE {
+            return Err("Pick an image (not a video) as the start image".into());
+        }
+        let bytes = std::fs::read(&rec.path)
+            .map_err(|e| format!("Could not read the gallery image: {e}"))?;
+        let (out, ext) = crate::references::process(&bytes)?;
+        let payload = json!({"name": format!("{}.{ext}", rec.id), "base64": b64(&out)});
+        let path = if dest == Destination::Vault {
+            vault_migrate::seal_verified(core, &out, ext)?.path()
+        } else {
+            rec.path
+        };
+        return Ok((payload, path));
+    }
+    vault_start_image(core, image_id, dest)
+}
+
+/// A vault item as the start image: decrypted in memory, downscaled, and
+/// referenced in place by the new vault item.
+fn vault_start_image(core: &Core, item_id: &str, dest: Destination) -> Result<(Value, String), String> {
+    if !core.vault.is_unlocked() {
+        return Err(if core.vault.exists() {
+            format!("{ERR_LOCKED}: Unlock the vault to use that start image")
+        } else {
+            "That gallery image no longer exists".into()
+        });
+    }
+    let item = core
+        .vault
+        .item(item_id)
+        .map_err(|_| "That gallery image no longer exists".to_string())?;
+    if dest != Destination::Vault {
+        return Err("A start image from the vault can only be used when saving to the vault".into());
+    }
+    if item.kind != KIND_IMAGE {
         return Err("Pick an image (not a video) as the start image".into());
     }
-    let bytes = std::fs::read(&rec.path)
-        .map_err(|e| format!("Could not read the gallery image: {e}"))?;
+    let bytes = core.vault.open_blob(&item.media.id)?;
     let (out, ext) = crate::references::process(&bytes)?;
-    let payload = json!({
-        "name": format!("{}.{ext}", rec.id),
-        "base64": base64::engine::general_purpose::STANDARD.encode(out),
-    });
-    Ok((payload, rec.path))
+    let payload = json!({"name": format!("{}.{ext}", item.id), "base64": b64(&out)});
+    Ok((payload, item.media.path()))
+}
+
+/// The start image of a request: an imported id, a general gallery record
+/// id, or a vault item id (at most one of them).
+fn load_start_image(
+    core: &Core,
+    init_image_id: Option<&str>,
+    gallery_id: Option<&str>,
+    vault_id: Option<&str>,
+    dest: Destination,
+) -> Result<Option<(Value, String)>, String> {
+    let given = [init_image_id, gallery_id, vault_id].iter().flatten().count();
+    if given > 1 {
+        return Err("Choose one start image".into());
+    }
+    match (init_image_id, gallery_id, vault_id) {
+        (Some(id), _, _) => load_reference(core, id, dest, "start image").map(Some),
+        (_, Some(gid), _) => gallery_start_image(core, gid, dest).map(Some),
+        (_, _, Some(vid)) => vault_start_image(core, vid, dest).map(Some),
+        _ => Ok(None),
+    }
 }
 
 fn build_video_plan(core: &Core, req: &VideoRequest) -> Result<Plan, String> {
@@ -267,10 +417,10 @@ fn build_video_plan(core: &Core, req: &VideoRequest) -> Result<Plan, String> {
     if prompt.is_empty() {
         return Err("Enter a prompt first".into());
     }
-    if req.init_image_id.is_some() && req.init_image_gallery_id.is_some() {
-        return Err("Choose one start image".into());
-    }
-    let has_init = req.init_image_id.is_some() || req.init_image_gallery_id.is_some();
+    check_destination(core, req.destination)?;
+    let has_init = req.init_image_id.is_some()
+        || req.init_image_gallery_id.is_some()
+        || req.init_image_vault_id.is_some();
     let mode = if has_init { "i2v" } else { "t2v" };
     if !model.has_mode(mode) {
         return Err(if mode == "i2v" {
@@ -359,21 +509,13 @@ fn build_video_plan(core: &Core, req: &VideoRequest) -> Result<Plan, String> {
         }
     }
 
-    let mut init = None;
-    if let Some(iid) = &req.init_image_id {
-        let p = crate::references::find(&core.cfg.references_dir(), iid)
-            .map_err(|_| "The start image is missing; please add it again".to_string())?;
-        let bytes =
-            std::fs::read(&p).map_err(|e| format!("Could not read the start image: {e}"))?;
-        let payload = json!({
-            "name": p.file_name().unwrap().to_string_lossy(),
-            "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
-        });
-        init = Some((payload, p.to_string_lossy().into_owned()));
-    }
-    if let Some(gid) = &req.init_image_gallery_id {
-        init = Some(gallery_start_image(core, gid)?);
-    }
+    let init = load_start_image(
+        core,
+        req.init_image_id.as_deref(),
+        req.init_image_gallery_id.as_deref(),
+        req.init_image_vault_id.as_deref(),
+        req.destination,
+    )?;
 
     let seeds = expand_seeds(req.seed, 1)?;
     let mut template = json!({
@@ -423,9 +565,12 @@ fn build_video_plan(core: &Core, req: &VideoRequest) -> Result<Plan, String> {
         fps: Some(req.fps),
         has_audio: Some(req.audio),
         poster_path: None,
+        vault: false,
+        thumb_path: None,
     };
     Ok(Plan {
         kind: JobKind::Video,
+        destination: req.destination,
         template,
         seeds,
         record,
@@ -471,9 +616,14 @@ fn build_plan(core: &Core, req: &GenerateRequest) -> Result<Plan, String> {
     if req.loras.len() > MAX_LORAS {
         return Err(format!("At most {MAX_LORAS} LoRAs per generation"));
     }
-    if req.init_image_id.is_some() && !model.supports_img2img {
+    if (req.init_image_id.is_some()
+        || req.init_image_gallery_id.is_some()
+        || req.init_image_vault_id.is_some())
+        && !model.supports_img2img
+    {
         return Err(format!("{} does not take a start image", model.name));
     }
+    check_destination(core, req.destination)?;
 
     let present = present_set(core);
     if has_cache(core) {
@@ -495,33 +645,20 @@ fn build_plan(core: &Core, req: &GenerateRequest) -> Result<Plan, String> {
     let mut refs_payload = Vec::new();
     let mut ref_paths = Vec::new();
     for rid in &req.reference_ids {
-        let p = crate::references::find(&core.cfg.references_dir(), rid)?;
-        let bytes =
-            std::fs::read(&p).map_err(|e| format!("Could not read a reference image: {e}"))?;
-        refs_payload.push(json!({
-            "name": p.file_name().unwrap().to_string_lossy(),
-            "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
-        }));
-        ref_paths.push(p.to_string_lossy().into_owned());
+        let (payload, path) = load_reference(core, rid, req.destination, "reference image")?;
+        refs_payload.push(payload);
+        ref_paths.push(path);
     }
 
     // img2img: the start image goes through the same import pipeline as references.
-    let mut init = None;
-    if let Some(iid) = &req.init_image_id {
-        let p = crate::references::find(&core.cfg.references_dir(), iid)
-            .map_err(|_| "The start image is missing; please add it again".to_string())?;
-        let bytes =
-            std::fs::read(&p).map_err(|e| format!("Could not read the start image: {e}"))?;
-        let payload = json!({
-            "name": p.file_name().unwrap().to_string_lossy(),
-            "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
-        });
-        init = Some((
-            payload,
-            p.to_string_lossy().into_owned(),
-            resolve_denoise(req.denoise),
-        ));
-    }
+    let init = load_start_image(
+        core,
+        req.init_image_id.as_deref(),
+        req.init_image_gallery_id.as_deref(),
+        req.init_image_vault_id.as_deref(),
+        req.destination,
+    )?
+    .map(|(payload, path)| (payload, path, resolve_denoise(req.denoise)));
 
     let mut loras_payload = Vec::new();
     let mut lora_refs = Vec::new();
@@ -591,9 +728,12 @@ fn build_plan(core: &Core, req: &GenerateRequest) -> Result<Plan, String> {
         fps: None,
         has_audio: None,
         poster_path: None,
+        vault: false,
+        thumb_path: None,
     };
     Ok(Plan {
         kind: JobKind::Image,
+        destination: req.destination,
         template,
         seeds,
         record,
@@ -615,9 +755,12 @@ pub fn generate_video(core: &Arc<Core>, req: VideoRequest) -> Result<String, Str
 fn start_job(core: &Arc<Core>, plan: Plan) -> Result<String, String> {
     let profile = plan.kind.profile();
     crate::worker::precheck_for(core, profile)?;
+    // Before any pod start: the next pod prefetches this model to local disk.
+    crate::pod::record_last_model(core, profile, &plan.record.model);
     let job = Job {
         job_id: uuid::Uuid::new_v4().to_string(),
         kind: plan.kind,
+        destination: plan.destination,
         status: JobState::Queued,
         total: plan.seeds.len() as u32,
         completed: 0,
@@ -732,7 +875,8 @@ fn looks_like_mp4(bytes: &[u8]) -> bool {
 }
 
 /// Decode the `generate_video` output: the MP4 into `videos/<id>.mp4`, the
-/// poster into `videos/<id>.jpg`, and a `kind = "video"` record.
+/// poster into `videos/<id>.jpg`, and a `kind = "video"` record — or, for a
+/// vault job, sealed into the vault straight from memory.
 fn save_video(
     core: &Core,
     plan: &Plan,
@@ -749,34 +893,11 @@ fn save_video(
     if !looks_like_mp4(&bytes) {
         return Err("The worker returned a file that is not an MP4 video".into());
     }
-    let id = uuid::Uuid::new_v4().to_string();
-    let dir = core.cfg.videos_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Could not save the video: {e}"))?;
-    let path = dir.join(format!("{id}.mp4"));
-    std::fs::write(&path, &bytes).map_err(|e| format!("Could not save the video: {e}"))?;
-    let poster_path = out
+    let poster = out
         .pointer("/poster/base64")
         .and_then(Value::as_str)
-        .and_then(decode_b64)
-        .and_then(|b| {
-            let ext = match image::guess_format(&b) {
-                Ok(image::ImageFormat::Png) => "png",
-                Ok(image::ImageFormat::WebP) => "webp",
-                _ => "jpg",
-            };
-            let p = dir.join(format!("{id}.{ext}"));
-            match std::fs::write(&p, &b) {
-                Ok(()) => Some(p.to_string_lossy().into_owned()),
-                Err(e) => {
-                    eprintln!("[jobs] could not save the video poster: {e}");
-                    None
-                }
-            }
-        });
+        .and_then(decode_b64);
     let mut rec = plan.record.clone();
-    rec.id = id;
-    rec.path = path.to_string_lossy().into_owned();
-    rec.poster_path = poster_path;
     rec.seed = video
         .get("seed")
         .or_else(|| out.get("seed"))
@@ -806,6 +927,33 @@ fn save_video(
         delay_ms: s.delay_time_ms,
         execution_ms: s.execution_time_ms,
     };
+    if plan.destination == Destination::Vault {
+        // Encrypted the moment it arrives; the plaintext never touches disk.
+        return vault_migrate::seal_output(core, &rec, &bytes, poster.as_deref());
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let dir = core.cfg.videos_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Could not save the video: {e}"))?;
+    let path = dir.join(format!("{id}.mp4"));
+    std::fs::write(&path, &bytes).map_err(|e| format!("Could not save the video: {e}"))?;
+    let poster_path = poster.and_then(|b| {
+        let ext = match image::guess_format(&b) {
+            Ok(image::ImageFormat::Png) => "png",
+            Ok(image::ImageFormat::WebP) => "webp",
+            _ => "jpg",
+        };
+        let p = dir.join(format!("{id}.{ext}"));
+        match std::fs::write(&p, &b) {
+            Ok(()) => Some(p.to_string_lossy().into_owned()),
+            Err(e) => {
+                eprintln!("[jobs] could not save the video poster: {e}");
+                None
+            }
+        }
+    });
+    rec.id = id;
+    rec.path = path.to_string_lossy().into_owned();
+    rec.poster_path = poster_path;
     core.db.lock().unwrap().insert_image(&rec)?;
     Ok(rec)
 }
@@ -822,7 +970,8 @@ fn save_output(
     }
 }
 
-/// Decode the `generate` output into a PNG file and an ImageRecord.
+/// Decode the `generate` output into a PNG file and an ImageRecord — or, for
+/// a vault job, seal it into the vault straight from memory.
 fn save_image(
     core: &Core,
     plan: &Plan,
@@ -839,17 +988,7 @@ fn save_image(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
         .map_err(|_| "The worker returned invalid image data".to_string())?;
-    let id = uuid::Uuid::new_v4().to_string();
-    let ext = match image::guess_format(&bytes) {
-        Ok(image::ImageFormat::Jpeg) => "jpg",
-        Ok(image::ImageFormat::WebP) => "webp",
-        _ => "png",
-    };
-    let path = core.cfg.images_dir().join(format!("{id}.{ext}"));
-    std::fs::write(&path, &bytes).map_err(|e| format!("Could not save the image: {e}"))?;
     let mut rec = plan.record.clone();
-    rec.id = id;
-    rec.path = path.to_string_lossy().into_owned();
     rec.seed = img.get("seed").and_then(Value::as_u64).unwrap_or(sub.seed);
     if let Some(w) = img.get("width").and_then(Value::as_u64) {
         rec.width = w as u32;
@@ -866,6 +1005,19 @@ fn save_image(
         delay_ms: s.delay_time_ms,
         execution_ms: s.execution_time_ms,
     };
+    if plan.destination == Destination::Vault {
+        return vault_migrate::seal_output(core, &rec, &bytes, None);
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let ext = match image::guess_format(&bytes) {
+        Ok(image::ImageFormat::Jpeg) => "jpg",
+        Ok(image::ImageFormat::WebP) => "webp",
+        _ => "png",
+    };
+    let path = core.cfg.images_dir().join(format!("{id}.{ext}"));
+    std::fs::write(&path, &bytes).map_err(|e| format!("Could not save the image: {e}"))?;
+    rec.id = id;
+    rec.path = path.to_string_lossy().into_owned();
     core.db.lock().unwrap().insert_image(&rec)?;
     Ok(rec)
 }
@@ -955,9 +1107,16 @@ async fn run_job(core: Arc<Core>, id: String, client: RunpodClient, plan: Plan) 
                     match save_output(&core, &plan, sub, &s) {
                         Ok(rec) => {
                             sub.state = RunStatus::Completed;
+                            // A vault output sealed while the vault is locked is
+                            // only counted: no path, prompt or id leaves the vault
+                            // until `list_vault_items` after an unlock.
+                            let redact = plan.destination == Destination::Vault
+                                && !core.vault.is_unlocked();
                             update(&core, &id, |j| {
                                 j.completed += 1;
-                                j.images.push(rec);
+                                if !redact {
+                                    j.images.push(rec);
+                                }
                             });
                         }
                         Err(e) => {
@@ -1020,6 +1179,16 @@ mod tests {
         assert!(expand_seeds(Some(MAX_SEED), 2).is_err());
         assert!(expand_seeds(Some(MAX_SEED), 1).is_ok());
         assert!(expand_seeds(Some(u64::MAX), 1).is_err());
+    }
+
+    #[test]
+    fn destination_parsing() {
+        assert_eq!(Destination::parse(None).unwrap(), Destination::General);
+        assert_eq!(Destination::parse(Some("")).unwrap(), Destination::General);
+        assert_eq!(Destination::parse(Some("general")).unwrap(), Destination::General);
+        assert_eq!(Destination::parse(Some(" vault ")).unwrap(), Destination::Vault);
+        assert!(Destination::parse(Some("cloud")).is_err());
+        assert_eq!(serde_json::to_value(Destination::Vault).unwrap(), "vault");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # Builds the RUNTIME image (worker/Dockerfile.runtime, repo root as build context)
 # and pushes ghcr.io/<owner>/image-studio-runtime:{latest,sha-<sha>}.
 #
-# The runtime image holds Python + torch (cu128) + ComfyUI + third-party deps
+# The runtime image holds Python + torch (cu130) + ComfyUI + third-party deps
 # only. Worker code (worker/src, shared/models.json) is fetched from GitHub by
 # worker/boot/boot.py when a pod starts, so a code-only push builds NOTHING:
 # the next pod start picks it up. This workflow runs only when the image

@@ -17,6 +17,14 @@ order (one GPU); other actions (status/download/delete) run on a separate
 executor, concurrently with generation. Both reuse handler.handler() unchanged; progress reaches the job
 record through the job's "_progress" hook, and cancellation through "_cancel".
 
+Local model copies and warm-up (local_models.py): at boot the models in
+PREFETCH_MODELS are copied from the network volume to the container disk
+(/models-local); once that is done and ComfyUI is up, one tiny generation of
+the first prefetched model loads its weights onto the GPU. The warm-up only
+runs while no real generate job has been submitted, never counts as activity
+for the idle watchdog, and a real job waits at most for the warm-up already
+running. GET /health adds `localModels` and `warmup`.
+
 Idle watchdog: when no authenticated request has arrived for IDLE_MINUTES
 (and no job is active or recently finished), the pod terminates itself through
 the RunPod API (see Terminator). It never exits the process; a failed
@@ -39,12 +47,15 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import requests
 from aiohttp import web
 
+import cuda_info
 import handler as worker
+import local_models
+from registry import load_registry
 
 log = logging.getLogger("image_studio.server")
 
@@ -132,6 +143,9 @@ class JobManager:
         self.jobs: dict[str, Job] = {}
         self.lock = threading.RLock()
         self.last_finished: float | None = None
+        # Held while a generate job (or the warm-up) uses ComfyUI / the GPU.
+        self._gen_lock = threading.Lock()
+        self.generate_submitted = False  # any real generate job since boot
         self._gen_queue: queue.Queue[Job | None] = queue.Queue()
         self._aux = ThreadPoolExecutor(max_workers=aux_workers, thread_name_prefix="aux")
         self._gen_thread = threading.Thread(target=self._generate_loop, name="generate",
@@ -150,6 +164,8 @@ class JobManager:
                   created=self.clock(), timeout_s=timeout_s)
         with self.lock:
             self.jobs[job.id] = job
+            if action in GENERATE_ACTIONS:
+                self.generate_submitted = True
         if action in GENERATE_ACTIONS:
             self._gen_queue.put(job)
         else:
@@ -162,7 +178,25 @@ class JobManager:
             job = self._gen_queue.get()
             if job is None:
                 return
-            self._execute(job)
+            with self._gen_lock:
+                self._execute(job)
+
+    def run_idle(self, fn: Callable[[], Any]) -> bool:
+        """Runs `fn` on the GPU slot only if no generate job was ever
+        submitted and none is waiting or running; returns False (fn not run)
+        otherwise. A job submitted while fn runs waits for it, then runs.
+        Not a job: it is not listed, not counted by active() and does not
+        move last_finished, so the idle watchdog ignores it."""
+        with self.lock:
+            if self.generate_submitted:
+                return False
+            if not self._gen_lock.acquire(blocking=False):
+                return False
+        try:
+            fn()
+        finally:
+            self._gen_lock.release()
+        return True
 
     def _execute(self, job: Job) -> None:
         with self.lock:
@@ -532,8 +566,12 @@ class Health:
     def __init__(self, manager: JobManager, comfy_up: Callable[[], bool] | None = None,
                  gpu: Callable[[], str] = gpu_name,
                  comfy_version: Callable[[], str | None] = worker.comfyui_version,
-                 code: Callable[[], dict | None] = code_info):
+                 code: Callable[[], dict | None] = code_info,
+                 local_models: Callable[[], dict] | None = None,
+                 warmup: Callable[[], dict] | None = None):
         self.manager = manager
+        self._local_models = local_models
+        self._warmup = warmup
         self.comfy_up = comfy_up or (lambda: worker.make_client().is_up())
         self._gpu_fn = gpu
         self._gpu: str | None = None
@@ -555,7 +593,130 @@ class Health:
                "comfyui": self.comfy_version() or ""}
         if self._code is not None:
             out["code"] = self._code
+        if self._local_models is not None:
+            out["localModels"] = self._local_models()
+        if self._warmup is not None:
+            out["warmup"] = self._warmup()
+        if (cuda := cuda_info.status()) is not None: out["cudaKernels"] = cuda  # noqa: E701
         return out
+
+
+# ---------------------------------------------------------------------------
+# warm-up
+# ---------------------------------------------------------------------------
+WARMUP_IMAGE_SIDE = 256  # valid for every image model; the weights load the same
+
+
+def warmup_input(registry: dict, model_id: str) -> dict | None:
+    """The cheapest valid job for `model_id`: 1 step, smallest size / frame
+    count. None for an unknown id."""
+    for m in registry.get("models", []):
+        if m["id"] == model_id:
+            return {"action": "generate", "model": model_id, "prompt": "warm-up",
+                    "width": WARMUP_IMAGE_SIDE, "height": WARMUP_IMAGE_SIDE,
+                    "steps": 1, "seed": 0, "references": [], "loras": []}
+    for m in registry.get("videoModels", []):
+        if m["id"] == model_id:
+            lim = m["limits"]
+
+            def pixels(r: str) -> int:
+                w, h = r.split("x")
+                return int(w) * int(h)
+
+            return {"action": "generate_video", "model": model_id, "prompt": "warm-up",
+                    "resolution": min(lim["resolutions"], key=pixels),
+                    "durationS": lim.get("minDurationS") or 1,
+                    "fps": min(lim["fpsOptions"]), "steps": 1, "seed": 0,
+                    "audio": bool(m.get("audio", False))}
+    return None
+
+
+class WarmUp:
+    """After the prefetch copy and ComfyUI are ready, runs one tiny job of
+    `model_id` through the normal handler so its weights are on the GPU when
+    the first real job arrives. Output is discarded.
+
+    Yields to real jobs: skipped if any generate job was submitted since boot
+    (queued, running or done; a done job already loaded what the user wants),
+    and a job submitted during the warm-up only waits for it to finish
+    (JobManager.run_idle). Not user activity: it never touches the watchdog."""
+
+    def __init__(self, manager: JobManager, model_id: str, inp: dict,
+                 local: local_models.LocalModels | None = None,
+                 comfy_up: Callable[[], bool] | None = None,
+                 run_job: Callable[[dict], Any] | None = None,
+                 ready_timeout_s: float = 1800.0, poll_s: float = 5.0,
+                 sleep: Callable[[float], None] = time.sleep,
+                 clock: Callable[[], float] = time.monotonic):
+        self.manager = manager
+        self.model_id = model_id
+        self.inp = inp
+        self.local = local
+        self.comfy_up = comfy_up or (lambda: worker.make_client().is_up())
+        self.run_job = run_job or manager.run_job
+        self.ready_timeout_s = ready_timeout_s
+        self.poll_s = poll_s
+        self.sleep = sleep
+        self.clock = clock
+        self.state = "pending"
+        self.detail: str | None = None
+        self.elapsed_ms: int | None = None
+
+    def status(self) -> dict:
+        out: dict[str, Any] = {"model": self.model_id, "state": self.state}
+        if self.detail:
+            out["detail"] = self.detail
+        if self.elapsed_ms is not None:
+            out["elapsedMs"] = self.elapsed_ms
+        return out
+
+    def _skip(self, why: str) -> None:
+        self.state, self.detail = "skipped", why
+        log.info("warm-up of %s skipped: %s", self.model_id, why)
+
+    def run(self) -> None:
+        try:
+            self._run()
+        except Exception as exc:  # never let the warm-up hurt the server
+            self.state, self.detail = "failed", f"{type(exc).__name__}: {exc}"
+            log.exception("warm-up of %s failed", self.model_id)
+
+    def _run(self) -> None:
+        if self.local is not None:
+            self.state = "waiting_copy"
+            entries = self.local.request(self.model_id)
+            if entries:
+                self.local.wait(entries)
+        self.state = "waiting_comfyui"
+        deadline = self.clock() + self.ready_timeout_s
+        while not self.comfy_up():
+            if self.manager.generate_submitted:
+                return self._skip("a real job arrived first")
+            if self.clock() >= deadline:
+                return self._skip("ComfyUI did not come up")
+            self.sleep(self.poll_s)
+        t0 = self.clock()
+        result: dict = {}
+
+        def go() -> None:
+            self.state = "running"
+            log.info("warm-up: loading %s with a 1-step job", self.model_id)
+            job = {"id": f"warmup-{uuid.uuid4().hex[:8]}", "input": dict(self.inp),
+                   worker.PROGRESS_HOOK: lambda payload: None,
+                   worker.CANCEL_EVENT: threading.Event()}
+            result["r"] = self.run_job(job)
+
+        if not self.manager.run_idle(go):
+            return self._skip("a real job is queued, running or already ran")
+        self.elapsed_ms = _ms(self.clock() - t0)
+        r = result.get("r")
+        if isinstance(r, dict) and r.get("error"):
+            self.state, self.detail = "failed", str(r["error"])[:300]
+            log.warning("warm-up of %s failed: %s", self.model_id, self.detail)
+        else:
+            self.state = "done"
+            log.info("warm-up of %s done in %d ms (output discarded)", self.model_id,
+                     self.elapsed_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -632,6 +793,30 @@ def _background(manager: JobManager, watchdog: IdleWatchdog, interval_s: float =
             log.exception("background check failed")
 
 
+def start_prefetch(manager: JobManager, env: Mapping[str, str]
+                   ) -> tuple[local_models.LocalModels | None, WarmUp | None]:
+    """Creates the local-copy manager, queues PREFETCH_MODELS and starts the
+    warm-up of the first one (WARMUP=0 turns the warm-up off). Never raises."""
+    local = warm = None
+    try:
+        local = local_models.init_from_env(env)
+        registry = load_registry()
+        ids = local_models.prefetch_ids(env, registry)
+        if local is not None:
+            for mid in ids:
+                local.request(mid)
+        if ids:
+            log.info("prefetch: %s", ", ".join(ids))
+        if ids and (env.get("WARMUP") or "1").strip() != "0":
+            inp = warmup_input(registry, ids[0])
+            if inp is not None:
+                warm = WarmUp(manager, ids[0], inp, local=local)
+                threading.Thread(target=warm.run, name="warmup", daemon=True).start()
+    except Exception:
+        log.exception("prefetch / warm-up setup failed; continuing without it")
+    return local, warm
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -647,7 +832,11 @@ def main() -> None:
     terminator = Terminator()
     watchdog = IdleWatchdog(manager, idle_minutes * 60, terminator.terminate,
                             verify=terminator.verify)
-    app = build_app(token, manager, Health(manager), watchdog)
+    local, warm = start_prefetch(manager, os.environ)
+    cuda_info.start()  # boot log + /health cudaKernels (comfy-kitchen CUDA backend on/off)
+    health = Health(manager, local_models=local.health if local is not None else None,
+                    warmup=warm.status if warm is not None else None)
+    app = build_app(token, manager, health, watchdog)
     threading.Thread(target=watchdog.verify, name="watchdog-verify", daemon=True).start()
     threading.Thread(target=_background, args=(manager, watchdog), name="watchdog",
                      daemon=True).start()

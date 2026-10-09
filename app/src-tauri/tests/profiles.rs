@@ -505,6 +505,7 @@ async fn idle_auto_stop_and_liveness_are_per_profile() {
     let job = Job {
         job_id: "j".into(),
         kind: JobKind::Image,
+        destination: Default::default(),
         status: JobState::Running,
         total: 1,
         completed: 0,
