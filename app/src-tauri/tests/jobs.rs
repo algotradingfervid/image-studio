@@ -3,7 +3,8 @@
 use app_lib::db::Db;
 use app_lib::jobs::{self, GenerateRequest, Job, JobState};
 use app_lib::registry::Registry;
-use app_lib::settings::{MemoryStore, SecretStore, Settings, ACCOUNT_RUNPOD, ENV_RUNPOD_ENDPOINT};
+use app_lib::pod::{self, GpuStatus};
+use app_lib::settings::{MemoryStore, SecretStore, Settings, ACCOUNT_POD_TOKEN, ACCOUNT_RUNPOD};
 use app_lib::state::{Core, CoreConfig, EventSink};
 use app_lib::status::StatusView;
 use app_lib::tasks::{self, Task, TaskStatus};
@@ -37,25 +38,58 @@ impl EventSink for Collect {
 struct Harness {
     core: Arc<Core>,
     sink: Arc<Collect>,
+    /// The mocked RunPod REST API (kept apart from `server`, the pod's worker
+    /// API, so the tests' request lists only hold worker calls).
+    _rest: MockServer,
     _dir: tempfile::TempDir,
 }
 
-fn harness(server: &MockServer) -> Harness {
+/// A core whose image GPU pod `pod1` is already running (adopted from the
+/// mocked REST API); worker calls go to `server` at `/proxy/pod1/...`.
+async fn harness(server: &MockServer) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(MemoryStore::default());
     store.set(ACCOUNT_RUNPOD, Some("test-key")).unwrap();
-    let env: HashMap<String, String> =
-        [(ENV_RUNPOD_ENDPOINT.to_string(), "ep1".to_string())].into();
-    // These tests exercise the legacy serverless path (the pod path is in tests/pod.rs).
-    std::fs::write(dir.path().join("settings.json"), r#"{"backend":"serverless"}"#).unwrap();
-    let settings = Settings::new(store, env, dir.path().join("settings.json"));
+    store.set(ACCOUNT_POD_TOKEN, Some("podtok")).unwrap();
+    let settings = Settings::new(store, HashMap::new(), dir.path().join("settings.json"));
     let sink = Arc::new(Collect::default());
+    let rest = MockServer::start().await;
+    let pod = json!({"id": "pod1", "name": "image-studio-gpu", "status": "RUNNING", "cost": 2.39,
+        "gpu": {"id": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "count": 1},
+        "startedAt": "2026-10-09T10:00:05Z"});
+    Mock::given(method("GET"))
+        .and(path("/v2/pods"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pods": [pod.clone()], "pagination": {"hasNextPage": false}})))
+        .mount(&rest)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/pod1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pod))
+        .mount(&rest)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/proxy/pod1/ping"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ok"})))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/proxy/pod1/health"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"jobs": {"inQueue": 0, "inProgress": 0},
+            "workers": {"idle": 1, "running": 0}, "ready": true})))
+        .mount(server)
+        .await;
     let cfg = CoreConfig {
         data_dir: dir.path().to_path_buf(),
         runpod_root: server.uri(),
         civitai_root: server.uri(),
         hf_root: server.uri(),
         poll_interval: Duration::from_millis(10),
+        rest_root: rest.uri(),
+        pod_proxy_template: format!("{}/proxy/{{podId}}", server.uri()),
+        pod_poll_interval: Duration::from_millis(10),
+        pod_start_timeout: Duration::from_secs(5),
+        pod_stop_timeout: Duration::from_secs(2),
+        rest_timeout: Duration::from_secs(2),
         ..CoreConfig::production(dir.path().to_path_buf())
     };
     let core = Core::new(
@@ -66,11 +100,31 @@ fn harness(server: &MockServer) -> Harness {
         cfg,
     )
     .unwrap();
+    pod::adopt(&core).await.unwrap();
+    for _ in 0..500 {
+        if pod::state(&core).status == GpuStatus::Running {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(pod::state(&core).status, GpuStatus::Running);
     Harness {
         core,
         sink,
+        _rest: rest,
         _dir: dir,
     }
+}
+
+/// Requests the worker API received (the pod readiness checks left out).
+async fn worker_requests(server: &MockServer) -> Vec<Request> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| !r.url.path().ends_with("/ping") && !r.url.path().ends_with("/health"))
+        .collect()
 }
 
 fn png_b64() -> String {
@@ -146,13 +200,13 @@ fn statuses(sink: &Collect) -> Vec<JobState> {
 async fn generate_happy_path() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/v2/ep1/run"))
-        .and(header("authorization", "Bearer test-key"))
+        .and(path("/proxy/pod1/run"))
+        .and(header("authorization", "Bearer podtok"))
         .respond_with(RunIds(AtomicUsize::new(0)))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path("/v2/ep1/status/rp-0"))
+        .and(path("/proxy/pod1/status/rp-0"))
         .respond_with(seq(vec![
             json!({"id": "rp-0", "status": "IN_QUEUE"}),
             json!({"id": "rp-0", "status": "IN_PROGRESS", "output": {"phase": "sampling", "step": 3, "totalSteps": 8}}),
@@ -160,7 +214,7 @@ async fn generate_happy_path() {
         ]))
         .mount(&server)
         .await;
-    let h = harness(&server);
+    let h = harness(&server).await;
     jobs::generate(&h.core, req(1, Some(42))).unwrap();
     let job = wait_job(&h.sink).await;
 
@@ -206,7 +260,7 @@ async fn generate_happy_path() {
     assert_eq!(list, job.images);
 
     // Request body follows the protocol.
-    let reqs = server.received_requests().await.unwrap();
+    let reqs = worker_requests(&server).await;
     let run: Value = reqs
         .iter()
         .find(|r| r.url.path().ends_with("/run"))
@@ -241,12 +295,12 @@ fn import_start_image(h: &Harness, w: u32, hgt: u32) -> app_lib::references::Imp
 async fn generate_img2img_sends_start_image_and_denoise() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/v2/ep1/run"))
+        .and(path("/proxy/pod1/run"))
         .respond_with(RunIds(AtomicUsize::new(0)))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path("/v2/ep1/status/rp-0"))
+        .and(path("/proxy/pod1/status/rp-0"))
         .respond_with(seq(vec![
             json!({"id": "rp-0", "status": "IN_PROGRESS", "output": {"phase": "loading",
                    "stage": "preparing_init_image", "stages": ["loading_model", "preparing_init_image", "sampling"]}}),
@@ -254,7 +308,7 @@ async fn generate_img2img_sends_start_image_and_denoise() {
         ]))
         .mount(&server)
         .await;
-    let h = harness(&server);
+    let h = harness(&server).await;
     let start = import_start_image(&h, 300, 200);
     let mut r = req(1, Some(9));
     r.model = "chroma".into();
@@ -264,7 +318,7 @@ async fn generate_img2img_sends_start_image_and_denoise() {
     let job = wait_job(&h.sink).await;
     assert_eq!(job.status, JobState::Completed, "{:?}", job.error);
 
-    let reqs = server.received_requests().await.unwrap();
+    let reqs = worker_requests(&server).await;
     let run: Value = reqs
         .iter()
         .find(|r| r.url.path().ends_with("/run"))
@@ -311,16 +365,16 @@ async fn generate_img2img_sends_start_image_and_denoise() {
 async fn generate_img2img_default_and_clamped_denoise() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/v2/ep1/run"))
+        .and(path("/proxy/pod1/run"))
         .respond_with(RunIds(AtomicUsize::new(0)))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path_regex("/v2/ep1/status/.*"))
+        .and(path_regex("/proxy/pod1/status/.*"))
         .respond_with(seq(vec![completed(1)]))
         .mount(&server)
         .await;
-    let h = harness(&server);
+    let h = harness(&server).await;
     let start = import_start_image(&h, 64, 64);
     for (given, sent) in [(None, 0.6), (Some(0.0), 0.05), (Some(4.0), 1.0)] {
         h.sink.jobs.lock().unwrap().clear();
@@ -330,7 +384,7 @@ async fn generate_img2img_default_and_clamped_denoise() {
         jobs::generate(&h.core, r).unwrap();
         let job = wait_job(&h.sink).await;
         assert_eq!(job.images[0].denoise, Some(sent));
-        let reqs = server.received_requests().await.unwrap();
+        let reqs = worker_requests(&server).await;
         let run: Value = reqs
             .iter()
             .rfind(|r| r.url.path().ends_with("/run"))
@@ -344,7 +398,7 @@ async fn generate_img2img_default_and_clamped_denoise() {
 #[tokio::test]
 async fn generate_img2img_validation() {
     let server = MockServer::start().await;
-    let h = harness(&server);
+    let h = harness(&server).await;
     let start = import_start_image(&h, 32, 32);
     for model in ["flux2", "qwen"] {
         let mut r = req(1, None);
@@ -361,24 +415,24 @@ async fn generate_img2img_validation() {
     let mut r = req(1, None);
     r.init_image_id = Some("../../etc/passwd".into());
     assert!(jobs::generate(&h.core, r).is_err());
-    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(worker_requests(&server).await.is_empty());
 }
 
 #[tokio::test]
 async fn generate_failure() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/v2/ep1/run"))
+        .and(path("/proxy/pod1/run"))
         .respond_with(RunIds(AtomicUsize::new(0)))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path("/v2/ep1/status/rp-0"))
+        .and(path("/proxy/pod1/status/rp-0"))
         .respond_with(seq(vec![json!({"id": "rp-0", "status": "FAILED",
             "error": "{\"error_type\":\"RuntimeError\",\"error_message\":\"MODEL_NOT_INSTALLED: unet/z_image_turbo_bf16.safetensors\"}"})]))
         .mount(&server)
         .await;
-    let h = harness(&server);
+    let h = harness(&server).await;
     jobs::generate(&h.core, req(1, Some(1))).unwrap();
     let job = wait_job(&h.sink).await;
     assert_eq!(job.status, JobState::Failed);
@@ -391,22 +445,22 @@ async fn generate_failure() {
 async fn generate_cancel() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/v2/ep1/run"))
+        .and(path("/proxy/pod1/run"))
         .respond_with(RunIds(AtomicUsize::new(0)))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path_regex("/v2/ep1/status/.*"))
+        .and(path_regex("/proxy/pod1/status/.*"))
         .respond_with(seq(vec![json!({"status": "IN_QUEUE"})]))
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path_regex("/v2/ep1/cancel/rp-.*"))
+        .and(path_regex("/proxy/pod1/cancel/rp-.*"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "CANCELLED"})))
         .expect(2)
         .mount(&server)
         .await;
-    let h = harness(&server);
+    let h = harness(&server).await;
     let id = jobs::generate(&h.core, req(2, Some(5))).unwrap();
     // Wait until it is "starting" (IN_QUEUE), then cancel.
     for _ in 0..200 {
@@ -426,14 +480,14 @@ async fn generate_cancel() {
 async fn generate_count_three_uses_consecutive_seeds() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/v2/ep1/run"))
+        .and(path("/proxy/pod1/run"))
         .respond_with(RunIds(AtomicUsize::new(0)))
         .expect(3)
         .mount(&server)
         .await;
     for (i, seed) in [100u64, 101, 102].iter().enumerate() {
         Mock::given(method("GET"))
-            .and(path(format!("/v2/ep1/status/rp-{i}")))
+            .and(path(format!("/proxy/pod1/status/rp-{i}")))
             .respond_with(seq(vec![
                 json!({"status": "IN_PROGRESS"}),
                 completed(*seed),
@@ -441,7 +495,7 @@ async fn generate_count_three_uses_consecutive_seeds() {
             .mount(&server)
             .await;
     }
-    let h = harness(&server);
+    let h = harness(&server).await;
     jobs::generate(&h.core, req(3, Some(100))).unwrap();
     let job = wait_job(&h.sink).await;
     assert_eq!(job.status, JobState::Completed);
@@ -450,10 +504,8 @@ async fn generate_count_three_uses_consecutive_seeds() {
     let mut seeds: Vec<u64> = job.images.iter().map(|i| i.seed).collect();
     seeds.sort();
     assert_eq!(seeds, vec![100, 101, 102]);
-    let sent: Vec<u64> = server
-        .received_requests()
+    let sent: Vec<u64> = worker_requests(&server)
         .await
-        .unwrap()
         .iter()
         .filter(|r| r.url.path().ends_with("/run"))
         .map(|r| {
@@ -469,7 +521,7 @@ async fn generate_count_three_uses_consecutive_seeds() {
 #[tokio::test]
 async fn generate_validation() {
     let server = MockServer::start().await;
-    let h = harness(&server);
+    let h = harness(&server).await;
     let mut r = req(1, None);
     r.reference_ids = vec!["00000000-0000-0000-0000-000000000000".into()];
     assert!(jobs::generate(&h.core, r)
@@ -497,13 +549,13 @@ async fn generate_validation() {
 async fn download_task_refreshes_status() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/v2/ep1/run"))
+        .and(path("/proxy/pod1/run"))
         .respond_with(RunIds(AtomicUsize::new(0)))
         .mount(&server)
         .await;
     // rp-0: the download; rp-1: the status refresh afterwards.
     Mock::given(method("GET"))
-        .and(path("/v2/ep1/status/rp-0"))
+        .and(path("/proxy/pod1/status/rp-0"))
         .respond_with(seq(vec![
             json!({"status": "IN_QUEUE"}),
             json!({"status": "IN_PROGRESS", "output": {"phase": "downloading", "file": "ae.safetensors", "bytes": 50, "totalBytes": 100}}),
@@ -519,14 +571,14 @@ async fn download_task_refreshes_status() {
         .map(|f| json!({"folder": f.folder, "filename": f.filename, "sizeBytes": f.size_bytes}))
         .collect();
     Mock::given(method("GET"))
-        .and(path("/v2/ep1/status/rp-1"))
+        .and(path("/proxy/pod1/status/rp-1"))
         .respond_with(seq(vec![
             json!({"status": "COMPLETED", "output": {"files": files,
             "volume": {"totalBytes": 100, "freeBytes": 40}, "comfyuiVersion": "0.39.0"}}),
         ]))
         .mount(&server)
         .await;
-    let h = harness(&server);
+    let h = harness(&server).await;
     let t = tasks::download_model(&h.core, "chroma").unwrap();
     assert!(
         tasks::download_model(&h.core, "chroma").is_err(),
@@ -566,7 +618,7 @@ async fn download_task_refreshes_status() {
     assert_eq!(chroma["task"], Value::Null);
     assert_eq!(chroma["files"][2]["sharedWith"], json!(["zimage"]));
     assert_eq!(h.sink.statuses.lock().unwrap().len(), 1);
-    let run: Value = server.received_requests().await.unwrap()[0]
+    let run: Value = worker_requests(&server).await[0]
         .body_json()
         .unwrap();
     assert_eq!(run["input"]["action"], "download");
@@ -582,7 +634,7 @@ async fn download_task_refreshes_status() {
 async fn generate_passes_stage_progress_through() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/v2/ep1/run"))
+        .and(path("/proxy/pod1/run"))
         .respond_with(RunIds(AtomicUsize::new(0)))
         .mount(&server)
         .await;
@@ -594,14 +646,14 @@ async fn generate_passes_stage_progress_through() {
         "stageTimes": {"loading_text_encoder": 0, "encoding_prompt": 1800}
     });
     Mock::given(method("GET"))
-        .and(path("/v2/ep1/status/rp-0"))
+        .and(path("/proxy/pod1/status/rp-0"))
         .respond_with(seq(vec![
             json!({"id": "rp-0", "status": "IN_PROGRESS", "output": progress.clone()}),
             completed(42),
         ]))
         .mount(&server)
         .await;
-    let h = harness(&server);
+    let h = harness(&server).await;
     jobs::generate(&h.core, req(1, Some(42))).unwrap();
     let job = wait_job(&h.sink).await;
     assert_eq!(job.status, JobState::Completed);
@@ -617,4 +669,61 @@ async fn generate_passes_stage_progress_through() {
     // The UI sees the worker payload verbatim (camelCase, same keys).
     let sent = serde_json::to_value(running.progress.unwrap()).unwrap();
     assert_eq!(sent, progress);
+}
+
+#[tokio::test]
+async fn a_queued_delete_no_longer_keeps_a_shared_file() {
+    use app_lib::db::{StatusSnapshot, VolumeFile};
+    let server = MockServer::start().await;
+    let h = harness(&server).await;
+    let reg = Registry::embedded();
+    let chroma = reg.model("chroma").unwrap().clone();
+    let zimage = reg.model("zimage").unwrap().clone();
+    let files: Vec<VolumeFile> = chroma
+        .files
+        .iter()
+        .chain(zimage.files.iter())
+        .map(|f| VolumeFile { folder: f.folder.clone(), filename: f.filename.clone(), size_bytes: f.size_bytes })
+        .collect();
+    h.core
+        .db
+        .lock()
+        .unwrap()
+        .save_status(&StatusSnapshot { files, ..Default::default() }, "2026-10-09T00:00:00Z")
+        .unwrap();
+    let shared: Vec<String> = zimage
+        .files
+        .iter()
+        .filter(|f| chroma.files.iter().any(|c| c.filename == f.filename))
+        .map(|f| f.filename.clone())
+        .collect();
+    assert!(!shared.is_empty(), "the fixture needs a shared file");
+    // Chroma installed: deleting Z-Image keeps the shared file.
+    let p = tasks::delete_preview(&h.core, "zimage").unwrap();
+    assert!(shared.iter().all(|s| !p.delete_files.contains(s)), "{p:?}");
+    // A queued delete of Chroma (its own files) makes it count as gone.
+    let task = Task {
+        task_id: "del-chroma".into(),
+        kind: tasks::TaskKind::Delete,
+        target: tasks::TaskTarget { kind: tasks::TargetType::Model, id: "chroma".into() },
+        status: TaskStatus::Queued,
+        bytes: 0,
+        total_bytes: 0,
+        file: None,
+        error: None,
+        gpu_release: None,
+    };
+    let chroma_own: Vec<(String, String)> = chroma
+        .files
+        .iter()
+        .filter(|f| !shared.contains(&f.filename))
+        .map(|f| (f.folder.clone(), f.filename.clone()))
+        .collect();
+    h.core.tasks.lock().unwrap().insert(
+        "del-chroma".into(),
+        tasks::TaskEntry { task, cancel: false, profile: app_lib::pod::Profile::Image, deletes: chroma_own },
+    );
+    let p = tasks::delete_preview(&h.core, "zimage").unwrap();
+    assert!(shared.iter().all(|s| p.delete_files.contains(s)), "{p:?}");
+    assert!(p.kept_files.is_empty(), "{p:?}");
 }

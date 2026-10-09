@@ -212,6 +212,22 @@ pub enum StopReason {
     Idle,
     /// The pod vanished (its own idle watchdog, or the RunPod console).
     External,
+    /// The only job it was started for was cancelled before it ran (UX-014).
+    Cancelled,
+    /// It was started only for a Refresh / download / delete, which finished
+    /// with no generation started meanwhile (UX-047).
+    Finished,
+}
+
+/// Why a pod start began: the user's explicit Start, a generation job, or a
+/// Models-screen task (Refresh / download / delete). Only pods started for
+/// work are stopped automatically when that work goes away; a pod the user
+/// started (or one adopted at launch) is left to the idle auto-stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartOrigin {
+    User,
+    Job,
+    Task,
 }
 
 /// `GpuState` from the spec, plus additive `leftRunning` and `stopReason`.
@@ -280,6 +296,10 @@ struct Inner {
     /// Until it has, the monitor retries it so a pod left running by a
     /// previous session is never forgotten after a failed first lookup.
     adopted: bool,
+    /// Why the current pod was started (None: stopped, or adopted at launch).
+    origin: Option<StartOrigin>,
+    /// A generation job has submitted work to the current pod.
+    served: bool,
 }
 
 impl Inner {
@@ -319,6 +339,8 @@ impl Gpu {
                     error_since: None,
                     urgent: false,
                     adopted: false,
+                    origin: None,
+                    served: false,
                 }),
                 tx,
             }
@@ -897,11 +919,20 @@ pub fn start(core: &Arc<Core>) -> Result<GpuState, String> {
 
 /// `start` for profile `p`.
 pub fn start_for(core: &Arc<Core>, p: Profile) -> Result<GpuState, String> {
+    start_as(core, p, StartOrigin::User)
+}
+
+/// `start_for`, recording why the pod starts. An explicit user Start on a pod
+/// already starting for work takes it over (it is then never auto-stopped).
+pub fn start_as(core: &Arc<Core>, p: Profile, origin: StartOrigin) -> Result<GpuState, String> {
     rest(core)?; // fail fast without an API key
     let (epoch, prev_pod) = {
         let mut g = inner(core, p);
         match g.state.status {
             GpuStatus::Running | GpuStatus::Starting => {
+                if origin == StartOrigin::User {
+                    g.origin = Some(StartOrigin::User);
+                }
                 drop(g);
                 return Ok(state_for(core, p));
             }
@@ -911,6 +942,8 @@ pub fn start_for(core: &Arc<Core>, p: Profile) -> Result<GpuState, String> {
             GpuStatus::Stopped | GpuStatus::Error => {}
         }
         g.epoch += 1;
+        g.origin = Some(origin);
+        g.served = false;
         let prev = g.state.pod_id.clone();
         (g.epoch, prev)
     };
@@ -1321,28 +1354,48 @@ pub async fn stop(core: &Arc<Core>, reason: StopReason) -> Result<GpuState, Stri
 /// On any failure the GPU shows Error and keeps a remaining pod id. The
 /// other profile's pod is never touched.
 pub async fn stop_for(core: &Arc<Core>, p: Profile, reason: StopReason) -> Result<GpuState, String> {
-    // Bump the epoch and show Stopping atomically, so a start that slips in
-    // between can never see the old status with the new epoch.
+    let Some((tracked, epoch)) = begin_stop(core, p, |_| true) else {
+        return Ok(state_for(core, p));
+    };
+    finish_stop(core, p, reason, tracked, epoch).await
+}
+
+/// Bumps the epoch and shows Stopping atomically (so a start that slips in
+/// between can never see the old status with the new epoch), when the pod
+/// isn't already stopped/stopping and `allow` agrees — checked under the same
+/// lock. Returns the tracked pod id (`None` inside: none tracked) and the
+/// stop's epoch, or `None` when nothing was begun.
+fn begin_stop(core: &Core, p: Profile, allow: impl FnOnce(&Inner) -> bool) -> Option<(Option<String>, u64)> {
     let now = (core.cfg.clock)();
     let (tracked, stopping) = {
         let mut g = inner(core, p);
-        match g.state.status {
-            GpuStatus::Stopped | GpuStatus::Stopping => {
-                drop(g);
-                return Ok(state_for(core, p));
-            }
-            _ => {}
+        if matches!(g.state.status, GpuStatus::Stopped | GpuStatus::Stopping) || !allow(&g) {
+            return None;
         }
         g.epoch += 1;
+        g.origin = None;
+        g.served = false;
         let before = g.state.status;
         g.state.status = GpuStatus::Stopping;
         g.state.phase = None;
         g.state.error = None;
         g.state.idle_minutes = core.settings.idle_minutes();
         g.track_error(before, now);
-        (g.state.pod_id.clone(), g.state.clone())
+        ((g.state.pod_id.clone(), g.epoch), g.state.clone())
     };
     emit(core, p, &stopping);
+    Some(tracked)
+}
+
+/// The rest of `stop_for` after `begin_stop`: terminates (confirmed) every
+/// pod of the profile; Error with a remaining id on any failure.
+async fn finish_stop(
+    core: &Arc<Core>,
+    p: Profile,
+    reason: StopReason,
+    tracked: Option<String>,
+    epoch: u64,
+) -> Result<GpuState, String> {
     let mut ids: Vec<String> = tracked.into_iter().chain(stored_pod_id(core, p)).collect();
     let mut problems: Vec<String> = Vec::new();
     match rest(core) {
@@ -1393,13 +1446,30 @@ pub async fn stop_for(core: &Arc<Core>, p: Profile, reason: StopReason) -> Resul
         mark_urgent(core, p);
         return Err(msg);
     }
-    persist_pod_id(core, p, None);
-    set_state(core, p, None, |s| {
-        *s = GpuState {
-            stop_reason: Some(reason),
-            ..GpuState::stopped_for(p, 0)
-        };
-    });
+    // Only while this stop is still current: a start begun meanwhile (e.g.
+    // after a stale start loop flipped the slot to Error) owns the slot now,
+    // and showing Stopped over it would hide a pod being created.
+    let stopped = {
+        let mut g = inner(core, p);
+        if g.epoch == epoch || g.state.status == GpuStatus::Stopping {
+            let before = g.state.status;
+            g.state = GpuState {
+                stop_reason: Some(reason),
+                ..GpuState::stopped_for(p, core.settings.idle_minutes())
+            };
+            g.track_error(before, (core.cfg.clock)());
+            Some(g.state.clone())
+        } else {
+            None
+        }
+    };
+    let current = stopped.is_some();
+    if let Some(s) = &stopped {
+        emit(core, p, s);
+    }
+    if current {
+        persist_pod_id(core, p, None);
+    }
     Ok(state_for(core, p))
 }
 
@@ -1460,6 +1530,8 @@ pub async fn adopt_for(core: &Arc<Core>, p: Profile) -> Result<GpuState, String>
     let epoch = {
         let mut g = inner(core, p);
         g.epoch += 1;
+        g.origin = None;
+        g.served = false;
         g.epoch
     };
     let status = pod_str(&pod, "status").unwrap_or("");
@@ -1521,9 +1593,20 @@ pub async fn ensure_running_for(
     on_phase: &mut (dyn FnMut(&str) + Send),
     cancelled: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<String, String> {
+    ensure_running_as(core, p, StartOrigin::Job, on_phase, cancelled).await
+}
+
+/// `ensure_running_for`, recording `origin` when it has to start the pod.
+pub async fn ensure_running_as(
+    core: &Arc<Core>,
+    p: Profile,
+    origin: StartOrigin,
+    on_phase: &mut (dyn FnMut(&str) + Send),
+    cancelled: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<String, String> {
     let mut rx = subscribe_for(core, p);
     if state_for(core, p).status != GpuStatus::Running {
-        start_for(core, p)?;
+        start_as(core, p, origin)?;
     }
     let mut last_phase: Option<String> = None;
     loop {
@@ -1565,6 +1648,124 @@ pub fn is_busy(core: &Core, p: Profile) -> bool {
         .values()
         .any(|e| e.job.kind.profile() == p)
         || core.tasks.lock().unwrap().values().any(|e| e.profile == p)
+}
+
+/// A generation job submitted work to profile `p`'s current pod: from now on
+/// the pod is not stopped just because the work it was started for went away.
+pub fn mark_served(core: &Core, p: Profile) {
+    inner(core, p).served = true;
+}
+
+/// An automatic stop begun by [`begin_release`]; finish it with
+/// [`complete_release`].
+#[derive(Debug)]
+pub struct Release {
+    pub profile: Profile,
+    pub reason: StopReason,
+    /// Approximate cost of the pod's run so far (USD), when it was known.
+    pub cost_usd: Option<f64>,
+    tracked: Option<String>,
+    epoch: u64,
+}
+
+/// Where an automatic GPU stop stands, as shown on the job/task that caused it.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReleaseState {
+    /// The stop has begun (the GPU shows Stopping).
+    Stopping,
+    /// RunPod confirmed the pod is gone.
+    Stopped,
+    /// The pod couldn't be confirmed gone: the GPU shows Error and Stop retries.
+    Failed,
+}
+
+/// Additive `gpuRelease` on a job or task: the app stopped that profile's GPU
+/// because this job/task was the only thing it was started for.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuRelease {
+    pub profile: Profile,
+    pub state: ReleaseState,
+    /// Approximate cost of the pod's run (USD), when its start time was known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl Release {
+    pub fn note(&self, state: ReleaseState, error: Option<String>) -> GpuRelease {
+        GpuRelease {
+            profile: self.profile,
+            state,
+            cost_usd: self.cost_usd,
+            error,
+        }
+    }
+}
+
+/// Approximate cost so far of a pod in state `s` at `now`.
+pub fn run_cost(s: &GpuState, now: DateTime<Utc>) -> Option<f64> {
+    let started = DateTime::parse_from_rfc3339(s.started_at.as_deref()?).ok()?;
+    let hours = (now - started.with_timezone(&Utc)).num_milliseconds().max(0) as f64 / 3_600_000.0;
+    Some(hours * s.cost_per_hr.unwrap_or(FALLBACK_COST_PER_HR))
+}
+
+/// Stops profile `p`'s pod when the work it was started for is gone (UX-014,
+/// UX-047): the pod is starting or running, it was started for a job or a
+/// task (never by the user's Start, never an adopted pod), no generation job
+/// has run on it, and no job or task uses the profile now. The decision and
+/// the switch to Stopping happen under one lock, so a start can't slip in.
+/// Returns the begun stop (the GPU shows Stopping); `None` leaves it alone.
+pub fn begin_release(core: &Core, p: Profile, reason: StopReason) -> Option<Release> {
+    let cost_usd = run_cost(&state_for(core, p), (core.cfg.clock)());
+    let (tracked, epoch) = begin_stop(core, p, |g| {
+        matches!(g.state.status, GpuStatus::Starting | GpuStatus::Running)
+            && matches!(g.origin, Some(StartOrigin::Job | StartOrigin::Task))
+            && !g.served
+            && !is_busy(core, p)
+    })?;
+    eprintln!(
+        "[pod:{}] stopping: nothing uses the pod it was started for ({reason:?})",
+        p.as_str()
+    );
+    Some(Release {
+        profile: p,
+        reason,
+        cost_usd,
+        tracked,
+        epoch,
+    })
+}
+
+/// Finishes a [`begin_release`] stop through the checked terminate path (the
+/// same as Stop: Error with the pod id kept when a pod can't be confirmed gone).
+pub async fn complete_release(core: &Arc<Core>, r: Release) -> Result<GpuState, String> {
+    finish_stop(core, r.profile, r.reason, r.tracked, r.epoch).await
+}
+
+/// `complete_release`, returning the note to show on the job/task.
+pub async fn finish_release_note(core: &Arc<Core>, r: Release) -> GpuRelease {
+    let ok = r.note(ReleaseState::Stopped, None);
+    let failed = r.note(ReleaseState::Failed, None);
+    match complete_release(core, r).await {
+        Ok(_) => ok,
+        Err(e) => GpuRelease {
+            error: Some(e),
+            ..failed
+        },
+    }
+}
+
+/// `begin_release` + `complete_release`.
+pub async fn release_if_unneeded(
+    core: &Arc<Core>,
+    p: Profile,
+    reason: StopReason,
+) -> Option<Result<GpuState, String>> {
+    let r = begin_release(core, p, reason)?;
+    Some(complete_release(core, r).await)
 }
 
 /// True when quitting now could leave a billed pod behind (the UI asks),

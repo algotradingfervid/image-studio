@@ -88,6 +88,8 @@ pub const VAULT_PATH_PREFIX: &str = "vault://localhost/";
 pub const ERR_LOCKED: &str = "VAULT_LOCKED";
 pub const ERR_WRONG_PASSWORD: &str = "WRONG_PASSWORD";
 pub const ERR_WEAK_PASSWORD: &str = "WEAK_PASSWORD";
+/// Changing the password to the one it already is (UX-072).
+pub const ERR_SAME_PASSWORD: &str = "SAME_PASSWORD";
 pub const ERR_EXISTS: &str = "VAULT_EXISTS";
 pub const ERR_NO_VAULT: &str = "NO_VAULT";
 
@@ -852,6 +854,11 @@ impl Vault {
         params: KdfParams,
     ) -> Result<(), String> {
         check_password(new)?;
+        if current == new {
+            return Err(format!(
+                "{ERR_SAME_PASSWORD}: Choose a password different from the current one"
+            ));
+        }
         params.validate()?;
         let _gate = self.unlock_gate.lock().unwrap();
         let (secret, public) = self.open_private_key(current)?;

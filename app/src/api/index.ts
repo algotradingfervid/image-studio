@@ -22,6 +22,7 @@ import type {
   ImagePage,
   Job,
   ImportedReference,
+  KeyTestReport,
   Lora,
   ModelView,
   ResolvedLora,
@@ -66,6 +67,13 @@ export const getSettings = () => call<Settings>("get_settings");
 /** Only send fields the user changed — an empty string CLEARS that field. */
 export const saveSettings = (input: SaveSettingsInput) => callObj<Settings>("save_settings", input);
 export const testConnection = () => call<ConnectionTest>("test_connection");
+/**
+ * Checks keys without saving them: a given (typed) key, or the saved one when not given.
+ * RunPod via the pod list (never starts a pod), Civitai via its account endpoint.
+ */
+/** Shows the settings file in Finder (creating it first); resolves with its path. */
+export const revealSettingsFile = () => call<string>("reveal_settings_file");
+export const testApiKeys = (input: { apiKey?: string; civitaiKey?: string }) => callObj<KeyTestReport>("test_api_keys", input);
 export const listModels = () => call<ModelView[]>("list_models");
 /** Asks the worker for fresh status — auto-starts the GPU pod when stopped (can take minutes). */
 export const refreshStatus = (profile: GpuProfile = "image") => call<StatusSnapshot>("refresh_status", { profile });

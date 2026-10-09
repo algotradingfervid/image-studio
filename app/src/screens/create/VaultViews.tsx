@@ -3,11 +3,132 @@
 
 import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { errorCode, errorMessage, VAULT_PASSWORD_MIN, type Destination, type MigrationProgress } from "../../api";
-import { ProgressBar } from "../../components/Dialog";
+import { Dialog, ProgressBar } from "../../components/Dialog";
 import { Icon } from "../../components/Icon";
 import { radioKeys } from "../../components/radio";
 import { pct } from "../../lib/format";
 import { useVault } from "../../state/vault";
+import { countGallery, type GalleryTotals } from "./Gallery";
+
+/** Passwords too common to protect anything (UX-075); checked case-insensitively. */
+const COMMON_PASSWORDS = new Set([
+  "password", "password1", "password12", "password123", "passw0rd", "12345678", "123456789", "1234567890", "87654321",
+  "11111111", "00000000", "qwertyui", "qwerty12", "qwerty123", "iloveyou", "abcdefgh", "abc12345", "letmein1",
+  "sunshine", "princess", "football", "baseball", "superman", "trustno1", "welcome1", "admin123", "changeme",
+  "imagestudio", "image studio", "image-studio", "vaultvault", "secret123",
+]);
+
+type Strength = { level: 0 | 1 | 2 | 3; label: string };
+/** A rough strength estimate: length and character variety, common passwords blocked. */
+function strengthOf(pw: string): Strength {
+  if (!pw) return { level: 0, label: "" };
+  if (COMMON_PASSWORDS.has(pw.toLowerCase())) return { level: 0, label: "This password is too common." };
+  const classes = [/[a-z]/, /[A-Z]/, /\d/, /[^A-Za-z0-9]/].filter((r) => r.test(pw)).length;
+  const unique = new Set(pw).size;
+  let score = 0;
+  if (pw.length >= 12) score++;
+  if (pw.length >= 16) score++;
+  if (classes >= 3) score++;
+  if (unique < 5) score = 0;
+  if (score === 0) return { level: 1, label: "Weak — easy to guess. Use 3–4 random words." };
+  if (score === 1) return { level: 2, label: "OK — longer is stronger." };
+  return { level: 3, label: "Strong." };
+}
+
+/** The password form shared by the Vault tab's lock screen and the unlock dialog. */
+function UnlockForm({ autoFocus = true, onUnlocked }: { autoFocus?: boolean; onUnlocked?: () => void }) {
+  const vault = useVault();
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const id = useId();
+  const reason = vault.lockReason;
+  const mins = vault.status?.autoLockMinutes ?? 10;
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!password || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await vault.unlock(password);
+      setPassword("");
+      onUnlocked?.();
+    } catch (err) {
+      const code = errorCode(err);
+      setError(
+        code === "WRONG_PASSWORD"
+          ? "Wrong password. Try again."
+          : code === "NO_VAULT"
+            ? "There is no vault yet."
+            : `Couldn't unlock: ${errorMessage(err)}`,
+      );
+      requestAnimationFrame(() => inputRef.current?.select());
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      {reason === "idle" && (
+        <p className="vault-gate__reason" role="status">
+          <Icon name="info" size={14} /> Locked after {mins} minute{mins === 1 ? "" : "s"} without activity. Change this in Settings → Vault.
+        </p>
+      )}
+      <form className="vault-gate__form" onSubmit={submit} aria-label="Unlock the vault">
+        <PasswordField
+          id={`${id}-pw`}
+          label="Password"
+          value={password}
+          onChange={(v) => {
+            setPassword(v);
+            if (error) setError(null);
+          }}
+          disabled={busy}
+          invalid={!!error}
+          describedBy={`${id}-status`}
+          autoFocus={autoFocus}
+          inputRef={inputRef}
+        />
+        <button type="submit" className="btn btn--primary vault-gate__submit" disabled={!password || busy}>
+          {busy ? <Icon name="refresh" className="spin" /> : <Icon name="unlock" />}
+          {busy ? "Unlocking…" : "Unlock"}
+        </button>
+      </form>
+      <p id={`${id}-status`} className={`vault-gate__status ${error ? "is-error" : ""}`} role={error ? "alert" : "status"} aria-live="polite">
+        {error ? (
+          <>
+            <Icon name="alert" size={14} /> {error}
+          </>
+        ) : busy ? (
+          "Deriving the key — this takes about a second."
+        ) : (
+          `Auto-locks after ${mins} minute${mins === 1 ? "" : "s"} without activity (Settings → Vault).`
+        )}
+      </p>
+    </>
+  );
+}
+
+/** Unlock from anywhere (the "saved to the vault · Unlock" notice when the Vault tab isn't on screen). */
+export function VaultUnlockDialog({ open, onClose, onUnlocked }: { open: boolean; onClose: () => void; onUnlocked?: () => void }) {
+  return (
+    <Dialog open={open} onClose={onClose} title="Unlock the vault" className="vault-unlock-dialog">
+      {open && (
+        <div className="vault-unlock-dialog__body">
+          <UnlockForm
+            onUnlocked={() => {
+              onClose();
+              onUnlocked?.();
+            }}
+          />
+        </div>
+      )}
+    </Dialog>
+  );
+}
 
 /** Password input with a show/hide toggle (same look as the Settings key fields). */
 export function PasswordField({
@@ -21,6 +142,7 @@ export function PasswordField({
   autoFocus,
   autoComplete = "current-password",
   inputRef,
+  onBlur,
 }: {
   id: string;
   label: string;
@@ -32,6 +154,7 @@ export function PasswordField({
   autoFocus?: boolean;
   autoComplete?: string;
   inputRef?: React.Ref<HTMLInputElement>;
+  onBlur?: () => void;
 }) {
   const [show, setShow] = useState(false);
   return (
@@ -54,6 +177,7 @@ export function PasswordField({
           aria-invalid={invalid || undefined}
           aria-describedby={describedBy}
           onChange={(e) => onChange(e.target.value)}
+          onBlur={onBlur}
         />
         <button
           type="button"
@@ -72,36 +196,6 @@ export function PasswordField({
 
 /** The Vault tab while locked: password → Unlock. */
 export function VaultLockScreen() {
-  const vault = useVault();
-  const [password, setPassword] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const id = useId();
-
-  const submit = async (e: FormEvent) => {
-    e.preventDefault();
-    if (!password || busy) return;
-    setBusy(true);
-    setError(null);
-    try {
-      await vault.unlock(password);
-      setPassword("");
-    } catch (err) {
-      const code = errorCode(err);
-      setError(
-        code === "WRONG_PASSWORD"
-          ? "Wrong password. Try again."
-          : code === "NO_VAULT"
-            ? "There is no vault yet."
-            : `Couldn't unlock: ${errorMessage(err)}`,
-      );
-      requestAnimationFrame(() => inputRef.current?.select());
-    } finally {
-      setBusy(false);
-    }
-  };
-
   return (
     <div className="vault-gate">
       <div className="vault-gate__art" aria-hidden>
@@ -109,37 +203,7 @@ export function VaultLockScreen() {
       </div>
       <h3>Vault is locked</h3>
       <p className="vault-gate__lede">Vault items stay hidden everywhere in the app until you unlock it with your password.</p>
-      <form className="vault-gate__form" onSubmit={submit} aria-label="Unlock the vault">
-        <PasswordField
-          id={`${id}-pw`}
-          label="Password"
-          value={password}
-          onChange={(v) => {
-            setPassword(v);
-            if (error) setError(null);
-          }}
-          disabled={busy}
-          invalid={!!error}
-          describedBy={`${id}-status`}
-          autoFocus
-          inputRef={inputRef}
-        />
-        <button type="submit" className="btn btn--primary vault-gate__submit" disabled={!password || busy}>
-          {busy ? <Icon name="refresh" className="spin" /> : <Icon name="unlock" />}
-          {busy ? "Unlocking…" : "Unlock"}
-        </button>
-      </form>
-      <p id={`${id}-status`} className={`vault-gate__status ${error ? "is-error" : ""}`} role={error ? "alert" : "status"} aria-live="polite">
-        {error ? (
-          <>
-            <Icon name="alert" size={14} /> {error}
-          </>
-        ) : busy ? (
-          "Deriving the key — this takes about a second."
-        ) : (
-          "Auto-locks after a period without activity (Settings → Vault)."
-        )}
-      </p>
+      <UnlockForm />
     </div>
   );
 }
@@ -152,11 +216,30 @@ export function VaultCreate({ generalCount, generalMore }: { generalCount: numbe
   const [ack, setAck] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** Fields left at least once: errors show on blur, not on every keystroke (UX-061). */
+  const [touched, setTouched] = useState({ pw: false, confirm: false });
   const id = useId();
 
+  // Real totals instead of the loaded page's "24+" (UX-019).
+  const [totals, setTotals] = useState<GalleryTotals | null>(null);
+  useEffect(() => {
+    let alive = true;
+    countGallery()
+      .then((t) => alive && setTotals(t))
+      .catch(() => {
+        /* falls back to the loaded count */
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const strength = strengthOf(password);
+  const common = password.length > 0 && strength.level === 0;
   const short = password.length > 0 && password.length < VAULT_PASSWORD_MIN;
-  const mismatch = confirm.length > 0 && confirm !== password;
-  const valid = password.length >= VAULT_PASSWORD_MIN && confirm === password && ack;
+  const showShort = short && touched.pw;
+  const mismatch = confirm.length > 0 && confirm !== password && (touched.confirm || confirm.length >= password.length);
+  const valid = password.length >= VAULT_PASSWORD_MIN && !common && confirm === password && ack;
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -181,7 +264,10 @@ export function VaultCreate({ generalCount, generalMore }: { generalCount: numbe
     }
   };
 
-  const what = generalCount > 0 ? `All ${generalCount}${generalMore ? "+" : ""} items in your gallery` : "Everything already in your gallery";
+  const n = totals?.items ?? generalCount;
+  const kinds = totals && totals.items ? ` (${totals.images} image${totals.images === 1 ? "" : "s"}, ${totals.videos} video${totals.videos === 1 ? "" : "s"})` : "";
+  const what =
+    n > 0 ? `All ${n}${!totals && generalMore ? "+" : ""} item${n === 1 ? "" : "s"}${kinds} in your gallery` : totals ? "Anything you create before then" : "Everything already in your gallery";
 
   return (
     <form className="vault-create card" onSubmit={submit} aria-labelledby={`${id}-title`}>
@@ -200,14 +286,25 @@ export function VaultCreate({ generalCount, generalMore }: { generalCount: numbe
             value={password}
             onChange={setPassword}
             disabled={busy}
-            invalid={short}
-            describedBy={`${id}-pw-help`}
+            invalid={showShort || common}
+            describedBy={`${id}-pw-help ${id}-pw-strength`}
             autoComplete="new-password"
             autoFocus
+            onBlur={() => setTouched((t) => ({ ...t, pw: true }))}
           />
-          <p id={`${id}-pw-help`} className={`hint ${short ? "hint--error" : ""}`}>
+          <p id={`${id}-pw-help`} className={`hint ${showShort ? "hint--error" : ""}`}>
             At least {VAULT_PASSWORD_MIN} characters{short ? ` — ${VAULT_PASSWORD_MIN - password.length} more` : ""}.
           </p>
+          {password && !short && (
+            <p id={`${id}-pw-strength`} className={`hint vault-strength vault-strength--${strength.level} ${common ? "hint--error" : ""}`} aria-live="polite">
+              <span className="vault-strength__bar" aria-hidden>
+                <span />
+                <span />
+                <span />
+              </span>
+              {strength.label}
+            </p>
+          )}
         </div>
         <div>
           <PasswordField
@@ -219,6 +316,7 @@ export function VaultCreate({ generalCount, generalMore }: { generalCount: numbe
             invalid={mismatch}
             describedBy={`${id}-confirm-help`}
             autoComplete="new-password"
+            onBlur={() => setTouched((t) => ({ ...t, confirm: true }))}
           />
           <p id={`${id}-confirm-help`} className={`hint ${mismatch ? "hint--error" : ""}`}>
             {mismatch ? "The passwords don't match." : confirm && confirm === password ? "Matches." : "Type it again."}
@@ -246,7 +344,7 @@ export function VaultCreate({ generalCount, generalMore }: { generalCount: numbe
       <div className="btn-row btn-row--end">
         <button type="submit" className="btn btn--primary" disabled={!valid || busy}>
           {busy ? <Icon name="refresh" className="spin" /> : <Icon name="lock" />}
-          {busy ? "Creating the vault…" : "Create vault & move my gallery"}
+          {busy ? "Creating the vault…" : n > 0 && totals ? `Create vault & move ${n} item${n === 1 ? "" : "s"}` : "Create vault & move my gallery"}
         </button>
       </div>
     </form>
@@ -288,7 +386,25 @@ export function MigrationView({ progress, onDone }: { progress: MigrationProgres
           : failed
             ? "The move into the vault stopped"
             : "Moving your gallery into the vault…"}
+        {finished && (
+          <button type="button" className="icon-btn icon-btn--sm vault-migration__close" aria-label="Dismiss" onClick={onDone}>
+            <Icon name="x" />
+          </button>
+        )}
       </h3>
+      {done && (
+        <p className="vault-migration__summary">
+          {progress.done} item{progress.done === 1 ? "" : "s"} ({c.images} image{c.images === 1 ? "" : "s"}, {c.videos} video{c.videos === 1 ? "" : "s"})
+          {c.posters + c.startImages + c.references > 0 &&
+            ` · plus ${[
+              c.posters && `${c.posters} poster${c.posters === 1 ? "" : "s"}`,
+              c.startImages && `${c.startImages} start image${c.startImages === 1 ? "" : "s"}`,
+              c.references && `${c.references} reference${c.references === 1 ? "" : "s"}`,
+            ]
+              .filter(Boolean)
+              .join(", ")}`}
+        </p>
+      )}
       {!finished && (
         <div className="vault-migration__progress">
           <ProgressBar label="Migration progress" value={progress.total ? pct(progress.done, progress.total) : 0} indeterminate={!progress.total} />
@@ -323,7 +439,7 @@ export function MigrationView({ progress, onDone }: { progress: MigrationProgres
       {finished && (
         <div className="btn-row btn-row--end">
           <button type="button" className="btn btn--primary" onClick={onDone} ref={doneRef}>
-            Show the vault
+            Done
           </button>
         </div>
       )}
@@ -342,7 +458,7 @@ export function SaveToSwitch({
   onChange: (d: Destination) => void;
   /** Set when a vault start image / reference is in use: the output must stay in the vault. */
   forcedReason?: string | null;
-  /** No vault yet: "Create a vault first" opens Gallery → Vault. */
+  /** No vault yet: "Set up a vault…" opens Gallery → Vault. */
   onCreateVault: () => void;
 }) {
   const vault = useVault();
@@ -354,8 +470,8 @@ export function SaveToSwitch({
           <span className="section__title">Save to</span>
           <span className="save-to__only">
             General
-            <button type="button" className="link-btn" onClick={onCreateVault}>
-              <Icon name="lock" size={12} /> Create a vault first
+            <button type="button" className="link-btn save-to__setup" onClick={onCreateVault}>
+              <Icon name="lock" size={12} /> Set up a vault…
             </button>
           </span>
         </div>
@@ -368,8 +484,9 @@ export function SaveToSwitch({
     : value === "vault"
       ? vault.unlocked
         ? "Encrypted the moment they arrive."
-        : "Vault is locked — outputs are sealed on arrival and appear after you unlock."
+        : "Locked — sealed on arrival;"
       : null;
+  const unlockLink = !forcedReason && value === "vault" && !vault.unlocked;
   return (
     <div className="save-to">
       <div className="save-to__row">
@@ -398,8 +515,9 @@ export function SaveToSwitch({
                 className={on ? "is-selected" : ""}
                 onClick={() => onChange(d)}
               >
-                {d === "vault" && <Icon name={vault.unlocked ? "unlock" : "lock"} size={13} />}
+                {d === "vault" && <Icon name={vault.unlocked ? "lockOpen" : "lock"} size={13} />}
                 {d === "general" ? "General" : "Vault"}
+                {d === "vault" && vault.unlocked && <span className="save-to__state"> · unlocked</span>}
               </button>
             );
           })}
@@ -408,6 +526,15 @@ export function SaveToSwitch({
       {note && (
         <p id={`${id}-note`} className="hint save-to__note">
           {note}
+          {unlockLink && (
+            <>
+              {" "}
+              <button type="button" className="link-btn" onClick={vault.requestUnlock}>
+                unlock
+              </button>{" "}
+              to view.
+            </>
+          )}
         </p>
       )}
     </div>

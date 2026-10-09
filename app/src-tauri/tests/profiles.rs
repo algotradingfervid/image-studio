@@ -512,6 +512,7 @@ async fn idle_auto_stop_and_liveness_are_per_profile() {
         progress: None,
         images: vec![],
         error: None,
+        gpu_release: None,
     };
     h.core.jobs.lock().unwrap().insert("j".into(), JobEntry { job, cancel: false });
     *h.now.lock().unwrap() += chrono::Duration::minutes(31);

@@ -3,11 +3,17 @@ import { fileSrc, isJobActive, type Job, type JobProgress } from "../../api";
 import { ProgressBar } from "../../components/Dialog";
 import { Icon } from "../../components/Icon";
 import { formatDuration, pct } from "../../lib/format";
+import { useGpu } from "../../state/gpu";
+import { useVault } from "../../state/vault";
 
 export interface JobView extends Job {
   modelName: string;
   prompt: string;
   startedAt: number;
+  /** Video jobs (UX-011): shown as "5 s · 1280×720 · audio" when present. */
+  durationS?: number | null;
+  resolution?: string | null;
+  audio?: boolean | null;
 }
 
 /** v1 phases, used when the worker doesn't report stages. */
@@ -69,9 +75,15 @@ function secs(ms: number): string {
   return v < 60_000 ? `${(v / 1000).toFixed(1)} s` : formatDuration(v);
 }
 
-function etaText(seconds: number): string {
+function etaText(seconds: number, all = false): string {
   const s = Math.max(1, Math.round(seconds));
-  return s < 60 ? `~${s} s left` : `~${Math.floor(s / 60)} min ${s % 60} s left`;
+  const t = s < 60 ? `~${s} s left` : `~${Math.floor(s / 60)} min ${s % 60} s left`;
+  return all ? `${t} for all` : t;
+}
+
+/** "14:03" for the Done title. */
+function hhmm(t: number): string {
+  return new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 export function JobCard({
@@ -82,6 +94,8 @@ export function JobCard({
   onCancel,
   onDismiss,
   onOpenImage,
+  index,
+  count,
 }: {
   job: JobView;
   /** A vault job while the vault is locked: no prompt, no thumbnails (spec v6). */
@@ -91,10 +105,43 @@ export function JobCard({
   /** Video jobs: the cost note while the video GPU is off/starting. */
   gpuNote?: string | null;
   onCancel: () => void;
-  onDismiss: () => void;
+  /** Shows a × on finished / cancelled / failed cards. */
+  onDismiss?: () => void;
   onOpenImage: (id: string) => void;
+  /** 0-based position among the cards shown (UX-011); numbered only when `count` > 1. */
+  index?: number;
+  count?: number;
 }) {
+  const video = job.kind === "video";
   const active = isJobActive(job);
+  const gpu = useGpu();
+  const vault = useVault();
+  const profile = video ? "video" : "image";
+  const gpuStatus = gpu.profiles[profile]?.state?.status ?? null;
+  // UX-014: Cancel while the job's GPU was starting → the backend stops that GPU; say so here.
+  // Remember the job's and the GPU's state at the moment it turned "cancelled".
+  const lastActive = useRef<{ status: string; gpu: string | null }>({ status: job.status, gpu: gpuStatus });
+  const atCancel = useRef<{ status: string; gpu: string | null } | null>(null);
+  if (active) lastActive.current = { status: job.status, gpu: gpuStatus };
+  else if (job.status === "cancelled" && !atCancel.current) atCancel.current = lastActive.current;
+  const cancelledWhileStarting =
+    job.status === "cancelled" && !!atCancel.current && (atCancel.current.status === "starting" || atCancel.current.status === "queued") && atCancel.current.gpu !== "running";
+  const rel = job.gpuRelease;
+  const gpuStopNote = rel
+    ? rel.state === "stopping"
+      ? "Stopping the GPU…"
+      : rel.state === "stopped"
+        ? `GPU stopped${rel.costUsd != null && isFinite(rel.costUsd) ? ` (~$${rel.costUsd.toFixed(2)})` : ""}`
+        : `Couldn't confirm the GPU stopped${rel.error ? ` — ${rel.error}` : ""}. Check the GPU pill.`
+    : cancelledWhileStarting
+      ? gpuStatus === "stopping"
+        ? "Stopping the GPU…"
+        : gpuStatus === "stopped"
+          ? "GPU stopped"
+          : null
+      : null;
+  const finishedAt = useRef<number | null>(null);
+  if (!active && finishedAt.current == null) finishedAt.current = Date.now();
   const [tick, setNow] = useState(Date.now());
   // The ticker only drives re-renders; read the real clock so timers never lag a fresh update.
   const now = Math.max(tick, Date.now());
@@ -109,8 +156,8 @@ export function JobCard({
   }, [job.completed, job.modelName]);
 
   const k = Math.min(job.completed + 1, job.total);
-  const video = job.kind === "video";
   const noun = video ? "video" : "image";
+  const Noun = video ? "Video" : "Image";
   const p = job.progress;
   const staged = job.status === "running" && !!p?.stage;
   const podPhase = job.status === "starting" && p?.phase ? p.phase : null;
@@ -158,17 +205,22 @@ export function JobCard({
         steps = stageSteps(prog, sinceUpdate);
         const step = prog.step ?? 0;
         const total = prog.totalSteps ?? 0;
+        // UX-095: with several outputs the bar and the time left cover the whole job.
+        const multi = job.total > 1;
+        const done = job.completed;
         if (prog.stage === "sampling" && total) {
           const percent = pct(step, total);
-          bar = { value: percent, indeterminate: false };
+          bar = { value: multi ? pct(done + step / total, job.total) : percent, indeterminate: false };
+          const perStep = eta != null && total > step ? eta / (total - step) : null;
+          const allEta = eta == null ? null : multi && perStep != null ? eta + perStep * total * (job.total - k) : eta;
           caption = {
-            left: `Step ${step} of ${total} · ${Math.round(percent)}%`,
-            right: eta == null ? "estimating…" : etaText(eta),
+            left: multi ? `${Noun} ${k} of ${job.total} · step ${step} of ${total}` : `Step ${step} of ${total} · ${Math.round(percent)}%`,
+            right: allEta == null ? "estimating…" : etaText(allEta, multi && job.total - k > 0),
           };
         } else if (POST_STAGES.has(String(prog.stage))) {
-          bar = { value: 100, indeterminate: false };
+          bar = { value: multi ? pct(done + 1, job.total) : 100, indeterminate: false };
         } else {
-          bar = { value: 0, indeterminate: true };
+          bar = multi ? { value: pct(done, job.total), indeterminate: false } : { value: 0, indeterminate: true };
         }
         const loading = LOADER_STAGES.has(String(prog.stage));
         if (loading && !prog.cached && job.completed === 0 && !warmModels.has(job.modelName)) {
@@ -187,27 +239,48 @@ export function JobCard({
       }
       break;
     case "completed":
-      title = `Done — ${job.total} ${noun}${job.total > 1 ? "s" : ""}`;
+      title = `Done — ${job.total} ${noun}${job.total > 1 ? "s" : ""} · ${hhmm(finishedAt.current ?? Date.now())}`;
       bar = { value: 100, indeterminate: false };
       break;
     case "cancelled":
-      title = "Cancelled";
+      // UX-041 / UX-007: say what was kept; a vault job adds nothing more while locked.
+      title =
+        job.completed > 0
+          ? `Cancelled — ${job.completed} of ${job.total} ${noun}${job.total > 1 ? "s" : ""} saved`
+          : sealed
+            ? "Cancelled"
+            : "Cancelled — nothing saved";
+      if (gpuStopNote) title += ` · ${gpuStopNote}`;
       bar = { value: 0, indeterminate: false, tone: "muted" };
       break;
     default:
-      title = "Failed";
+      title = job.completed > 0 ? `Failed — ${job.completed} of ${job.total} ${noun}${job.total > 1 ? "s" : ""} saved` : "Failed — nothing saved";
       bar = { value: 100, indeterminate: false, tone: "warn" };
   }
 
   if (gpuNote && (job.status === "queued" || job.status === "starting")) hint = gpuNote;
 
+  // UX-011: number concurrent cards by their order in the list.
+  const numbered = index != null && (count ?? 0) > 1;
+  if (numbered) {
+    title = job.status === "queued" && index! > 0 ? `Job ${index! + 1} · queued · starts after job ${index}` : `Job ${index! + 1} · ${title}`;
+  }
+  const videoSpecs = video
+    ? [
+        job.durationS != null && isFinite(job.durationS) ? `${Math.round(job.durationS)} s` : null,
+        job.resolution ? job.resolution.replace(/^(\d+)x(\d+)$/, "$1×$2") : null,
+        job.audio == null ? null : job.audio ? "audio" : "no audio",
+      ].filter(Boolean)
+    : [];
+
   const showCountTag = job.total > 1 && active && !staged;
+  const started = job.status === "running" || job.completed > 0;
   const promptLine = `${job.modelName}${job.prompt ? ` · ${job.prompt}` : ""}`;
 
   return (
     <article
       className={`job-card job-card--${job.status} ${sealed ? "job-card--sealed" : ""}`}
-      aria-label={sealed ? `${video ? "Video" : "Generation"} saved to the vault` : `${video ? "Video" : "Generation"}: ${job.prompt}`}
+      aria-label={sealed ? `${video ? "Video" : "Generation"} for the vault` : `${video ? "Video" : "Generation"}: ${job.prompt}`}
     >
       <div className="job-card__head">
         <div className="job-card__status">
@@ -219,7 +292,7 @@ export function JobCard({
         <div className="job-card__meta">
           {showCountTag && (
             <span className="tag mono">
-              {noun} {k} of {job.total}
+              {started ? `${noun} ${k} of ${job.total}` : `${job.total} ${noun}s queued`}
             </span>
           )}
           {active && (
@@ -231,11 +304,11 @@ export function JobCard({
             <button type="button" className="btn btn--ghost btn--sm" onClick={onCancel}>
               <Icon name="stop" /> Cancel
             </button>
-          ) : (
+          ) : onDismiss ? (
             <button type="button" className="icon-btn icon-btn--sm" aria-label="Dismiss" onClick={onDismiss}>
               <Icon name="x" />
             </button>
-          )}
+          ) : null}
         </div>
       </div>
 
@@ -272,18 +345,35 @@ export function JobCard({
         </p>
       )}
 
+      {videoSpecs.length > 0 && <p className="job-card__specs mono hint">{videoSpecs.join(" · ")}</p>}
+
       <div className="job-card__foot">
         {sealed ? (
-          <p className="job-card__prompt job-card__sealed">
-            <Icon name="lock" size={13} /> Saved to vault
-            <span className="hint"> · unlock to see it</span>
-          </p>
+          // UX-007: never claim "saved" before it is; a cancelled job with nothing saved says nothing more.
+          job.status === "cancelled" && job.completed === 0 ? null : (
+            <p className="job-card__prompt job-card__sealed">
+              <Icon name="lock" size={13} />{" "}
+              {active
+                ? "Will be sealed in the vault when done"
+                : job.completed > 0
+                  ? `${job.completed} ${noun}${job.completed === 1 ? "" : "s"} sealed in the vault`
+                  : "Nothing was saved"}
+              {!active && job.completed > 0 && (
+                <>
+                  {" · "}
+                  <button type="button" className="link-btn" onClick={vault.requestUnlock}>
+                    Unlock to view
+                  </button>
+                </>
+              )}
+            </p>
+          )
         ) : (
           <p className="job-card__prompt" title={promptLine}>
             <strong>{job.modelName}</strong>
             {job.prompt ? ` · ${job.prompt}` : ""}
             {job.destination === "vault" && (
-              <span className="job-card__dest" title="Saved to the vault">
+              <span className="job-card__dest" title={job.status === "completed" ? "Saved to the vault" : "Goes to the vault"}>
                 {" "}
                 <Icon name="lock" size={11} label="Vault" />
               </span>

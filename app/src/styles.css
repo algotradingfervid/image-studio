@@ -67,7 +67,6 @@ body,
 
 body {
   background: var(--bg);
-  min-width: 1100px;
   min-height: 720px;
   overflow: hidden;
   user-select: none;
@@ -662,8 +661,14 @@ kbd {
   margin-top: 14px;
 }
 
+/* Side-by-side fields start on the same line: no stacked-field gap inside a row (UX-056). */
+.field-row > .field + .field {
+  margin-top: 0;
+}
+
 .field__label {
   font-size: 12px;
+  line-height: 17px;
   font-weight: 600;
   color: var(--text-2);
 }
@@ -678,6 +683,7 @@ kbd {
 .field-row {
   display: grid;
   grid-template-columns: 1fr 1fr;
+  align-items: start;
   gap: 12px;
 }
 
@@ -1088,7 +1094,7 @@ input[type="range"]:focus-visible {
 .create {
   display: grid;
   /* minmax(0, …): long unbreakable content must not widen the main column */
-  grid-template-columns: minmax(380px, 420px) minmax(0, 1fr);
+  grid-template-columns: clamp(320px, 38vw, 420px) minmax(0, 1fr);
   min-height: 0;
   height: 100%;
 }
@@ -1097,25 +1103,113 @@ input[type="range"]:focus-visible {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
   background: var(--bg-raise);
   border-right: 1px solid var(--line);
+  /* The footer's "more below" cue reads the scroll area's timeline (UX-018). */
+  timeline-scope: --panel-scroll;
 }
 
 .panel__scroll {
   flex: 1;
   overflow-y: auto;
-  padding: 18px 18px 8px;
+  padding: 18px 18px 24px;
+  /* Controls focused or scrolled into view stop clear of the footer edge. */
+  scroll-padding: 56px 0 32px;
+  scroll-timeline: --panel-scroll y;
+  /* Fallback "more below" shadow where scroll-driven animations are missing: the cover
+     (local) scrolls with the content and hides the shadow (scroll) once the end is reached. */
+  background:
+    linear-gradient(to bottom, rgba(19, 18, 16, 0), var(--bg-raise) 70%) center bottom / 100% 40px no-repeat local,
+    radial-gradient(farthest-side at 50% 100%, rgba(0, 0, 0, 0.6), rgba(0, 0, 0, 0)) center bottom / 100% 18px no-repeat scroll;
 }
 
 .panel__foot {
-  padding: 12px 18px 14px;
+  position: relative;
+  padding: 10px 18px 10px;
   border-top: 1px solid var(--line);
   background: linear-gradient(to bottom, rgba(19, 18, 16, 0.6), var(--bg-raise));
 }
 
+/* "More below" cue: a fade + shadow on the footer's top edge while the form continues
+   under it. Shown by the scroll timeline where supported, or by the hook
+   [data-more-below="true"] on .panel__scroll / .panel (set from JS). */
+.panel__foot::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  height: 28px;
+  pointer-events: none;
+  background: linear-gradient(to top, rgba(10, 9, 8, 0.85), rgba(10, 9, 8, 0));
+  opacity: 0;
+  transition: opacity 0.15s var(--ease);
+}
+
+.panel__foot::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: -1px;
+  width: 64px;
+  height: 2px;
+  margin-left: -32px;
+  border-radius: 2px;
+  background: var(--accent-line);
+  pointer-events: none;
+  opacity: 0;
+}
+
+.panel:has(> .panel__scroll[data-more-below="true"]) > .panel__foot::before,
+.panel[data-more-below="true"] > .panel__foot::before,
+.panel:has(> .panel__scroll[data-more-below="true"]) > .panel__foot::after,
+.panel[data-more-below="true"] > .panel__foot::after {
+  opacity: 1;
+}
+
+@supports (animation-timeline: scroll()) {
+  .panel__scroll {
+    background: none;
+  }
+
+  .panel__foot::before,
+  .panel__foot::after {
+    animation: more-below linear both;
+    animation-timeline: --panel-scroll;
+    animation-range: calc(100% - 48px) 100%;
+  }
+}
+
+@keyframes more-below {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
 .panel__hint {
-  margin: 8px 0 0;
+  margin: 6px 0 0;
   text-align: center;
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+/* The Image | Video switch stays reachable while the form scrolls (UX-087). */
+.panel__scroll > .mode-switch {
+  position: sticky;
+  /* Sticky offsets count from the padding edge (18 px): -10 px sits it 8 px below the top. */
+  top: -10px;
+  z-index: 3;
+  background: #0f0e0d;
+  box-shadow: 0 0 0 8px var(--bg-raise), 0 10px 12px -2px var(--bg-raise);
+}
+
+/* Hook for "scroll the opened Advanced section into view" (UX-018): keep it clear of the footer. */
+.panel__scroll .advanced {
+  scroll-margin-bottom: 24px;
 }
 
 .section + .section,
@@ -1438,8 +1532,9 @@ input[type="range"]:focus-visible {
   gap: 8px;
 }
 
+/* The button box starts on the form's 18 px column edge like every other control (UX-085). */
 .lora-picker__add > .btn {
-  margin-left: -10px;
+  margin-left: 0;
 }
 
 .menu {
@@ -1553,10 +1648,22 @@ input[type="range"]:focus-visible {
 
 .advanced__foot {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 6px 8px;
   margin-top: 14px;
+}
+
+/* The defaults hint keeps its words together: it moves to its own line instead of
+   leaving a lone value next to Reset (UX-056). */
+.advanced__foot > .hint {
+  flex: 0 1 auto;
+  max-width: 100%;
+}
+
+.advanced__foot > .btn {
+  margin-left: auto;
 }
 
 .btn--generate {
@@ -1920,7 +2027,7 @@ input[type="range"]:focus-visible {
   margin: 0;
   padding: 0;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(170px, 100%), 1fr));
   gap: 10px;
 }
 
@@ -1988,7 +2095,7 @@ input[type="range"]:focus-visible {
 }
 
 .tile__meta {
-  font-size: 10.5px;
+  font-size: 12px;
   color: var(--text-3);
 }
 
@@ -2331,6 +2438,9 @@ input[type="range"]:focus-visible {
 /* ------------------------------------------------------------------ pages */
 
 .page {
+  /* Contain absolutely positioned descendants (e.g. .visually-hidden labels): without it they
+     sit against <body>, stretch the document, and scrollIntoView pushes the toolbar off-screen. */
+  position: relative;
   overflow-y: auto;
   height: 100%;
   background:
@@ -2991,7 +3101,7 @@ input[type="range"]:focus-visible {
   border-radius: 5px;
   background: rgba(8, 7, 6, 0.72);
   color: var(--accent-hi);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   font-family: var(--mono);
   pointer-events: none;
@@ -3110,7 +3220,7 @@ input[type="range"]:focus-visible {
 
 /* Two pills at narrow window widths: the GPU name moves to the tooltip. */
 @media (max-width: 1380px) {
-  .gpu-pills--dual .gpu-pill__gpu {
+  .gpu-pills--dual .gpu-pill--running .gpu-pill__gpu {
     display: none;
   }
 }
@@ -3301,9 +3411,13 @@ input[type="range"]:focus-visible {
   border-radius: 999px;
   background: rgba(8, 7, 6, 0.72);
   color: var(--text);
-  font-size: 10.5px;
+  font-size: 12px;
   font-weight: 600;
   pointer-events: none;
+}
+
+.tile__video-badge * {
+  font-size: inherit;
 }
 
 .tile__video-badge .icon:first-child {
@@ -3469,8 +3583,9 @@ input[type="range"]:focus-visible {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  margin: 0 -4px;
-  padding: 0 4px 4px;
+  /* Room for the tiles' focus ring (2 px outline + 3 px offset) so it is never clipped. */
+  margin: 0 -6px;
+  padding: 6px 6px 6px;
 }
 
 .picker__grid {
@@ -3491,9 +3606,10 @@ input[type="range"]:focus-visible {
   text-align: center;
 }
 
-/* The running pill keeps its cost visible; a starting pill truncates its phase first. */
+/* Both pills share the room; the running pill gives way last (its cost stays visible
+   longest), a starting pill truncates its phase first. */
 .gpu-pills .gpu-pill--running {
-  flex-shrink: 0;
+  flex-shrink: 0.25;
 }
 
 /* ------------------------------------------------------- v6: the vault */
@@ -3892,4 +4008,235 @@ input[type="range"]:focus-visible {
 
 .vault-settings .settings__actions {
   margin-top: 12px;
+}
+
+/* ------------------------------------------- v7: header vault indicator (UX-051) */
+
+.toolbar__end {
+  gap: 8px;
+}
+
+.vault-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  height: 30px;
+  padding: 0 3px 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent-hi);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.vault-pill__btn {
+  flex: none;
+  border-radius: 999px;
+  height: 24px;
+}
+
+/* The vault pill also needs more than the centred layout's right third. */
+.toolbar:has(.vault-pill) {
+  grid-template-columns: auto auto minmax(0, 1fr);
+  column-gap: 20px;
+}
+
+/* Beside the vault pill, running GPU pills may shrink too, and two of them drop the GPU name. */
+.toolbar:has(.vault-pill) .gpu-pills--dual .gpu-pill--running .gpu-pill__gpu {
+  display: none;
+}
+
+/* ------------------------------------------- v7: narrow windows, 800-1100 px (UX-002) */
+
+.brand,
+.tabs {
+  min-width: 0;
+}
+
+.tab {
+  white-space: nowrap;
+}
+
+.canvas__head,
+.job-card__head,
+.job-card__foot,
+.volume__top,
+.model-panel__head,
+.page__head,
+.settings__actions,
+.save-to__row,
+.dialog__foot,
+.banner {
+  flex-wrap: wrap;
+}
+
+.banner > span:not(.banner__actions) {
+  min-width: 0;
+  flex: 1 1 260px;
+}
+
+.model-panel__head > :first-child,
+.volume__top > :first-child {
+  min-width: 0;
+  flex: 1 1 280px;
+}
+
+.model-panel__actions,
+.volume__actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+/* Vault pill + two GPU pills: compact both a little earlier. */
+@media (max-width: 1300px) {
+  .vault-pill__more {
+    display: none;
+  }
+
+  .toolbar:has(.vault-pill) .gpu-pills--dual .gpu-pill__btn:has(> .icon) {
+    font-size: 0;
+    gap: 0;
+    padding: 0 7px;
+  }
+  .toolbar:has(.vault-pill):has(.gpu-pills--dual) .brand__name {
+    display: none;
+  }
+}
+
+@media (max-width: 1100px) {
+  /* Tabs move next to the brand; status pills take the rest of the row. */
+  .toolbar {
+    grid-template-columns: auto auto minmax(0, 1fr);
+    column-gap: 14px;
+    padding: 0 12px;
+  }
+
+  .tab {
+    padding: 0 12px;
+  }
+
+  /* The GPU name, the stopped label and the combined total move out (all in tooltips or
+     each pill's own cost). */
+  .gpu-pills .gpu-pill--running .gpu-pill__gpu,
+  .gpu-pills .gpu-pill__state,
+  .gpu-pills .gpu-total {
+    display: none;
+  }
+
+  /* Two pills: Stop / Start keep their icon and accessible name, the word moves out. */
+  .gpu-pills--dual .gpu-pill__btn:has(> .icon) {
+    font-size: 0;
+    gap: 0;
+    padding: 0 7px;
+  }
+
+  .vault-pill__more {
+    display: none;
+  }
+
+  /* Beside two GPU pills the open-lock icon and Lock button carry it alone. */
+  .toolbar:has(.gpu-pills--dual) .vault-pill__text {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .canvas {
+    padding: 16px 16px 24px;
+  }
+
+  .page__inner {
+    padding: 22px 16px 40px;
+  }
+
+  .lightbox__layout {
+    grid-template-columns: minmax(0, 1fr) 300px;
+  }
+
+  .lightbox__stage {
+    padding: 24px 52px;
+  }
+}
+
+@media (max-width: 960px) {
+  .brand__name {
+    display: none;
+  }
+
+  .toolbar {
+    column-gap: 10px;
+  }
+
+  .lightbox {
+    width: calc(100vw - 32px);
+    height: calc(100vh - 32px);
+  }
+
+  .lightbox__layout {
+    grid-template-columns: minmax(0, 1fr) 280px;
+  }
+
+  .lightbox__stage {
+    padding: 20px 48px;
+  }
+
+  .panel__scroll {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+
+  .panel__foot {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+
+  /* The absolutely placed ⌘↵ badge would overlap a long centred label ("Start GPU & Generate
+     video"); the prompt's "⌘↵ to generate" hint still shows the shortcut. */
+  .btn--generate .kbd-group {
+    display: none;
+  }
+
+  /* Narrow form column: model names get the glyph's room and may wrap to two lines. */
+  .model-card {
+    padding: 9px 10px;
+  }
+
+  .model-card__glyph {
+    display: none;
+  }
+
+  .model-card__name {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }
+}
+
+/* Busy GPU pills or the vault pill need the tab labels' room: tabs go icon-only,
+   keeping their names for assistive tech and in the tooltip. */
+@media (max-width: 900px) {
+  .toolbar:has(.gpu-pill--running, .gpu-pill--starting, .gpu-pill--error, .gpu-pill--stopping, .vault-pill) .tab {
+    padding: 0 10px;
+  }
+
+  .toolbar:has(.gpu-pill--running, .gpu-pill--starting, .gpu-pill--error, .gpu-pill--stopping, .vault-pill) .tab__label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .settings .field-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }

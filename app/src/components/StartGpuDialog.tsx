@@ -28,12 +28,21 @@ export function StartGpuDialog({
   open,
   info,
   action,
+  details,
+  confirmLabel,
+  selfStopOff,
   onAnswer,
 }: {
   open: boolean;
   info: StartGpuInfo | null;
   /** What the start is for ("generate", "download Flux.2"); omitted for a plain Start. */
   action?: string;
+  /** Extra facts about the action (size, free space, token status), one line each (UX-031). */
+  details?: string[];
+  /** Names the outcome on the confirm button ("Start GPU & download 17.2 GB"). */
+  confirmLabel?: string;
+  /** "Let the pod stop itself when idle" is off: the pod keeps billing if the app closes. */
+  selfStopOff?: boolean;
   onAnswer: (ok: boolean) => void;
 }) {
   const confirmRef = useRef<HTMLButtonElement>(null);
@@ -66,7 +75,7 @@ export function StartGpuDialog({
             Cancel
           </button>
           <button ref={confirmRef} type="button" className="btn btn--primary" onClick={() => onAnswer(true)}>
-            <Icon name="bolt" /> Start GPU ({price})
+            <Icon name="bolt" /> {confirmLabel ? `${confirmLabel} (${price})` : `Start GPU (${price})`}
           </button>
         </>
       }
@@ -87,9 +96,23 @@ export function StartGpuDialog({
             </dd>
             <dt>Billing</dt>
             <dd>
-              Bills until you stop it, or until it auto-stops after <strong>{info.idleMinutes} idle minutes</strong>.
+              Bills until you stop it, or until it auto-stops after <strong>{info.idleMinutes} idle minutes</strong>
+              {selfStopOff ? " while the app is open" : ""}.
+              {action && !/^generate|^make|^create/i.test(action) ? " Started only for this, it stops again when the work finishes." : ""}
             </dd>
           </dl>
+          {details && details.length > 0 && (
+            <ul className="plain start-gpu__details">
+              {details.map((d) => (
+                <li key={d}>{d}</li>
+              ))}
+            </ul>
+          )}
+          {selfStopOff && (
+            <p className="notice notice--warn">
+              <Icon name="alert" /> “Let the pod stop itself when idle” is off: if this app quits or crashes, the pod keeps billing until you stop it.
+            </p>
+          )}
           <p className="hint">
             {action
               ? "Starting takes a few minutes; the work waits in the queue until the GPU is ready."

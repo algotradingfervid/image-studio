@@ -1,7 +1,83 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
+import * as api from "../../api";
 import { fileSrc, inTauri, type ImageRecord } from "../../api";
 import { Icon, type IconName } from "../../components/Icon";
-import { formatRelative } from "../../lib/format";
+import { formatRelative, pct } from "../../lib/format";
+import { useVault } from "../../state/vault";
+import "../../styles/gallery.css";
+
+// ---------- shared with the lightbox ----------
+
+/**
+ * The paging state of the gallery on screen (only one Gallery is mounted at a time), so the
+ * lightbox can load the next page when it reaches the last loaded item (UX-049).
+ */
+export const galleryPager: { hasMore: boolean; loading: boolean; loadMore: () => void; filter: "all" | "image" | "video" } = {
+  hasMore: false,
+  loading: false,
+  loadMore: () => {},
+  filter: "all",
+};
+
+/** Real totals of the General gallery (the list is paged), read through every page. */
+export interface GalleryTotals {
+  items: number;
+  images: number;
+  videos: number;
+}
+
+export async function countGallery(): Promise<GalleryTotals> {
+  const t: GalleryTotals = { items: 0, images: 0, videos: 0 };
+  let before: number | null = null;
+  for (let page = 0; page < 200; page++) {
+    const res: api.ImagePage = await api.listImages({ limit: 500, before });
+    for (const r of res.items) {
+      t.items++;
+      if (r.kind === "video") t.videos++;
+      else t.images++;
+    }
+    if (res.nextBefore == null || res.items.length === 0) break;
+    before = res.nextBefore;
+  }
+  return t;
+}
+
+export const totalFor = (t: GalleryTotals, filter: "all" | "image" | "video") => (filter === "video" ? t.videos : filter === "image" ? t.images : t.items);
+
+// "New" markers (UX-041): items created during this session stay marked until opened.
+const sessionStart = Date.now();
+const seen = new Set<string>();
+const seenSubs = new Set<() => void>();
+let seenVersion = 0;
+export function markSeen(id: string) {
+  if (seen.has(id)) return;
+  seen.add(id);
+  seenVersion++;
+  seenSubs.forEach((f) => f());
+}
+const isNew = (im: ImageRecord) => !seen.has(im.id) && Date.parse(im.createdAt) >= sessionStart;
+function useSeenVersion() {
+  return useSyncExternalStore(
+    (f) => {
+      seenSubs.add(f);
+      return () => seenSubs.delete(f);
+    },
+    () => seenVersion,
+  );
+}
+
+/** Switch the Create screen's gallery tab (General / Vault) by its tab button. */
+export function switchGalleryTab(tab: "general" | "vault") {
+  document.getElementById(`gallery-tab-${tab}`)?.click();
+}
+
+/** Width / height for the tile (UX-038: tiles keep the item's real aspect ratio). */
+function aspectOf(im: ImageRecord): number {
+  if (im.width > 0 && im.height > 0) return im.width / im.height;
+  const m = String(im.aspectRatio ?? "").match(/^(\d+)\s*[:x×]\s*(\d+)$/);
+  if (m && +m[1] > 0 && +m[2] > 0) return +m[1] / +m[2];
+  return 4 / 5;
+}
 
 /** "5 s", "1:05". */
 export function formatClipLength(s: number | null | undefined): string {
@@ -45,6 +121,14 @@ export function Gallery({
   const sentinel = useRef<HTMLDivElement>(null);
   const loadRef = useRef(onLoadMore);
   loadRef.current = onLoadMore;
+  galleryPager.hasMore = hasMore;
+  galleryPager.loading = loading;
+  galleryPager.loadMore = onLoadMore;
+  galleryPager.filter = filter;
+  useSeenVersion();
+  const vault = useVault();
+  const mig = vault.migration;
+  const migrating = !!mig && mig.phase !== "done" && mig.phase !== "error";
 
   useEffect(() => {
     const el = sentinel.current;
@@ -67,9 +151,26 @@ export function Gallery({
         </div>
         <h3>{empty.title}</h3>
         <p>{empty.text}</p>
+        <div className="btn-row empty__actions">
+          <button type="button" className="btn btn--sm" onClick={() => switchGalleryTab("general")}>
+            <Icon name={filter === "video" ? "video" : "image"} size={14} />
+            {filter === "video" ? "Show General videos" : filter === "image" ? "Show General images" : "Open General"}
+          </button>
+        </div>
       </div>
     );
   }
+
+  // General while the move into the vault runs (UX-040).
+  const migrationNote = migrating && !empty && (
+    <div className="gallery-note" role="status">
+      <Icon name="refresh" className="spin" size={14} />
+      <span>
+        Moving {mig!.done} of {mig!.total} into the vault…
+      </span>
+      {mig!.total > 0 && <span className="mono hint">{Math.round(pct(mig!.done, mig!.total))}%</span>}
+    </div>
+  );
 
   if (!loading && items.length === 0 && filter !== "all") {
     return (
@@ -87,6 +188,31 @@ export function Gallery({
     );
   }
 
+  if (!loading && items.length === 0 && vault.exists) {
+    return (
+      <>
+        {migrationNote}
+        <div className="empty">
+          <div className="empty__art" aria-hidden>
+            <Icon name="image" size={28} />
+          </div>
+          <h3>Your General gallery is empty</h3>
+          <p>
+            {vault.unlocked && vault.items.length
+              ? `${vault.items.length} item${vault.items.length === 1 ? " is" : "s are"} in the vault. `
+              : "Items you moved into the vault are there, not here. "}
+            New creations land wherever <strong>Save to</strong> says.
+          </p>
+          <div className="btn-row empty__actions">
+            <button type="button" className="btn btn--sm" onClick={() => switchGalleryTab("vault")}>
+              <Icon name={vault.unlocked ? "lockOpen" : "lock"} size={14} /> Open Vault
+            </button>
+          </div>
+        </div>
+      </>
+    );
+  }
+
   if (!loading && items.length === 0) {
     return (
       <div className="empty">
@@ -101,15 +227,18 @@ export function Gallery({
 
   return (
     <>
-      <ul className="gallery" aria-label="Generated images, newest first">
+      {migrationNote}
+      <ul className="gallery gallery--justified" aria-label="Generated images, newest first">
         {items.map((im, i) =>
           im.kind === "video" ? (
-            <li key={im.id} className="gallery__item">
+            <li key={im.id} className="gallery__item" style={{ "--ar": aspectOf(im) } as CSSProperties}>
               <VideoTile im={im} modelName={modelNames[im.model] ?? im.model} onOpen={() => onOpen(i)} />
+              {isNew(im) && <NewDot />}
             </li>
           ) : (
-          <li key={im.id} className="gallery__item">
-            <button type="button" className="tile" onClick={() => onOpen(i)} aria-label={`Open image${im.initImage ? " (img2img)" : ""}: ${im.prompt}`}>
+          <li key={im.id} className="gallery__item" style={{ "--ar": aspectOf(im) } as CSSProperties}>
+            {isNew(im) && <NewDot />}
+            <button type="button" className="tile" onClick={() => onOpen(i)} aria-label={`Open ${isNew(im) ? "new " : ""}image${im.initImage ? " (img2img)" : ""}: ${im.prompt}`}>
               <img src={fileSrc(im.thumbPath || im.path)} alt="" loading="lazy" decoding="async" />
               {im.initImage && (
                 <span className="tile__badge" title={`From a start image${im.denoise != null ? ` · strength ${im.denoise.toFixed(2)}` : ""}`}>
@@ -136,6 +265,14 @@ export function Gallery({
       )}
       {!hasMore && items.length > 12 && <p className="gallery__end">That's everything.</p>}
     </>
+  );
+}
+
+function NewDot() {
+  return (
+    <span className="tile__new" title="New since you opened the app" aria-hidden>
+      New
+    </span>
   );
 }
 

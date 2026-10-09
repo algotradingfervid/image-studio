@@ -1,0 +1,257 @@
+/* Agent D: gallery, lightbox, job cards, vault views, toasts (UX review 2026-10-09). */
+
+/* ---- gallery: tiles keep the item's real aspect ratio (UX-038), justified rows ---- */
+.gallery.gallery--justified {
+  --row-h: 210px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+/* Filler so the last row keeps natural widths instead of stretching. */
+.gallery.gallery--justified::after {
+  content: "";
+  flex: 999 1 0;
+}
+.gallery.gallery--justified .gallery__item {
+  position: relative;
+  flex: var(--ar, 0.8) 1 calc(var(--row-h) * var(--ar, 0.8));
+  min-width: 0;
+  /* A row that can't fill up doesn't blow one tile up to the full width. */
+  max-width: calc(var(--row-h) * var(--ar, 0.8) * 1.6);
+}
+.gallery.gallery--justified .tile {
+  aspect-ratio: var(--ar, 0.8);
+  height: auto;
+}
+@media (max-width: 1100px) {
+  .gallery.gallery--justified {
+    --row-h: 160px;
+  }
+}
+@media (max-width: 900px) {
+  .gallery.gallery--justified {
+    --row-h: 130px;
+  }
+}
+
+.tile__new {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  z-index: 2;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #1b0d03;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+
+.gallery-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line-2);
+  background: var(--panel);
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+.gallery-note .hint {
+  margin-left: auto;
+}
+
+.empty__actions {
+  justify-content: center;
+  margin-top: 6px;
+}
+
+/* ---- toasts: actions; above the lightbox (they're portalled into the open dialog) ---- */
+.toast__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+/* Inside a dialog, toasts sit bottom-left so they never cover the lightbox's action column. */
+dialog .toasts {
+  position: fixed;
+  z-index: 1000;
+  right: auto;
+  left: 18px;
+  max-width: calc(100vw - 36px);
+}
+
+/* ---- lightbox ---- */
+.lightbox__prompt.lightbox__prompt--select {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+
+.btn.btn--done {
+  border-color: rgba(124, 214, 141, 0.45);
+  color: var(--ok);
+}
+
+/* Warning-tone confirm (vault export / move out): outlined amber, not a second orange primary (UX-074). */
+.btn.btn--warn-outline {
+  background: transparent;
+  border-color: rgba(243, 197, 82, 0.55);
+  color: var(--warn);
+}
+.btn.btn--warn-outline:hover:not(:disabled) {
+  background: var(--warn-soft);
+  border-color: var(--warn);
+}
+
+/*
+ * Inline confirm panels open just above their trigger, so the trigger stays put (the actions are
+ * bottom-anchored) and the confirm button never lands under the pointer; it also ignores clicks
+ * for 400 ms after it appears (UX-006).
+ */
+.confirm.confirm--above {
+  margin-bottom: -2px;
+}
+.confirm .btn[aria-disabled="true"] {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.start-spec__open {
+  flex: none;
+  padding: 0;
+  border: 0;
+  background: none;
+  border-radius: 6px;
+  cursor: zoom-in;
+}
+.start-spec__open img {
+  display: block;
+  transition: transform 0.15s var(--ease), border-color 0.15s;
+}
+.start-spec__open:hover img {
+  transform: scale(1.05);
+  border-color: var(--accent);
+}
+.start-spec__from {
+  font-size: 12px;
+  color: var(--text-2);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.lightbox__start-preview {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: grid;
+  place-items: center;
+  grid-template-rows: minmax(0, 1fr) auto;
+  gap: 10px;
+  margin: 0;
+  padding: 28px 64px 16px;
+  background: rgba(10, 9, 8, 0.94);
+}
+.lightbox__start-preview img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 6px;
+}
+.lightbox__start-preview figcaption {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+/* ---- vault views ---- */
+.vault-gate__reason {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--panel-2);
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+
+.vault-unlock-dialog__body {
+  padding: 4px 20px 20px;
+}
+.vault-unlock-dialog__body .vault-gate__form {
+  max-width: none;
+}
+
+.vault-strength {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.vault-strength__bar {
+  display: inline-flex;
+  gap: 3px;
+}
+.vault-strength__bar > span {
+  width: 18px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line-2);
+}
+.vault-strength--1 .vault-strength__bar > span:nth-child(-n + 1) {
+  background: var(--danger);
+}
+.vault-strength--2 .vault-strength__bar > span:nth-child(-n + 2) {
+  background: var(--warn);
+}
+.vault-strength--3 .vault-strength__bar > span {
+  background: var(--ok);
+}
+
+.vault-migration__close {
+  margin-left: auto;
+}
+.vault-migration__summary {
+  margin: 0;
+  color: var(--text-2);
+}
+
+.save-to__state {
+  color: var(--accent);
+  font-weight: 600;
+}
+.save-to__note .link-btn {
+  font-weight: 600;
+}
+
+/* Job card video specs (UX-011) */
+.job-card__specs {
+  margin: 0;
+  font-size: 11.5px;
+}
+
+/* "Set up a vault…" (UX-057): muted link, 24 px target, 8 px clear above Generate */
+.save-to {
+  margin-bottom: 8px;
+}
+.save-to__only .link-btn.save-to__setup {
+  min-height: 24px;
+  padding: 0 4px;
+  color: var(--text-3);
+  font-weight: 500;
+}
+.save-to__only .link-btn.save-to__setup:hover {
+  color: var(--text-2);
+}

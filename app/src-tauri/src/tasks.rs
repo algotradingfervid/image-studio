@@ -59,6 +59,10 @@ pub struct Task {
     pub total_bytes: u64,
     pub file: Option<String>,
     pub error: Option<String>,
+    /// Additive (UX-047): set when the app stopped the GPU because it was
+    /// started only for this task, which has now ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_release: Option<crate::pod::GpuRelease>,
 }
 
 pub struct TaskEntry {
@@ -66,7 +70,23 @@ pub struct TaskEntry {
     pub cancel: bool,
     /// The GPU profile (volume) the task runs on.
     pub profile: Profile,
+    /// Files a delete task will remove (empty for downloads).
+    pub deletes: Vec<crate::delete_rule::FileKey>,
 }
+
+/// Files that queued or running delete tasks on profile `p` will remove.
+pub fn pending_deletes(core: &Core, p: Profile) -> HashSet<crate::delete_rule::FileKey> {
+    core.tasks
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|e| e.profile == p)
+        .flat_map(|e| e.deletes.iter().cloned())
+        .collect()
+}
+
+/// Longest LoRA name accepted (UX-090).
+pub const MAX_LORA_NAME_CHARS: usize = 60;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -184,12 +204,15 @@ pub fn download_model(core: &Arc<Core>, id: &str) -> Result<Task, String> {
 /// Delete plan against the model's own volume (image or video family).
 fn plan(core: &Core, id: &str) -> Result<(crate::delete_rule::DeletePlan, Vec<ModelFile>), String> {
     let model = core.registry.any_model(id)?;
-    let p = plan_delete(
-        model,
-        core.registry.family_of(id),
-        &present_set_for(core, profile_for_model(core, id)),
-        &busy_models(core),
-    );
+    let profile = profile_for_model(core, id);
+    // Files a queued delete will remove already count as gone (UX-043): a
+    // model being deleted no longer keeps a shared file.
+    let pending = pending_deletes(core, profile);
+    let present: HashSet<_> = present_set_for(core, profile)
+        .into_iter()
+        .filter(|k| !pending.contains(k))
+        .collect();
+    let p = plan_delete(model, core.registry.family_of(id), &present, &busy_models(core));
     let files = p.delete_files.clone();
     Ok((p, files))
 }
@@ -247,10 +270,28 @@ pub async fn add_lora(
     trigger_words: Option<Vec<String>>,
 ) -> Result<LoraView, String> {
     core.registry.any_model(model_id)?;
+    if name.as_deref().is_some_and(|n| n.trim().chars().count() > MAX_LORA_NAME_CHARS) {
+        return Err(format!("Keep the name to {MAX_LORA_NAME_CHARS} characters or fewer"));
+    }
     let profile = profile_for_model(core, model_id);
     crate::worker::precheck_for(core, profile)?;
     let r = core.resolver().resolve(url, &core.registry).await?;
     let filename = sanitize_filename(&r.filename)?;
+    // The same file for the same model would share one file on the volume:
+    // deleting either row would break the other (UX-092).
+    if let Some(dup) = core
+        .db
+        .lock()
+        .unwrap()
+        .list_loras()?
+        .into_iter()
+        .find(|l| l.model_id == model_id && l.filename == filename)
+    {
+        return Err(format!(
+            "Already in your library as “{}” for this model (same file {filename})",
+            dup.name
+        ));
+    }
     let row = LoraRow {
         id: uuid::Uuid::new_v4().to_string(),
         name: name
@@ -354,6 +395,7 @@ fn start_task(
         total_bytes,
         file: None,
         error: None,
+        gpu_release: None,
     };
     core.tasks.lock().unwrap().insert(
         task.task_id.clone(),
@@ -361,6 +403,20 @@ fn start_task(
             task: task.clone(),
             cancel: false,
             profile,
+            deletes: if kind == TaskKind::Delete {
+                input["files"]
+                    .as_array()
+                    .map(|fs| {
+                        fs.iter()
+                            .filter_map(|f| {
+                                Some((f["folder"].as_str()?.to_string(), f["filename"].as_str()?.to_string()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            },
         },
     );
     core.sink.task_update(&task);
@@ -394,6 +450,19 @@ async fn finish(core: &Arc<Core>, profile: Profile, id: &str, status: TaskStatus
     if let Err(e) = refresh_status_opts_for(core, profile, false).await {
         eprintln!("[tasks] status refresh after task failed: {e}");
     }
+    end(core, profile, id, status, error).await;
+}
+
+/// Ends a task that never reached the worker (no status refresh).
+async fn fail_now(core: &Arc<Core>, profile: Profile, id: &str, status: TaskStatus, e: Option<String>) {
+    end(core, profile, id, status, e).await;
+}
+
+/// Removes the task and reports its end. When the pod was started only for
+/// Models-screen work and nothing (no job, no other task) uses it now, it is
+/// stopped (UX-047) and the task says so (`gpuRelease`, emitted again when the
+/// stop is confirmed).
+async fn end(core: &Arc<Core>, profile: Profile, id: &str, status: TaskStatus, error: Option<String>) {
     let done = {
         let mut tasks = core.tasks.lock().unwrap();
         tasks.remove(id).map(|mut e| {
@@ -402,18 +471,14 @@ async fn finish(core: &Arc<Core>, profile: Profile, id: &str, status: TaskStatus
             e.task
         })
     };
-    if let Some(t) = done {
-        core.sink.task_update(&t);
-    }
-}
-
-fn fail_now(core: &Core, id: &str, status: TaskStatus, e: Option<String>) {
-    let t = core.tasks.lock().unwrap().remove(id).map(|mut x| {
-        x.task.status = status;
-        x.task.error = e;
-        x.task
-    });
-    if let Some(t) = t {
+    let Some(mut t) = done else { return };
+    let release = crate::pod::begin_release(core, profile, crate::pod::StopReason::Finished);
+    t.gpu_release = release
+        .as_ref()
+        .map(|r| r.note(crate::pod::ReleaseState::Stopping, None));
+    core.sink.task_update(&t);
+    if let Some(r) = release {
+        t.gpu_release = Some(crate::pod::finish_release_note(core, r).await);
         core.sink.task_update(&t);
     }
 }
@@ -430,18 +495,18 @@ async fn run_task(
     let client = {
         let (c, i) = (core.clone(), id.clone());
         let cancelled = move || cancel_requested(&c, &i);
-        crate::worker::client_for(&core, profile, &mut |_| {}, &cancelled).await
+        crate::worker::client_as(&core, profile, crate::pod::StartOrigin::Task, &mut |_| {}, &cancelled).await
     };
     let client = match client {
         Ok(c) => c,
         Err(_) if cancel_requested(&core, &id) => {
-            return fail_now(&core, &id, TaskStatus::Cancelled, None)
+            return fail_now(&core, profile, &id, TaskStatus::Cancelled, None).await
         }
-        Err(e) => return fail_now(&core, &id, TaskStatus::Failed, Some(e)),
+        Err(e) => return fail_now(&core, profile, &id, TaskStatus::Failed, Some(e)).await,
     };
     let rp_id = match client.run(input, timeout_ms).await {
         Ok(r) => r,
-        Err(e) => return fail_now(&core, &id, TaskStatus::Failed, Some(e)),
+        Err(e) => return fail_now(&core, profile, &id, TaskStatus::Failed, Some(e)).await,
     };
     let mut errors = 0;
     loop {

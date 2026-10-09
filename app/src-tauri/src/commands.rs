@@ -52,6 +52,8 @@ pub struct SettingsResponse {
     pub video_volume_names: Vec<String>,
     /// Vault auto-lock after this many idle minutes (spec v6; default 10).
     pub vault_auto_lock_minutes: u32,
+    /// Additive: the settings file (hand-edited keys such as workerRef).
+    pub settings_path: String,
 }
 
 fn settings_response(core: &Core) -> SettingsResponse {
@@ -69,7 +71,17 @@ fn settings_response(core: &Core) -> SettingsResponse {
         video_gpu_types: core.settings.gpu_types_for(Profile::Video),
         video_volume_names: core.settings.volume_names_for(Profile::Video),
         vault_auto_lock_minutes: core.settings.vault_auto_lock_minutes(),
+        settings_path: core.settings.config_path().to_string_lossy().into_owned(),
     }
+}
+
+/// Shows the settings file in Finder (created first if it doesn't exist yet).
+#[tauri::command]
+pub fn reveal_settings_file(core: CoreState<'_>) -> Res<String> {
+    let path = core.settings.ensure_config_file()?;
+    tauri_plugin_opener::reveal_item_in_dir(&path)
+        .map_err(|e| format!("Couldn't show the settings file: {e}"))?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -90,9 +102,8 @@ pub fn save_settings(
     vault_auto_lock_minutes: Option<u32>,
 ) -> Res<SettingsResponse> {
     if let Some(m) = vault_auto_lock_minutes {
-        core.settings.save_vault_auto_lock(m)?;
-        core.vault.set_auto_lock(m);
-        core.emit_vault();
+        // Only while unlocked (refused otherwise, before anything is saved).
+        core.set_vault_auto_lock(m)?;
     }
     core.settings.save_pod(SavePodSettings {
         backend,
@@ -131,9 +142,6 @@ pub fn list_gpu_states(core: CoreState<'_>) -> Vec<GpuState> {
 #[tauri::command]
 pub async fn start_gpu(core: CoreState<'_>, profile: Option<String>) -> Res<GpuState> {
     let p = Profile::parse(profile.as_deref())?;
-    if p == Profile::Image && core.settings.backend() != Backend::Pod {
-        return Err("The app is set to use the serverless endpoint (Settings)".into());
-    }
     pod::start_for(&core, p)
 }
 
@@ -174,22 +182,124 @@ pub async fn confirm_quit(
 
 #[tauri::command]
 pub async fn test_connection(core: CoreState<'_>) -> Res<Health> {
-    if core.settings.backend() == Backend::Pod {
-        return Ok(test_pod_connection(&core).await);
-    }
-    let client = match core.runpod() {
-        Ok(c) => c,
-        Err(e) => {
-            return Ok(Health {
-                error: Some(e),
-                ..Default::default()
+    Ok(test_pod_connection(&core).await)
+}
+
+/// One key's check (UX-017).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyCheck {
+    pub ok: bool,
+    /// "typed" (the unsaved value given) or "saved" (the stored key).
+    pub source: &'static str,
+    pub message: String,
+    /// The check couldn't reach the service (the key may still be fine).
+    pub network: bool,
+}
+
+/// `test_api_keys`: `null` for a key that was neither given nor saved.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyTestReport {
+    pub runpod: Option<KeyCheck>,
+    pub civitai: Option<KeyCheck>,
+}
+
+/// Checks the given (unsaved) keys — or, for a key not given, the saved one —
+/// without storing anything: RunPod with `GET /v2/pods` (never starts a pod),
+/// Civitai with `GET /api/v1/me` (401 without a valid token). Keys are never
+/// logged or returned.
+pub async fn check_api_keys(
+    core: &Core,
+    api_key: Option<String>,
+    civitai_key: Option<String>,
+) -> KeyTestReport {
+    let pick = |typed: Option<String>, saved: Option<String>| {
+        match typed.map(|k| k.trim().to_string()).filter(|k| !k.is_empty()) {
+            Some(k) => Some((k, "typed")),
+            None => saved.map(|k| (k, "saved")),
+        }
+    };
+    let runpod = match pick(api_key, core.settings.runpod_api_key()) {
+        None => None,
+        Some((key, source)) => {
+            let rest = pod::RestClient::with_timeout(&core.cfg.rest_root, &key, core.cfg.rest_timeout);
+            Some(match rest.list_pods().await {
+                Ok(_) => KeyCheck {
+                    ok: true,
+                    source,
+                    message: "Key OK".into(),
+                    network: false,
+                },
+                Err(e) => KeyCheck {
+                    ok: false,
+                    source,
+                    message: match e.status {
+                        Some(401) => "RunPod rejected this key — check RunPod → Settings → API Keys".into(),
+                        Some(403) => "This key can't manage pods — give it read/write access in RunPod → Settings → API Keys".into(),
+                        _ => e.message,
+                    },
+                    network: e.status.is_none(),
+                },
             })
         }
     };
-    Ok(client.health().await.unwrap_or_else(|e| Health {
-        error: Some(e),
-        ..Default::default()
-    }))
+    let civitai = match pick(civitai_key, core.settings.civitai_api_key()) {
+        None => None,
+        Some((key, source)) => Some(check_civitai_key(&core.cfg.civitai_root, &key, source).await),
+    };
+    KeyTestReport { runpod, civitai }
+}
+
+async fn check_civitai_key(root: &str, key: &str, source: &'static str) -> KeyCheck {
+    let fail = |message: String, network: bool| KeyCheck {
+        ok: false,
+        source,
+        message,
+        network,
+    };
+    let http = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+    {
+        Ok(h) => h,
+        Err(e) => return fail(e.to_string(), true),
+    };
+    let url = format!("{}/api/v1/me", root.trim_end_matches('/'));
+    match http.get(url).bearer_auth(key).send().await {
+        Err(e) => fail(format!("Couldn't reach Civitai: {}", e.without_url()), true),
+        Ok(r) if r.status().is_success() => {
+            let user = r
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|v| v.get("username").and_then(Value::as_str).map(str::to_string));
+            KeyCheck {
+                ok: true,
+                source,
+                message: match user {
+                    Some(u) => format!("Key OK (signed in as {u})"),
+                    None => "Key OK".into(),
+                },
+                network: false,
+            }
+        }
+        Ok(r) if matches!(r.status().as_u16(), 401 | 403) => fail(
+            "Civitai rejected this key — check civitai.com → Account settings → API keys".into(),
+            false,
+        ),
+        Ok(r) => fail(format!("Civitai answered {} — try again later", r.status().as_u16()), true),
+    }
+}
+
+/// UX-017: test keys before saving them (nothing is stored).
+#[tauri::command]
+pub async fn test_api_keys(
+    core: CoreState<'_>,
+    api_key: Option<String>,
+    civitai_key: Option<String>,
+) -> Res<KeyTestReport> {
+    Ok(check_api_keys(&core, api_key, civitai_key).await)
 }
 
 /// Pod running → the pod's `/health`; otherwise verify the API key with
@@ -594,13 +704,12 @@ pub async fn vault_change_password(
     .map_err(|e| e.to_string())?
 }
 
-/// Auto-lock after `minutes` without interaction (1–240); persisted in settings.json.
+/// Auto-lock after `minutes` without interaction (1–240); persisted in
+/// settings.json. Only while the vault is unlocked.
 #[tauri::command]
 pub fn vault_set_auto_lock(core: CoreState<'_>, minutes: u32) -> Res<VaultStatus> {
-    core.settings.save_vault_auto_lock(minutes)?;
-    core.vault.set_auto_lock(minutes);
-    core.emit_vault();
-    Ok(core.vault.status())
+    // Refused while locked (or with no vault).
+    core.set_vault_auto_lock(minutes)
 }
 
 /// Decrypted vault items, newest first (error while locked).

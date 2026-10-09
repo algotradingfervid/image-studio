@@ -1,8 +1,8 @@
-// "From gallery" picker: the user's generated images (no videos), searchable by prompt/model,
-// paginated with list_images and infinite scroll like the gallery. While the vault is unlocked a
-// General | Vault switch also offers vault images (labelled); they never appear while locked.
+// "From gallery" picker: the user's generated images (no videos), searchable by prompt, model or seed,
+// paginated with list_images and infinite scroll like the gallery. A General | Vault switch offers vault
+// images while unlocked; while locked the Vault side offers an inline unlock and shows nothing from the vault.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import * as api from "../../api";
 import { fileSrc, type ImageRecord } from "../../api";
 import { Dialog } from "../../components/Dialog";
@@ -16,33 +16,44 @@ const PAGE = 36;
 export function GalleryPicker({
   open,
   title = "Choose a start image",
+  purpose = "start",
   modelNames,
   onClose,
   onPick,
   preferVault = false,
+  currentId,
 }: {
   open: boolean;
   /** Start on the Vault source when it's available (Save to = Vault). */
   preferVault?: boolean;
   title?: string;
+  /** What the picked image becomes (labels only). */
+  purpose?: "start" | "reference";
   modelNames: Record<string, string>;
   onClose: () => void;
   onPick: (rec: ImageRecord) => void;
+  /** The record already in use: ringed, badged "Current" and listed first. */
+  currentId?: string;
 }) {
   const toast = useToast();
   const vault = useVault();
   const [source, setSource] = useState<"general" | "vault">("general");
   const fromVault = source === "vault" && vault.unlocked;
+  const vaultLockedView = source === "vault" && !vault.unlocked;
   const [items, setItems] = useState<ImageRecord[]>([]);
   const [loaded, setLoaded] = useState(0);
   const [nextBefore, setNextBefore] = useState<number | null>(null);
   const [hasMore, setHasMore] = useState(true);
   const [loading, setLoading] = useState(false);
   const [query, setQuery] = useState("");
+  const [password, setPassword] = useState("");
+  const [unlocking, setUnlocking] = useState(false);
+  const [unlockError, setUnlockError] = useState<string | null>(null);
   const loadingRef = useRef(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const sentinel = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  const passwordRef = useRef<HTMLInputElement>(null);
 
   const loadMore = useCallback(
     async (reset = false) => {
@@ -79,6 +90,8 @@ export function GalleryPicker({
     setLoaded(0);
     setNextBefore(null);
     setHasMore(true);
+    setPassword("");
+    setUnlockError(null);
     setSource(preferVault && unlockedRef.current ? "vault" : "general");
     void loadRef.current(true);
     // showModal() focuses the header's Close button; start in the search field instead.
@@ -86,31 +99,56 @@ export function GalleryPicker({
     return () => cancelAnimationFrame(h);
   }, [open]);
 
+  useEffect(() => {
+    if (vaultLockedView) requestAnimationFrame(() => passwordRef.current?.focus());
+  }, [vaultLockedView]);
+
+  const unlock = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!password || unlocking) return;
+    setUnlocking(true);
+    setUnlockError(null);
+    try {
+      await vault.unlock(password);
+      setPassword("");
+    } catch (err) {
+      const msg = api.errorMessage(err);
+      setUnlockError(msg.startsWith("WRONG_PASSWORD") ? "That password isn't right." : msg.replace(/^[A-Z_]+:\s*/, ""));
+    } finally {
+      setUnlocking(false);
+    }
+  };
+
   const q = query.trim().toLowerCase();
   const vaultImages = useMemo(() => (vault.unlocked ? vault.items.filter((r) => r.kind !== "video") : []), [vault.unlocked, vault.items]);
-  const pool = fromVault ? vaultImages : items;
-  const listHasMore = fromVault ? false : hasMore;
-  const shown = useMemo(
-    () => (q ? pool.filter((r) => r.prompt.toLowerCase().includes(q) || (modelNames[r.model] ?? r.model).toLowerCase().includes(q)) : pool),
-    [pool, q, modelNames],
-  );
+  const pool = fromVault ? vaultImages : vaultLockedView ? [] : items;
+  const listHasMore = fromVault || vaultLockedView ? false : hasMore;
+  const shown = useMemo(() => {
+    const hits = q
+      ? pool.filter((r) => r.prompt.toLowerCase().includes(q) || (modelNames[r.model] ?? r.model).toLowerCase().includes(q) || String(r.seed).includes(q))
+      : pool;
+    const cur = currentId ? hits.find((r) => r.id === currentId) : undefined;
+    return cur ? [cur, ...hits.filter((r) => r !== cur)] : hits;
+  }, [pool, q, modelNames, currentId]);
 
   // Infinite scroll; re-armed whenever a page arrives (a page may add nothing that matches).
   useEffect(() => {
     const el = sentinel.current;
-    if (!open || !el || !hasMore || fromVault) return;
+    if (!open || !el || !hasMore || source === "vault") return;
     const io = new IntersectionObserver((es) => es.some((e) => e.isIntersecting) && void loadRef.current(), {
       root: scrollRef.current,
       rootMargin: "400px 0px",
     });
     io.observe(el);
     return () => io.disconnect();
-  }, [open, hasMore, loaded, shown.length, fromVault]);
+  }, [open, hasMore, loaded, shown.length, source]);
+
+  const verb = purpose === "reference" ? "Add as reference" : "Use as start image";
 
   return (
     <Dialog open={open} onClose={onClose} title={title} className="picker">
       <div className="picker__bar">
-        {vault.unlocked && (
+        {vault.exists && (
           <div className="segmented picker__source" role="radiogroup" aria-label="Pick from">
             {(["general", "vault"] as const).map((src) => (
               <button
@@ -122,64 +160,119 @@ export function GalleryPicker({
                 className={source === src ? "is-selected" : ""}
                 onClick={() => setSource(src)}
               >
-                {src === "vault" && <Icon name="unlock" size={13} />}
-                {src === "general" ? "General" : "Vault"}
+                {src === "vault" && <Icon name={vault.unlocked ? "unlock" : "lock"} size={13} />}
+                {src === "general" ? "General" : vault.unlocked ? "Vault" : "Vault (locked)"}
               </button>
             ))}
           </div>
         )}
-        <div className="picker__search">
-          <Icon name="search" size={14} />
-          <input
-            className="input"
-            type="search"
-            placeholder="Search by prompt or model"
-            aria-label="Search your images by prompt or model"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            ref={searchRef}
-          />
-        </div>
-        <span className="hint mono">
-          {shown.length}
-          {listHasMore ? "+" : ""} {fromVault ? "vault " : ""}image{shown.length === 1 ? "" : "s"}
-        </span>
-      </div>
-      <div className="picker__scroll" ref={scrollRef}>
-        {shown.length > 0 && (
-          <ul className="picker__grid" aria-label={fromVault ? "Your vault images" : "Your images"}>
-            {shown.map((r) => (
-              <li key={r.id}>
-                <button
-                  type="button"
-                  className="tile picker__tile"
-                  onClick={() => onPick(r)}
-                  aria-label={`Use as start image${r.vault ? " (from the vault)" : ""}: ${r.prompt}`}
-                >
-                  <img src={fileSrc(r.thumbPath || r.path)} alt="" loading="lazy" decoding="async" />
-                  {r.vault && (
-                    <span className="tile__badge tile__badge--vault">
-                      <Icon name="lock" size={10} /> Vault
-                    </span>
-                  )}
-                  <span className="tile__overlay" aria-hidden>
-                    <span className="tile__prompt">{r.prompt}</span>
-                    <span className="tile__meta">
-                      {modelNames[r.model] ?? r.model} · {formatRelative(r.createdAt)}
-                    </span>
-                  </span>
-                </button>
-              </li>
-            ))}
-          </ul>
+        {!vaultLockedView && (
+          <div className="picker__search">
+            <Icon name="search" size={14} />
+            <input
+              className="input"
+              type="search"
+              placeholder="Search by prompt, model or seed"
+              aria-label="Search your images by prompt, model or seed"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              ref={searchRef}
+            />
+          </div>
         )}
-        {(fromVault || !loading) && shown.length === 0 && !listHasMore && (
-          <p className="picker__empty hint">
-            {q ? `No images match “${query.trim()}”.` : fromVault ? "No images in the vault yet." : "No images yet — generate one in Image mode first."}
-          </p>
+        {!vaultLockedView && (
+          <span className="hint mono">
+            {shown.length}
+            {listHasMore ? "+" : ""} {fromVault ? "vault " : ""}image{shown.length === 1 ? "" : "s"}
+          </span>
+        )}
+      </div>
+      {fromVault && (
+        <p className="hint picker__vault-note">
+          <Icon name="lock" size={12} /> Images made from a vault image are saved to the vault.
+        </p>
+      )}
+      <div className="picker__scroll" ref={scrollRef}>
+        {vaultLockedView ? (
+          <form className="picker__unlock" onSubmit={unlock}>
+            <Icon name="lock" size={22} />
+            <p>The vault is locked. Unlock it to pick from your vault images.</p>
+            <label className="visually-hidden" htmlFor="picker-vault-password">
+              Vault password
+            </label>
+            <div className="picker__unlock-row">
+              <input
+                id="picker-vault-password"
+                ref={passwordRef}
+                className="input"
+                type="password"
+                autoComplete="current-password"
+                placeholder="Vault password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                aria-invalid={!!unlockError || undefined}
+                aria-describedby={unlockError ? "picker-vault-err" : undefined}
+              />
+              <button type="submit" className="btn btn--primary" disabled={!password || unlocking}>
+                {unlocking ? <Icon name="refresh" className="spin" /> : <Icon name="unlock" />} Unlock
+              </button>
+            </div>
+            {unlockError && (
+              <p className="field-error" id="picker-vault-err" role="alert">
+                {unlockError}
+              </p>
+            )}
+          </form>
+        ) : (
+          shown.length > 0 && (
+            <ul className="picker__grid" aria-label={fromVault ? "Your vault images" : "Your images"}>
+              {shown.map((r) => {
+                const current = r.id === currentId;
+                return (
+                  <li key={r.id} className="picker__cell">
+                    <button
+                      type="button"
+                      className={`tile picker__tile ${current ? "is-current" : ""}`}
+                      onClick={() => onPick(r)}
+                      aria-label={`${verb}${r.vault ? " (from the vault)" : ""}${current ? " (current)" : ""}: ${r.prompt}, seed ${r.seed}, ${r.width}×${r.height}`}
+                      title={r.prompt}
+                    >
+                      <img src={fileSrc(r.thumbPath || r.path)} alt="" loading="lazy" decoding="async" />
+                      {r.vault && (
+                        <span className="tile__badge tile__badge--vault">
+                          <Icon name="lock" size={10} /> Vault
+                        </span>
+                      )}
+                      {current && <span className="tile__badge picker__current">Current</span>}
+                    </button>
+                    <span className="picker__caption" aria-hidden>
+                      <span className="picker__caption-prompt">{r.prompt}</span>
+                      <span className="mono">
+                        seed {r.seed} · {r.width}×{r.height} · {formatRelative(r.createdAt)}
+                      </span>
+                      <span>{modelNames[r.model] ?? r.model}</span>
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          )
+        )}
+        {!vaultLockedView && (fromVault || !loading) && shown.length === 0 && !listHasMore && (
+          <div className="picker__empty hint">
+            <p>{q ? `No images match “${query.trim()}”.` : fromVault ? "No images in the vault yet." : "No images yet — generate one in Image mode first."}</p>
+            {vault.exists && !vault.unlocked && source === "general" && (
+              <p>
+                Vault images aren't searched while the vault is locked.{" "}
+                <button type="button" className="link-btn" onClick={() => setSource("vault")}>
+                  Unlock vault
+                </button>
+              </p>
+            )}
+          </div>
         )}
         <div ref={sentinel} className="gallery__sentinel" aria-hidden />
-        {loading && !fromVault && (
+        {loading && source === "general" && (
           <div className="gallery__loading" role="status">
             <Icon name="refresh" className="spin" /> Loading…
           </div>

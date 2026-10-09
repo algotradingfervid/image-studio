@@ -115,6 +115,8 @@ export interface Settings {
   videoVolumeNames: string[];
   /** Vault auto-lock minutes (spec v6; same value as `VaultStatus.autoLockMinutes`). */
   vaultAutoLockMinutes?: number;
+  /** Path of the settings file (hand-edited keys: gpuTypes, videoGpuTypes, volumeNames, workerRef, podImage). */
+  settingsPath?: string;
 }
 
 export interface SaveSettingsInput {
@@ -162,7 +164,7 @@ export interface GpuState {
   /** True when an existing pod was found and re-adopted at app launch. */
   leftRunning: boolean;
   /** Set on "stopped": user pressed Stop, the app auto-stopped it, or the pod vanished. */
-  stopReason?: "user" | "idle" | "external" | null;
+  stopReason?: "user" | "idle" | "external" | "cancelled" | "finished" | null;
   /**
    * From the pod's /health watchdog: false means the pod can't terminate itself when
    * idle (only the app's auto-stop protects it). Absent when the pod doesn't report it.
@@ -364,6 +366,11 @@ export interface VaultStatus {
   itemCount: number | null;
   /** A started migration has items left (resumes on unlock). */
   migrationPending: boolean;
+  /**
+   * Length of the auto-lock period in ms, when it isn't `autoLockMinutes` × 60 s (the dev mock's
+   * ?fastLock). The UI's 30 s warning uses it; absent → autoLockMinutes × 60 000.
+   */
+  autoLockMs?: number;
 }
 
 export type MigrationPhase = "encrypting" | "verifying" | "cleaning" | "done" | "error";
@@ -436,6 +443,19 @@ export interface JobProgress {
   copyPercent?: number;
 }
 
+/**
+ * Additive (UX-014 / UX-047): the app stopped that profile's GPU because this job (cancelled
+ * before it ran) or task (finished) was the only thing it was started for. Emitted first with
+ * "stopping", then again with "stopped" — or "failed" (the GPU shows an error; Stop retries).
+ */
+export interface GpuRelease {
+  profile: GpuProfile;
+  state: "stopping" | "stopped" | "failed";
+  /** Approximate cost of the pod's run (USD), when its start time was known. */
+  costUsd?: number;
+  error?: string;
+}
+
 export interface Job {
   jobId: string;
   /** "video" for `generate_video` jobs; absent/"image" otherwise. */
@@ -449,6 +469,8 @@ export interface Job {
   error: string | null;
   /** Where the outputs go (spec v6). Absent from older cores → "general". */
   destination?: Destination;
+  /** Set on a cancelled job when the app stopped the GPU that was starting only for it. */
+  gpuRelease?: GpuRelease;
 }
 
 export type TaskStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
@@ -462,6 +484,24 @@ export interface Task {
   totalBytes: number;
   file: string | null;
   error: string | null;
+  /** Set when the app stopped the GPU because it was started only for this task. */
+  gpuRelease?: GpuRelease;
+}
+
+/** One key's check from `test_api_keys` (UX-017). */
+export interface KeyCheck {
+  ok: boolean;
+  /** "typed": the unsaved value given; "saved": the stored key. */
+  source: "typed" | "saved";
+  message: string;
+  /** The service couldn't be reached (the key may still be fine). */
+  network: boolean;
+}
+
+/** `test_api_keys`: null for a key that was neither given nor saved. */
+export interface KeyTestReport {
+  runpod: KeyCheck | null;
+  civitai: KeyCheck | null;
 }
 
 export interface EventMap {

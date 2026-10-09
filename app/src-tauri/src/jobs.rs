@@ -160,6 +160,10 @@ pub struct Job {
     pub progress: Option<JobProgress>,
     pub images: Vec<ImageRecord>,
     pub error: Option<String>,
+    /// Additive (UX-014): set on a cancelled job when the app stopped the GPU
+    /// that was starting only for it ("stopping", then "stopped"/"failed").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_release: Option<crate::pod::GpuRelease>,
 }
 
 pub struct JobEntry {
@@ -767,6 +771,7 @@ fn start_job(core: &Arc<Core>, plan: Plan) -> Result<String, String> {
         progress: None,
         images: vec![],
         error: None,
+        gpu_release: None,
     };
     let id = job.job_id.clone();
     core.jobs.lock().unwrap().insert(
@@ -796,9 +801,7 @@ fn start_job(core: &Arc<Core>, plan: Plan) -> Result<String, String> {
         };
         match client {
             Ok(client) => run_job(core2, id2, client, plan).await,
-            Err(_) if cancel_requested(&core2, &id2) => {
-                finish(&core2, &id2, JobState::Cancelled, None)
-            }
+            Err(_) if cancel_requested(&core2, &id2) => finish_cancelled(&core2, &id2, profile).await,
             Err(e) => finish(&core2, &id2, JobState::Failed, Some(e)),
         }
     });
@@ -862,6 +865,31 @@ fn finish(core: &Core, id: &str, status: JobState, error: Option<String>) {
 
 fn cancel_requested(core: &Core, id: &str) -> bool {
     core.jobs.lock().unwrap().get(id).is_some_and(|e| e.cancel)
+}
+
+/// A job cancelled before any of its work reached the GPU: reported
+/// Cancelled, and when it was the only reason that profile's pod was starting
+/// (or had just started), the pod is stopped through the checked terminate
+/// path and the job says so (`gpuRelease`, emitted again when confirmed).
+async fn finish_cancelled(core: &Arc<Core>, id: &str, profile: Profile) {
+    crate::pod::touch_for(core, profile);
+    // Out of the table first, so this job no longer counts as work on the pod.
+    let job = core.jobs.lock().unwrap().remove(id).map(|mut e| {
+        e.job.status = JobState::Cancelled;
+        e.job.error = None;
+        e.job.progress = None;
+        e.job
+    });
+    let Some(mut job) = job else { return };
+    let release = crate::pod::begin_release(core, profile, crate::pod::StopReason::Cancelled);
+    job.gpu_release = release
+        .as_ref()
+        .map(|r| r.note(crate::pod::ReleaseState::Stopping, None));
+    core.sink.job_update(&job);
+    if let Some(r) = release {
+        job.gpu_release = Some(crate::pod::finish_release_note(core, r).await);
+        core.sink.job_update(&job);
+    }
 }
 
 fn decode_b64(b64: &str) -> Option<Vec<u8>> {
@@ -1048,13 +1076,21 @@ async fn run_job(core: Arc<Core>, id: String, client: RunpodClient, plan: Plan) 
     for i in 0..subs.len() {
         if cancel_requested(&core, &id) {
             cancel_all(&client, &subs).await;
-            finish(&core, &id, JobState::Cancelled, None);
+            if i == 0 {
+                // Nothing ran yet: the pod may have been started only for this.
+                finish_cancelled(&core, &id, plan.kind.profile()).await;
+            } else {
+                finish(&core, &id, JobState::Cancelled, None);
+            }
             return;
         }
         let mut input = plan.template.clone();
         input["seed"] = json!(subs[i].seed);
         match client.run(input, plan.timeout_ms).await {
-            Ok(rp) => subs[i].rp_id = Some(rp),
+            Ok(rp) => {
+                subs[i].rp_id = Some(rp);
+                crate::pod::mark_served(&core, plan.kind.profile());
+            }
             Err(e) => {
                 if i == 0 {
                     finish(&core, &id, JobState::Failed, Some(e));

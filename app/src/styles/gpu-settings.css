@@ -1,0 +1,286 @@
+/* Agent E: GPU pills, Settings and Models (UX review fixes, 2026-10-09). Imported from
+   GpuPill.tsx, SettingsScreen.tsx and ModelsScreen.tsx. */
+
+/* ----------------------------------------------------------- header pills (UX-013/023) */
+
+.gpu-pill--stopped {
+  color: var(--text-3);
+  background: rgba(0, 0, 0, 0.25);
+}
+
+.gpu-pill--stopped .gpu-pill__profile {
+  color: var(--text-2);
+}
+
+.gpu-pill__idle,
+.gpu-pill__rate {
+  color: var(--text-2);
+}
+
+.gpu-total {
+  flex: none;
+  padding: 0 8px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid var(--line-2);
+  color: var(--text);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+/* Pills shrink (their text ellipsises at the end; the full status is in the tooltip)
+   instead of overflowing to the left. */
+.gpu-pills .gpu-pill--running,
+.gpu-pills .gpu-pill--starting {
+  flex-shrink: 1;
+}
+
+/* Narrower windows: the idle countdown moves to the tooltip first. */
+@media (max-width: 1640px) {
+  .gpu-pills .gpu-pill__idle {
+    display: none;
+  }
+}
+
+/* The starting pill keeps its short rate ("~$2.49/h"); the phase goes to the tooltip first. */
+@media (max-width: 1100px) {
+  .gpu-pills .gpu-pill--starting .gpu-pill__gpu,
+  .gpu-pills .gpu-pill__state {
+    display: none;
+  }
+}
+
+/* ------------------------------------------------------------ in-page section links (UX-045) */
+
+.section-nav {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px;
+  margin: -4px 0 0;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(6px);
+}
+
+.section-nav__link {
+  border: 0;
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 550;
+  padding: 4px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.section-nav__link:hover {
+  color: var(--text);
+  background: var(--panel-2);
+}
+
+.section-nav__link.is-active {
+  color: var(--accent-ink);
+  background: var(--accent);
+}
+
+.section-nav__link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+[id^="set-"],
+#models-image,
+#models-video,
+#lora-title {
+  scroll-margin-top: 64px;
+}
+
+/* -------------------------------------------------------------------------- settings */
+
+.input--invalid,
+.input[aria-invalid="true"]:not(:disabled) {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 1px var(--danger-soft);
+}
+
+.hint--warn {
+  color: var(--warn);
+}
+
+.note__warn {
+  color: var(--warn);
+}
+
+/* A disabled primary reads as disabled: grey outline, not muted orange (UX-028). */
+.settings .btn--primary:disabled,
+.settings-bar .btn--primary:disabled,
+.loras .btn--primary:disabled {
+  opacity: 1;
+  background: transparent;
+  color: var(--text-3);
+  border-color: var(--line-3);
+}
+
+/* .plain (styles.css, loaded after this file) would zero the padding/margin: out-rank it. */
+.plain.key-results {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: var(--r);
+  border: 1px solid var(--line-2);
+  background: var(--panel-2);
+}
+
+.key-results__row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  font-size: 13px;
+}
+
+.key-results__row.is-ok > .icon {
+  color: var(--ok);
+}
+
+.key-results__row.is-error > .icon {
+  color: var(--danger);
+}
+
+.config-rows {
+  display: grid;
+  grid-template-columns: minmax(130px, auto) minmax(0, 1fr);
+  gap: 10px 16px;
+  margin: 12px 0;
+}
+
+.config-rows dt {
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.config-rows dd {
+  margin: 0;
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  font-size: 13px;
+}
+
+.config-list {
+  margin: 0;
+  padding: 0 0 0 18px;
+  overflow-wrap: anywhere;
+}
+
+.config-list:not(.config-list--ordered) {
+  list-style: none;
+  padding-left: 0;
+  font-family: var(--mono);
+}
+
+.config-file__path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+@media (max-width: 640px) {
+  .config-rows {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* Unsaved-changes bar (UX-021). */
+.settings-bar {
+  position: sticky;
+  bottom: 12px;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 10px 8px 14px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--accent-line);
+  background: var(--panel-3);
+  box-shadow: var(--shadow-pop);
+  font-size: 13px;
+  font-weight: 550;
+}
+
+.settings-bar__dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--warn);
+  vertical-align: 1px;
+}
+
+.settings-bar__actions {
+  display: inline-flex;
+  gap: 6px;
+}
+
+/* ---------------------------------------------------------------- start confirmation */
+
+/* Out-ranks .plain (styles.css loads after this file and zeroes padding/margin). */
+.plain.start-gpu__details {
+  display: grid;
+  gap: 4px;
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border-radius: var(--r);
+  background: var(--panel-2);
+  font-size: 13px;
+}
+
+/* -------------------------------------------------------------------------- models */
+
+.model-panel.is-pulsing {
+  animation: model-pulse 1.5s var(--ease) 1;
+}
+
+@keyframes model-pulse {
+  0%,
+  100% {
+    box-shadow: var(--shadow);
+    border-color: var(--line);
+  }
+  25%,
+  60% {
+    box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow);
+    border-color: var(--accent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .model-panel.is-pulsing {
+    animation: none;
+    border-color: var(--accent);
+  }
+}
+
+/* Trigger-word chip remove targets: 24 × 24 (UX-064). */
+.loras .chip__x {
+  min-width: 24px;
+  min-height: 24px;
+}
+
+.btn-row--end-hint {
+  text-align: right;
+  margin-top: 4px;
+}

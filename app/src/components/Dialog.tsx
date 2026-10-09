@@ -30,6 +30,7 @@ export function Dialog({
   onKeyDown?: (e: KeyboardEvent<HTMLDialogElement>) => void;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
+  const downOnBackdrop = useRef(false);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
 
@@ -80,8 +81,16 @@ export function Dialog({
         onKeyDown?.(e);
         if (!e.defaultPrevented) trapTab(e);
       }}
+      aria-modal="true"
+      // Close on a full click on the backdrop (press and release both outside the box). Closing
+      // on mousedown let the release land on the page behind and click it (UX-065).
       onMouseDown={(e) => {
-        if (e.target === ref.current) onClose();
+        downOnBackdrop.current = e.target === ref.current;
+      }}
+      onClick={(e) => {
+        const wasDown = downOnBackdrop.current;
+        downOnBackdrop.current = false;
+        if (wasDown && e.target === ref.current) onClose();
       }}
     >
       {open && (

@@ -34,6 +34,8 @@ import { hashString, placeholderImage } from "./placeholder";
 import type {
   AddLoraInput,
   ConnectionTest,
+  KeyCheck,
+  KeyTestReport,
   DeletePreview,
   Destination,
   MigrationProgress,
@@ -98,7 +100,8 @@ const settings: Settings = {
     ? { hasApiKey: false, endpointId: null, hasCivitaiKey: false }
     : { hasApiKey: true, endpointId: "abc123mockendpoint", hasCivitaiKey: true }),
   idleMinutes: 30,
-  backend: params.has("serverless") ? "serverless" : "pod",
+  // Serverless was removed (UX-016): like the core, a legacy ?serverless still runs as the pod backend.
+  backend: "pod",
   gpuType: GPU_TYPE,
   gpuTypes: [GPU_TYPE, "NVIDIA RTX PRO 4500 Blackwell", "NVIDIA GeForce RTX 4090", "NVIDIA RTX PRO 4000 Blackwell"],
   volumeNames: ["image-studio-models"],
@@ -291,6 +294,9 @@ const gpus: Record<GpuProfile, GpuState> = {
 // Bumped on every start/stop so a stale start sequence gives up.
 const gpuRun: Record<GpuProfile, number> = { image: 0, video: 0 };
 const lastActivity: Record<GpuProfile, number> = { image: Date.now(), video: Date.now() };
+/** Like the Rust core (UX-014/047): why each pod was started, and whether a generation ran on it. */
+const gpuOrigin: Record<GpuProfile, "user" | "job" | "task" | null> = { image: null, video: null };
+const gpuServed: Record<GpuProfile, boolean> = { image: false, video: false };
 
 const podMode = () => settings.backend === "pod";
 const asProfile = (v: unknown): GpuProfile => (v === "video" ? "video" : "image");
@@ -312,9 +318,14 @@ const mockStats = {
 };
 (window as unknown as { mockStats: typeof mockStats }).mockStats = mockStats;
 
-function startGpuInternal(p: GpuProfile) {
+function startGpuInternal(p: GpuProfile, origin: "user" | "job" | "task" = "job") {
   const gpu = gpus[p];
-  if (gpu.status === "starting" || gpu.status === "running" || gpu.status === "stopping") return;
+  if (gpu.status === "starting" || gpu.status === "running" || gpu.status === "stopping") {
+    if (origin === "user" && gpu.status !== "stopping") gpuOrigin[p] = "user";
+    return;
+  }
+  gpuOrigin[p] = origin;
+  gpuServed[p] = false;
   mockStats.gpuStarts[p]++;
   console.info(`[mock] Starting the ${p} GPU pod (start #${mockStats.gpuStarts[p]})`);
   const run = ++gpuRun[p];
@@ -345,7 +356,43 @@ function startGpuInternal(p: GpuProfile) {
   })();
 }
 
-async function stopGpuInternal(p: GpuProfile, reason: "user" | "idle" | "external") {
+/**
+ * Like the Rust core's `begin_release`: stop a pod started for a job/task when that work is gone
+ * (nothing else on the profile, no generation ran on it). Returns the stop promise, or null.
+ */
+function releaseGpu(p: GpuProfile, reason: "cancelled" | "finished"): { costUsd?: number; done: Promise<boolean> } | null {
+  const g = gpus[p];
+  if (!podMode() && p === "image") return null;
+  if (g.status !== "starting" && g.status !== "running") return null;
+  if (gpuOrigin[p] !== "job" && gpuOrigin[p] !== "task") return null;
+  if (gpuServed[p]) return null;
+  const busy =
+    [...activeJobs.values()].some((j) => jobProfile(j) === p) ||
+    [...modelTasks.values(), ...loraTasks.values()].some((t) => taskLive(t) && taskProfile(t) === p);
+  if (busy) return null;
+  const started = g.startedAt ? Date.parse(g.startedAt) : null;
+  const costUsd = started ? ((Date.now() - started) / 3_600_000) * (g.costPerHr ?? GPU_COST) : undefined;
+  console.info(`[mock] Stopping the ${p} GPU: nothing uses the pod it was started for (${reason})`);
+  const done = stopGpuInternal(p, reason).then(
+    () => true,
+    () => false,
+  );
+  return { costUsd, done };
+}
+
+/** Cancelled job / ended task: release the GPU and say so on it (two events, like the core). */
+function releaseFor<T extends Job | Task>(item: T, p: GpuProfile, reason: "cancelled" | "finished", event: "job-update" | "task-update") {
+  const rel = releaseGpu(p, reason);
+  if (!rel) return;
+  item.gpuRelease = { profile: p, state: "stopping", costUsd: rel.costUsd };
+  emit(event, item as never);
+  void rel.done.then((ok) => {
+    item.gpuRelease = { profile: p, state: ok ? "stopped" : "failed", costUsd: rel.costUsd, ...(ok ? {} : { error: gpus[p].error ?? "Couldn't stop the GPU" }) };
+    emit(event, { ...item } as never);
+  });
+}
+
+async function stopGpuInternal(p: GpuProfile, reason: "user" | "idle" | "external" | "cancelled" | "finished") {
   const status = () => gpus[p].status;
   if (status() === "stopped") return;
   if (status() === "stopping") {
@@ -380,11 +427,11 @@ const quitNeedsConfirm = () => podMode() && PROFILES.some((p) => mayBill(gpus[p]
  * Pod backend: make sure the profile's GPU is running, auto-starting it when stopped (like the Rust core).
  * `onPhase` sees each boot phase; resolves once running, throws if it ends stopped/in error.
  */
-async function ensureGpuReady(p: GpuProfile, onPhase?: (phase: string) => void, aborted?: () => boolean) {
+async function ensureGpuReady(p: GpuProfile, onPhase?: (phase: string) => void, aborted?: () => boolean, origin: "job" | "task" = "job") {
   const status = () => gpus[p].status;
   if (!podMode() || status() === "running") return;
   while (status() === "stopping") await sleep(100);
-  startGpuInternal(p);
+  startGpuInternal(p, origin);
   let last: string | null = null;
   while (status() === "starting" && !aborted?.()) {
     const phase = gpus[p].phase;
@@ -456,13 +503,19 @@ function computeDelete(id: string): DeletePreview {
   const deleteFiles: string[] = [];
   const keptFiles: KeptFile[] = [];
   let freedBytes = 0;
+  // Like the core (UX-043): files a queued/running delete will remove already count as gone,
+  // and only downloads keep a shared file busy.
+  const pendingDeletes = new Set<string>();
+  for (const t of modelTasks.values())
+    if (t.kind === "delete" && (t.status === "queued" || t.status === "running")) for (const fn of (t.file ?? "").split(", ")) if (fn) pendingDeletes.add(fn);
+  const onVolume = (fn: string) => present.has(fn) && !pendingDeletes.has(fn);
   for (const f of m.files) {
-    if (!present.has(f.filename)) continue;
+    if (!onVolume(f.filename)) continue;
     const others = models.filter((y) => y.id !== id && y.files.some((g) => g.filename === f.filename));
     const blocking = others.filter((y) => {
-      const otherFilesPresent = y.files.some((g) => g.filename !== f.filename && present.has(g.filename));
+      const otherFilesPresent = y.files.some((g) => g.filename !== f.filename && onVolume(g.filename));
       const t = modelTasks.get(y.id);
-      const busy = !!t && (t.status === "queued" || t.status === "running");
+      const busy = !!t && t.kind === "download" && (t.status === "queued" || t.status === "running");
       return otherFilesPresent || busy;
     });
     if (blocking.length === 0) {
@@ -471,7 +524,7 @@ function computeDelete(id: string): DeletePreview {
     } else {
       const y = blocking[0];
       const t = modelTasks.get(y.id);
-      const busy = !!t && (t.status === "queued" || t.status === "running");
+      const busy = !!t && t.kind === "download" && (t.status === "queued" || t.status === "running");
       keptFiles.push({
         filename: f.filename,
         reason: busy ? `Shared with ${y.name}, which is downloading` : `Shared with ${y.name}, which is still installed`,
@@ -491,7 +544,7 @@ async function runDownloadTask(task: Task, files: { filename: string; sizeBytes:
   const total = files.reduce((a, f) => a + f.sizeBytes, 0);
   task.totalBytes = total;
   try {
-    await ensureGpuReady(taskProfile(task), undefined, () => taskCancel.has(task.taskId)); // stays "queued" while the GPU starts
+    await ensureGpuReady(taskProfile(task), undefined, () => taskCancel.has(task.taskId), "task"); // stays "queued" while the GPU starts
   } catch (e) {
     return finishTask(task, "failed", e instanceof Error ? e.message : String(e));
   }
@@ -520,6 +573,7 @@ function finishTask(task: Task, status: Task["status"], error: string | null = n
   task.status = status;
   task.error = error;
   emit("task-update", task);
+  releaseFor(task, taskProfile(task), "finished", "task-update");
   // Like the Rust core: refresh the status cache after a download/delete finishes.
   if (status === "completed") {
     const p = taskProfile(task);
@@ -745,6 +799,7 @@ const vaultStatus = (): VaultStatus => ({
   autoLockMinutes: vault.autoLockMinutes,
   itemCount: vault.unlocked ? vault.items.length : null,
   migrationPending: vault.migrating && !vault.unlocked,
+  autoLockMs: vault.autoLockMinutes * VAULT_MINUTE_MS,
 });
 
 function emitVault() {
@@ -1019,9 +1074,13 @@ async function runJob(jobId: string, input: GenerateInput) {
     } catch (e) {
       return stop("failed", e instanceof Error ? e.message : String(e));
     }
-    if (cancelled()) return stop("cancelled");
+    if (cancelled()) {
+      stop("cancelled");
+      return releaseFor(job, "image", "cancelled", "job-update");
+    }
     job.progress = null;
   }
+  if (!cancelled()) gpuServed.image = true;
   await sleep(300);
 
   for (let k = 0; k < input.count; k++) {
@@ -1199,9 +1258,13 @@ async function runVideoJob(jobId: string, input: GenerateVideoInput) {
     } catch (e) {
       return stop("failed", e instanceof Error ? e.message : String(e));
     }
-    if (cancelled()) return stop("cancelled");
+    if (cancelled()) {
+      stop("cancelled");
+      return releaseFor(job, "video", "cancelled", "job-update");
+    }
     job.progress = null;
   }
+  if (!cancelled()) gpuServed.video = true;
   await sleep(300);
   if (cancelled()) return stop("cancelled");
   const delayMs = Date.now() - queuedAt;
@@ -1239,7 +1302,7 @@ async function runVideoJob(jobId: string, input: GenerateVideoInput) {
 type Handler = (args: Record<string, unknown>) => unknown | Promise<unknown>;
 
 const commands: Record<string, Handler> = {
-  get_settings: () => ({ ...settings, vaultAutoLockMinutes: vault.autoLockMinutes }),
+  get_settings: () => ({ ...settings, vaultAutoLockMinutes: vault.autoLockMinutes, settingsPath: "~/Library/Application Support/com.naren.imagestudio/settings.json" }),
   save_settings: async (a) => {
     const i = a as SaveSettingsInput;
     await sleep(250);
@@ -1248,13 +1311,37 @@ const commands: Record<string, Handler> = {
     if (i.apiKey !== undefined) settings.hasApiKey = i.apiKey.length > 0;
     if (i.endpointId !== undefined) settings.endpointId = i.endpointId.trim() || null;
     if (i.civitaiKey !== undefined) settings.hasCivitaiKey = i.civitaiKey.length > 0;
-    if (i.backend !== undefined) settings.backend = i.backend;
+    // The backend is no longer a choice (UX-016): always the pod.
     if (i.passApiKeyToPod !== undefined) settings.passApiKeyToPod = i.passApiKeyToPod;
     if (i.idleMinutes !== undefined) {
       settings.idleMinutes = i.idleMinutes;
       for (const p of PROFILES) setGpu(p, { idleMinutes: i.idleMinutes });
     }
     return { ...settings };
+  },
+  reveal_settings_file: () => {
+    const path = "~/Library/Application Support/com.naren.imagestudio/settings.json";
+    console.info(`[mock] Would show ${path} in Finder.`);
+    return path;
+  },
+  test_api_keys: async (a): Promise<KeyTestReport> => {
+    await sleep(700);
+    // Dev mock: a key containing "invalid"/"bad" is rejected; "offline" can't be reached.
+    const check = (typed: unknown, saved: boolean, service: "runpod" | "civitai"): KeyCheck | null => {
+      const t = typeof typed === "string" ? typed.trim() : "";
+      if (!t && !saved) return null;
+      const source = t ? "typed" : "saved";
+      if (/offline/i.test(t)) return { ok: false, source, network: true, message: `Couldn't reach ${service === "runpod" ? "RunPod" : "Civitai"}: connection refused (mock)` };
+      if (/invalid|bad/i.test(t))
+        return {
+          ok: false,
+          source,
+          network: false,
+          message: service === "runpod" ? "RunPod rejected this key — check RunPod → Settings → API Keys" : "Civitai rejected this key — check civitai.com → Account settings → API keys",
+        };
+      return { ok: true, source, network: false, message: service === "civitai" ? "Key OK (signed in as mock-user)" : "Key OK" };
+    };
+    return { runpod: check(a.apiKey, settings.hasApiKey, "runpod"), civitai: check(a.civitaiKey, settings.hasCivitaiKey, "civitai") };
   },
   test_connection: async (): Promise<ConnectionTest> => {
     await sleep(900);
@@ -1285,7 +1372,7 @@ const commands: Record<string, Handler> = {
     const p = asProfile(a.profile);
     if (!settings.hasApiKey) throw new Error("RunPod API key is not set. Add it in Settings.");
     await sleep(200);
-    startGpuInternal(p);
+    startGpuInternal(p, "user");
     return { ...gpus[p] };
   },
   stop_gpu: async (a) => {
@@ -1311,10 +1398,11 @@ const commands: Record<string, Handler> = {
   refresh_status: async (a) => {
     const p = asProfile(a.profile);
     requireConfigured();
-    await ensureGpuReady(p);
+    await ensureGpuReady(p, undefined, undefined, "task");
     await sleep(2200);
     checkedAt[p] = Date.now();
     emitStatus(p);
+    releaseGpu(p, "finished"); // a pod started only for this Refresh stops again
     return snapshot(p);
   },
   get_status: (a) => snapshot(asProfile(a.profile)),
@@ -1349,7 +1437,7 @@ const commands: Record<string, Handler> = {
     modelTasks.set(id, task);
     void (async () => {
       try {
-        await ensureGpuReady(taskProfile(task), undefined, () => taskCancel.has(task.taskId));
+        await ensureGpuReady(taskProfile(task), undefined, () => taskCancel.has(task.taskId), "task");
       } catch (e) {
         return finishTask(task, "failed", e instanceof Error ? e.message : String(e));
       }
@@ -1416,7 +1504,13 @@ const commands: Record<string, Handler> = {
     const i = a as unknown as AddLoraInput;
     await sleep(300);
     const name = i.name?.trim() || i.url.split("/").pop()?.replace(/\.safetensors$/, "") || "LoRA";
-    const filename = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "_")}.safetensors`;
+    // Like the core: the file keeps the resolved name (the Name is only a label), names are
+    // at most 60 characters, and the same file can't be added twice for one model.
+    if (name.length > 60) throw new Error("Keep the name to 60 characters or fewer");
+    const resolved = (await commands.resolve_lora_link({ url: i.url })) as ResolvedLora;
+    const filename = resolved.filename;
+    const dup = loras.find((x) => x.modelId === i.modelId && x.filename === filename);
+    if (dup) throw new Error(`Already in your library as “${dup.name}” for this model (same file ${filename})`);
     const l = {
       id: uid("lora"),
       name,
@@ -1439,12 +1533,13 @@ const commands: Record<string, Handler> = {
     if (!loras.some((l) => l.id === a.id)) throw new Error("LoRA not found");
     const t = loraTasks.get(String(a.id));
     if (t) taskCancel.add(t.taskId);
-    await ensureGpuReady("image");
+    await ensureGpuReady("image", undefined, undefined, "task");
     await sleep(500);
     const idx = loras.findIndex((l) => l.id === a.id);
     if (idx < 0) throw new Error("LoRA not found");
     loraFiles.delete(loras[idx].filename);
     loras.splice(idx, 1);
+    releaseGpu("image", "finished"); // a pod started only for this delete stops again
     return null; // removed immediately
   },
 
@@ -1561,11 +1656,14 @@ const commands: Record<string, Handler> = {
     if (String(a.oldPassword ?? "") !== vault.password) throw new Error("WRONG_PASSWORD: The current password is incorrect.");
     const next = String(a.newPassword ?? "");
     if (next.length < 8) throw new Error("WEAK_PASSWORD: Use at least 8 characters.");
+    if (next === vault.password) throw new Error("SAME_PASSWORD: Choose a password different from the current one");
     vault.password = next;
     emitVault();
     return vaultStatus();
   },
   vault_set_auto_lock: async (a) => {
+    // Like the core: only while unlocked.
+    if (!vault.unlocked) throw new Error("VAULT_LOCKED: Unlock the vault to change its auto-lock time");
     const n = Number(a.minutes);
     if (!Number.isInteger(n) || n < 1 || n > 240) throw new Error("Auto-lock must be between 1 and 240 minutes.");
     await sleep(150);

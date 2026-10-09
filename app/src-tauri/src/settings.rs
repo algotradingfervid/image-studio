@@ -193,8 +193,10 @@ pub fn resolve(primary: Option<String>, fallback: Option<&String>) -> Option<Str
         .map(|s| s.trim().to_string())
 }
 
-/// Where worker jobs run: the dedicated GPU pod (default since v3) or the
-/// legacy serverless endpoint.
+/// Where worker jobs run: always the dedicated GPU pod. The legacy
+/// serverless backend was removed (UX-016); `Serverless` only remains so a
+/// settings file that still says `"backend": "serverless"` loads without
+/// error — it is treated as `Pod` and dropped on the next save.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
@@ -336,8 +338,9 @@ impl Settings {
         )
     }
 
+    /// Always `Pod`: a stored legacy `serverless` is treated as the pod backend.
     pub fn backend(&self) -> Backend {
-        self.config.lock().unwrap().backend.unwrap_or_default()
+        Backend::Pod
     }
 
     pub fn idle_minutes(&self) -> u32 {
@@ -458,6 +461,21 @@ impl Settings {
         Ok(token)
     }
 
+    /// Where the settings file lives (for "Open settings file").
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+
+    /// Writes the current settings file if it doesn't exist yet, so it can be
+    /// revealed and hand-edited (workerRef, gpuTypes, …).
+    pub fn ensure_config_file(&self) -> Result<PathBuf, String> {
+        if !self.config_path.exists() {
+            let cfg = self.config.lock().unwrap();
+            self.write_config(&cfg)?;
+        }
+        Ok(self.config_path.clone())
+    }
+
     fn write_config(&self, cfg: &AppConfig) -> Result<(), String> {
         if let Some(dir) = self.config_path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("Could not save settings: {e}"))?;
@@ -485,9 +503,8 @@ impl Settings {
             return Ok(());
         }
         let mut cfg = self.config.lock().unwrap();
-        if let Some(b) = s.backend {
-            cfg.backend = Some(b);
-        }
+        // The backend is no longer a choice: any save drops a legacy value.
+        cfg.backend = None;
         if let Some(m) = s.idle_minutes {
             cfg.idle_minutes = Some(m);
         }
@@ -665,7 +682,7 @@ mod tests {
         .unwrap();
         let r = Settings::new(store.clone(), HashMap::new(), path);
         assert_eq!(r.idle_minutes(), 45);
-        assert_eq!(r.backend(), Backend::Serverless);
+        assert_eq!(r.backend(), Backend::Pod, "serverless was removed: saving it keeps the pod backend");
         assert!(!r.pass_api_key_to_pod());
         assert_eq!(r.gpu_types(), vec!["G1".to_string()]);
         assert_eq!(r.volume_names().len(), DEFAULT_VOLUME_NAMES.len(), "empty list → defaults");
@@ -674,6 +691,25 @@ mod tests {
         assert_eq!(t.len(), 64);
         assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(r.pod_token().unwrap(), t, "generated once, then reused");
+    }
+
+    #[test]
+    fn legacy_serverless_setting_loads_as_pod() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        std::fs::write(&path, r#"{"backend": "serverless", "endpointId": "ep1", "idleMinutes": 45}"#).unwrap();
+        let store = Arc::new(MemoryStore::default());
+        let s = Settings::new(store.clone(), HashMap::new(), path.clone());
+        assert_eq!(s.backend(), Backend::Pod);
+        assert_eq!(s.idle_minutes(), 45, "the rest of the file still loads");
+        s.save_pod(SavePodSettings {
+            idle_minutes: Some(50),
+            ..Default::default()
+        })
+        .unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(!body.contains("serverless"), "{body}");
+        assert_eq!(Settings::new(store, HashMap::new(), path).idle_minutes(), 50);
     }
 
     #[test]

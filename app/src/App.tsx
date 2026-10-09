@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { inTauri, isConfigured } from "./api";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { GpuPills } from "./components/GpuPill";
@@ -10,7 +10,7 @@ import { SettingsScreen } from "./screens/settings/SettingsScreen";
 import { GpuProvider, PROFILE_LABEL, PROFILES, useGpu } from "./state/gpu";
 import { LibraryProvider, useLibrary } from "./state/library";
 import { ToastProvider } from "./state/toast";
-import { VaultProvider } from "./state/vault";
+import { useVault, VaultProvider } from "./state/vault";
 
 export type Tab = "create" | "models" | "settings";
 
@@ -20,8 +20,24 @@ const TABS: { id: Tab; label: string; icon: IconName; key: string }[] = [
   { id: "settings", label: "Settings", icon: "gear", key: "3" },
 ];
 
+const TAB_KEY = "imagestudio.tab";
+
+/** `#models` / `#settings` in the address, else the tab open at the last quit (UX-058). */
+function initialTab(): Tab {
+  const fromHash = window.location.hash.slice(1);
+  if (TABS.some((t) => t.id === fromHash)) return fromHash as Tab;
+  try {
+    const saved = window.localStorage.getItem(TAB_KEY);
+    if (TABS.some((t) => t.id === saved)) return saved as Tab;
+  } catch {
+    // Storage blocked: start on Create.
+  }
+  return "create";
+}
+
 function Shell() {
-  const [tab, setTab] = useState<Tab>("create");
+  const [tab, setTabState] = useState<Tab>(initialTab);
+  const vault = useVault();
   const lib = useLibrary();
   const s = lib.settings;
   const needsSetup = !!s && !isConfigured(s);
@@ -35,6 +51,39 @@ function Shell() {
       return !keptPods.has(x.profile) && !!g?.leftRunning && (g.status === "running" || g.status === "starting");
     });
   const activeDownloads = lib.models.filter((m) => m.task && (m.task.status === "running" || m.task.status === "queued")).length;
+
+  // Each tab has an address: switching pushes a history entry (Back returns to the previous
+  // tab), reload reopens it, and the choice survives relaunch.
+  const setTab = useCallback((next: Tab) => {
+    setTabState(next);
+    if (window.location.hash.slice(1) !== next) {
+      const url = `${window.location.pathname}${window.location.search}#${next}`;
+      window.history.pushState(null, "", url);
+    }
+  }, []);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(TAB_KEY, tab);
+    } catch {
+      // Storage blocked: the hash still keeps the tab for this session.
+    }
+  }, [tab]);
+  useEffect(() => {
+    if (window.location.hash.slice(1) !== tab) {
+      window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#${tab}`);
+    }
+    const onHash = () => {
+      const h = window.location.hash.slice(1);
+      setTabState(TABS.some((t) => t.id === h) ? (h as Tab) : "create");
+    };
+    window.addEventListener("popstate", onHash);
+    window.addEventListener("hashchange", onHash);
+    return () => {
+      window.removeEventListener("popstate", onHash);
+      window.removeEventListener("hashchange", onHash);
+    };
+    // Mount only: later tab changes write the hash in setTab.
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -59,14 +108,14 @@ function Shell() {
       window.removeEventListener("dragover", stop);
       window.removeEventListener("drop", stop);
     };
-  }, []);
+  }, [setTab]);
 
   return (
     <div className="app">
       <header className="toolbar" data-tauri-drag-region>
         <div className="brand" data-tauri-drag-region>
           <span className="brand__mark" aria-hidden />
-          <span className="brand__name">Image Studio</span>
+          <span className="brand__name" title="Image Studio">Image Studio</span>
           {!inTauri && <span className="badge badge--mock" title="Running in a browser with the in-memory mock">Dev mock</span>}
         </div>
         <nav
@@ -93,12 +142,28 @@ function Shell() {
               title={`${t.label} (⌘${t.key})`}
             >
               <Icon name={t.icon} />
-              {t.label}
+              <span className="tab__label">{t.label}</span>
               {t.id === "models" && activeDownloads > 0 && <span className="tab__dot" aria-label={`${activeDownloads} downloading`} />}
             </button>
           ))}
         </nav>
         <div className="toolbar__end" data-tauri-drag-region>
+          {vault.unlocked && (
+            <div className="vault-pill" role="status" aria-label="Vault unlocked">
+              <Icon name="lockOpen" size={13} />
+              <span className="vault-pill__text">
+                Vault<span className="vault-pill__more"> unlocked</span>
+              </span>
+              <button
+                type="button"
+                className="btn btn--sm vault-pill__btn"
+                onClick={() => void vault.lock()}
+                title="Lock the vault now — its items disappear until you unlock"
+              >
+                <Icon name="lock" size={13} /> Lock
+              </button>
+            </div>
+          )}
           <GpuPills />
         </div>
       </header>
@@ -107,7 +172,7 @@ function Shell() {
         <div className="banner" role="status">
           <Icon name="key" />
           <span>
-            {!s?.hasApiKey ? "Add your RunPod API key" : "Add your RunPod endpoint ID (serverless backend)"} to start generating.
+            Add your RunPod API key to start generating.
           </span>
           {tab !== "settings" && (
             <button type="button" className="link-btn" onClick={() => setTab("settings")}>

@@ -38,6 +38,9 @@ const paths: Record<string, string> = {
   search: "M9 15a6 6 0 1 0 0-12 6 6 0 0 0 0 12ZM13.5 13.5 17 17",
   globe: "M10 17.5a7.5 7.5 0 1 0 0-15 7.5 7.5 0 0 0 0 15ZM2.5 10h15M10 2.5c2 2 3 4.5 3 7.5s-1 5.5-3 7.5c-2-2-3-4.5-3-7.5s1-5.5 3-7.5Z",
   cloud: "M6 15.5h8.5a3.5 3.5 0 0 0 .4-7A5 5 0 0 0 5.2 9.6 3 3 0 0 0 6 15.5Z",
+  /** Clearly open padlock (shackle lifted off the body). */
+  lockOpen: "M5.5 9.5h9v7.5h-9zM7.5 9.5V5a2.5 2.5 0 0 1 5 0v1.2",
+  undo: "M7 5.5 3.5 9 7 12.5M3.5 9h8a4.5 4.5 0 0 1 0 9H9",
 };
 
 export type IconName = keyof typeof paths;

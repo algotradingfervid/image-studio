@@ -16,7 +16,7 @@
         "title": "Image Studio",
         "width": 1400,
         "height": 900,
-        "minWidth": 1100,
+        "minWidth": 800,
         "minHeight": 720
       }
     ],

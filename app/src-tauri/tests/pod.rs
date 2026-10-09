@@ -26,13 +26,16 @@ const REST_TIMEOUT: Duration = Duration::from_secs(1);
 #[derive(Default)]
 struct Collect {
     jobs: Mutex<Vec<Job>>,
+    tasks: Mutex<Vec<Task>>,
     gpu: Mutex<Vec<GpuState>>,
 }
 impl EventSink for Collect {
     fn job_update(&self, j: &Job) {
         self.jobs.lock().unwrap().push(j.clone());
     }
-    fn task_update(&self, _: &Task) {}
+    fn task_update(&self, t: &Task) {
+        self.tasks.lock().unwrap().push(t.clone());
+    }
     fn status_update(&self, _: &StatusView) {}
     fn gpu_update(&self, g: &GpuState) {
         self.gpu.lock().unwrap().push(g.clone());
@@ -513,6 +516,7 @@ async fn auto_stops_after_idle_minutes() {
         progress: None,
         images: vec![],
         error: None,
+        gpu_release: None,
     };
     h.core
         .jobs
@@ -1100,4 +1104,435 @@ async fn stop_during_an_ambiguous_create_still_catches_a_late_pod() {
     assert_eq!(sim.deletes(), vec!["late"]);
     assert!(sim.pod_ids().is_empty());
     assert_eq!(sim.posts(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Automatic stop when the work a pod was started for goes away (UX-014, UX-047).
+
+use app_lib::pod::{ReleaseState, StartOrigin};
+use app_lib::tasks::{self, TaskStatus};
+use std::sync::atomic::AtomicBool;
+
+fn image_job() -> GenerateRequest {
+    GenerateRequest {
+        model: "zimage".into(),
+        prompt: "a cube".into(),
+        aspect_ratio: "1:1".into(),
+        count: 1,
+        seed: Some(1),
+        ..Default::default()
+    }
+}
+
+/// A pod that is created but never gets past PROVISIONING (a long cold start).
+async fn slow_start_server(server: &MockServer) -> Sim {
+    mount_volumes(server).await;
+    let sim = Sim::new(&["pod1", "pod2", "pod3"], "PROVISIONING");
+    sim.mount(server).await;
+    sim
+}
+
+async fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
+    for _ in 0..500 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+fn last_job(h: &Harness, id: &str) -> Option<Job> {
+    h.sink.jobs.lock().unwrap().iter().rev().find(|j| j.job_id == id).cloned()
+}
+
+#[tokio::test]
+async fn cancelling_the_only_job_while_the_pod_starts_stops_the_pod() {
+    let server = MockServer::start().await;
+    let sim = slow_start_server(&server).await;
+    let h = harness(&server, Some("t"), Duration::from_secs(30));
+    let id = jobs::generate(&h.core, image_job()).unwrap();
+    // The pod exists (created, billing) and is still starting.
+    wait_until("the pod to be created", || pod::state(&h.core).pod_id.as_deref() == Some("pod1")).await;
+    assert_eq!(pod::state(&h.core).status, GpuStatus::Starting);
+    jobs::cancel_job(&h.core, &id).unwrap();
+
+    let s = wait_for(&h.core, GpuStatus::Stopped).await;
+    assert_eq!(s.stop_reason, Some(StopReason::Cancelled));
+    assert_eq!(s.pod_id, None);
+    assert_eq!(stored_pod_id(&h.core), None);
+    assert_eq!(sim.deletes(), vec!["pod1"], "terminated through the checked path");
+    assert!(sim.pod_ids().is_empty(), "no orphan pod left");
+    assert_eq!(sim.posts(), 1);
+    // The job says so: first "stopping", then "stopped".
+    wait_until("the job's final GPU note", || {
+        last_job(&h, &id).and_then(|j| j.gpu_release).is_some_and(|r| r.state == ReleaseState::Stopped)
+    })
+    .await;
+    let notes: Vec<ReleaseState> = h
+        .sink
+        .jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|j| j.job_id == id)
+        .filter_map(|j| j.gpu_release.as_ref().map(|r| r.state))
+        .collect();
+    assert_eq!(notes, vec![ReleaseState::Stopping, ReleaseState::Stopped]);
+    let j = last_job(&h, &id).unwrap();
+    assert_eq!(j.status, JobState::Cancelled);
+    assert!(j.gpu_release.unwrap().cost_usd.is_some());
+    assert!(!pod::needs_quit_confirm(&h.core));
+}
+
+#[tokio::test]
+async fn cancelling_before_the_pod_exists_leaves_no_orphan_pod() {
+    let server = MockServer::start().await;
+    let sim = slow_start_server(&server).await;
+    let h = harness(&server, Some("t"), Duration::from_secs(30));
+    let id = jobs::generate(&h.core, image_job()).unwrap();
+    jobs::cancel_job(&h.core, &id).unwrap();
+    wait_until("the job to end", || last_job(&h, &id).is_some_and(|j| j.status == JobState::Cancelled)).await;
+    wait_for(&h.core, GpuStatus::Stopped).await;
+    // A create still in flight when the stop began is cleaned up too.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(pod::state(&h.core).status, GpuStatus::Stopped);
+    assert!(sim.pod_ids().is_empty(), "no pod left: {:?}", sim.pod_ids());
+    assert_eq!(stored_pod_id(&h.core), None);
+}
+
+#[tokio::test]
+async fn cancelling_keeps_a_pod_the_user_started() {
+    let server = MockServer::start().await;
+    let sim = slow_start_server(&server).await;
+    let h = harness(&server, Some("t"), Duration::from_secs(30));
+    pod::start(&h.core).unwrap();
+    let id = jobs::generate(&h.core, image_job()).unwrap();
+    wait_until("the pod to be created", || pod::state(&h.core).pod_id.is_some()).await;
+    jobs::cancel_job(&h.core, &id).unwrap();
+    wait_until("the job to end", || last_job(&h, &id).is_some_and(|j| j.status == JobState::Cancelled)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(pod::state(&h.core).status, GpuStatus::Starting);
+    assert!(last_job(&h, &id).unwrap().gpu_release.is_none());
+    assert!(sim.deletes().is_empty());
+}
+
+#[tokio::test]
+async fn a_users_start_takes_over_a_pod_starting_for_a_job() {
+    let server = MockServer::start().await;
+    let sim = slow_start_server(&server).await;
+    let h = harness(&server, Some("t"), Duration::from_secs(30));
+    let id = jobs::generate(&h.core, image_job()).unwrap();
+    wait_until("the pod to be created", || pod::state(&h.core).pod_id.is_some()).await;
+    pod::start_as(&h.core, pod::Profile::Image, StartOrigin::User).unwrap();
+    jobs::cancel_job(&h.core, &id).unwrap();
+    wait_until("the job to end", || last_job(&h, &id).is_some_and(|j| j.status == JobState::Cancelled)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(pod::state(&h.core).status, GpuStatus::Starting);
+    assert!(sim.deletes().is_empty());
+}
+
+#[tokio::test]
+async fn cancelling_one_of_two_jobs_keeps_the_pod_for_the_other() {
+    let server = MockServer::start().await;
+    let sim = slow_start_server(&server).await;
+    let h = harness(&server, Some("t"), Duration::from_secs(30));
+    let a = jobs::generate(&h.core, image_job()).unwrap();
+    let b = jobs::generate(&h.core, image_job()).unwrap();
+    wait_until("the pod to be created", || pod::state(&h.core).pod_id.is_some()).await;
+    jobs::cancel_job(&h.core, &a).unwrap();
+    wait_until("job a to end", || last_job(&h, &a).is_some_and(|j| j.status == JobState::Cancelled)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(pod::state(&h.core).status, GpuStatus::Starting);
+    assert!(sim.deletes().is_empty());
+    // Cancelling the last one stops it.
+    jobs::cancel_job(&h.core, &b).unwrap();
+    let s = wait_for(&h.core, GpuStatus::Stopped).await;
+    assert_eq!(s.stop_reason, Some(StopReason::Cancelled));
+    assert!(sim.pod_ids().is_empty());
+}
+
+#[tokio::test]
+async fn cancelling_with_a_task_on_the_profile_keeps_the_pod() {
+    let server = MockServer::start().await;
+    let sim = slow_start_server(&server).await;
+    let h = harness(&server, Some("t"), Duration::from_secs(30));
+    let id = jobs::generate(&h.core, image_job()).unwrap();
+    let t = tasks::download_model(&h.core, "zimage").unwrap();
+    wait_until("the pod to be created", || pod::state(&h.core).pod_id.is_some()).await;
+    jobs::cancel_job(&h.core, &id).unwrap();
+    wait_until("the job to end", || last_job(&h, &id).is_some_and(|j| j.status == JobState::Cancelled)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(pod::state(&h.core).status, GpuStatus::Starting);
+    assert!(sim.deletes().is_empty());
+    // Then cancelling the task too: nothing uses the pod any more.
+    tasks::cancel_task(&h.core, &t.task_id).unwrap();
+    let s = wait_for(&h.core, GpuStatus::Stopped).await;
+    assert_eq!(s.stop_reason, Some(StopReason::Finished));
+    assert!(sim.pod_ids().is_empty());
+}
+
+/// Worker task API on `pod1`: `/run` → `t1`; `/status/t1` stays IN_PROGRESS
+/// until `gate` opens, then COMPLETED (an output that also parses as a status).
+struct Gate(Arc<AtomicBool>);
+impl Respond for Gate {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        if self.0.load(Ordering::SeqCst) {
+            ok(json!({"id": "t1", "status": "COMPLETED", "output": {"files": [],
+                "volume": {"totalBytes": 0, "freeBytes": 0}}}))
+        } else {
+            ok(json!({"id": "t1", "status": "IN_PROGRESS", "output": {"phase": "downloading", "bytes": 1, "totalBytes": 2}}))
+        }
+    }
+}
+
+/// A pod that starts at once, with a worker whose tasks finish when the gate opens.
+async fn task_server(server: &MockServer, open: bool) -> (Sim, Arc<AtomicBool>) {
+    mount_volumes(server).await;
+    let sim = Sim::new(&["pod1", "pod2"], "RUNNING");
+    sim.mount(server).await;
+    mount_ready_pod_server(server, "pod1").await;
+    let gate = Arc::new(AtomicBool::new(open));
+    Mock::given(method("POST"))
+        .and(path("/proxy/pod1/run"))
+        .respond_with(ok(json!({"id": "t1", "status": "IN_QUEUE"})))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/proxy/pod1/status/t1"))
+        .respond_with(Gate(gate.clone()))
+        .mount(server)
+        .await;
+    (sim, gate)
+}
+
+fn last_task(h: &Harness, id: &str) -> Option<Task> {
+    h.sink.tasks.lock().unwrap().iter().rev().find(|t| t.task_id == id).cloned()
+}
+
+#[tokio::test]
+async fn a_pod_started_only_for_a_download_stops_when_it_finishes() {
+    let server = MockServer::start().await;
+    let (sim, _gate) = task_server(&server, true).await;
+    let h = harness(&server, Some("t"), Duration::from_secs(5));
+    let t = tasks::download_model(&h.core, "zimage").unwrap();
+    wait_until("the automatic stop", || pod::state(&h.core).stop_reason == Some(StopReason::Finished)).await;
+    let s = pod::state(&h.core);
+    assert_eq!(s.status, GpuStatus::Stopped);
+    assert_eq!(sim.posts(), 1);
+    assert_eq!(sim.deletes(), vec!["pod1"]);
+    assert!(sim.pod_ids().is_empty(), "no pod left billing");
+    assert_eq!(stored_pod_id(&h.core), None);
+    wait_until("the task's final GPU note", || {
+        last_task(&h, &t.task_id)
+            .and_then(|t| t.gpu_release)
+            .is_some_and(|r| r.state == ReleaseState::Stopped)
+    })
+    .await;
+    assert_eq!(last_task(&h, &t.task_id).unwrap().status, TaskStatus::Completed);
+}
+
+#[tokio::test]
+async fn a_download_on_a_pod_the_user_started_keeps_it_running() {
+    let server = MockServer::start().await;
+    let (sim, _gate) = task_server(&server, true).await;
+    let h = harness(&server, Some("t"), Duration::from_secs(5));
+    pod::start(&h.core).unwrap();
+    wait_for(&h.core, GpuStatus::Running).await;
+    let t = tasks::download_model(&h.core, "zimage").unwrap();
+    wait_until("the task to end", || last_task(&h, &t.task_id).is_some_and(|t| t.status == TaskStatus::Completed)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(pod::state(&h.core).status, GpuStatus::Running);
+    assert!(sim.deletes().is_empty());
+    assert!(last_task(&h, &t.task_id).unwrap().gpu_release.is_none());
+}
+
+#[tokio::test]
+async fn a_generation_queued_during_the_download_keeps_the_pod() {
+    let server = MockServer::start().await;
+    let (sim, gate) = task_server(&server, false).await;
+    let h = harness(&server, Some("t"), Duration::from_secs(5));
+    let t = tasks::download_model(&h.core, "zimage").unwrap();
+    wait_for(&h.core, GpuStatus::Running).await;
+    // A generation is queued on the image profile meanwhile.
+    let job = Job {
+        job_id: "j".into(),
+        kind: Default::default(),
+        destination: Default::default(),
+        status: JobState::Queued,
+        total: 1,
+        completed: 0,
+        progress: None,
+        images: vec![],
+        error: None,
+        gpu_release: None,
+    };
+    h.core.jobs.lock().unwrap().insert("j".into(), JobEntry { job, cancel: false });
+    gate.store(true, Ordering::SeqCst);
+    wait_until("the task to end", || last_task(&h, &t.task_id).is_some_and(|t| t.status == TaskStatus::Completed)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(pod::state(&h.core).status, GpuStatus::Running);
+    assert!(sim.deletes().is_empty());
+}
+
+#[tokio::test]
+async fn a_generation_that_ran_during_the_download_keeps_the_pod() {
+    let server = MockServer::start().await;
+    let (sim, gate) = task_server(&server, false).await;
+    let h = harness(&server, Some("t"), Duration::from_secs(5));
+    let t = tasks::download_model(&h.core, "zimage").unwrap();
+    wait_for(&h.core, GpuStatus::Running).await;
+    // A generation ran (and finished) on the pod meanwhile.
+    pod::mark_served(&h.core, pod::Profile::Image);
+    gate.store(true, Ordering::SeqCst);
+    wait_until("the task to end", || last_task(&h, &t.task_id).is_some_and(|t| t.status == TaskStatus::Completed)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(pod::state(&h.core).status, GpuStatus::Running);
+    assert!(sim.deletes().is_empty());
+}
+
+#[tokio::test]
+async fn a_pod_started_only_for_refresh_stops_afterwards() {
+    let server = MockServer::start().await;
+    let (sim, _gate) = task_server(&server, true).await;
+    let h = harness(&server, Some("t"), Duration::from_secs(5));
+    let view = status::refresh_status(&h.core).await.unwrap();
+    assert!(view.checked_at.is_some());
+    let s = wait_for(&h.core, GpuStatus::Stopped).await;
+    assert_eq!(s.stop_reason, Some(StopReason::Finished));
+    assert!(sim.pod_ids().is_empty());
+    // A refresh on a running pod the user started leaves it running.
+    let server2 = MockServer::start().await;
+    let (sim2, _g) = task_server(&server2, true).await;
+    let h2 = harness(&server2, Some("t"), Duration::from_secs(5));
+    pod::start(&h2.core).unwrap();
+    wait_for(&h2.core, GpuStatus::Running).await;
+    status::refresh_status(&h2.core).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(pod::state(&h2.core).status, GpuStatus::Running);
+    assert!(sim2.deletes().is_empty());
+}
+
+#[tokio::test]
+async fn an_automatic_stop_that_cant_confirm_keeps_the_pod_id_and_shows_error() {
+    let server = MockServer::start().await;
+    let (sim, _gate) = task_server(&server, true).await;
+    sim.with(|s| {
+        s.fail_delete.insert("pod1".into());
+    });
+    let h = harness(&server, Some("t"), Duration::from_secs(5));
+    let t = tasks::download_model(&h.core, "zimage").unwrap();
+    let s = wait_for(&h.core, GpuStatus::Error).await;
+    assert_eq!(s.pod_id.as_deref(), Some("pod1"));
+    assert!(s.error.unwrap().contains("may still be billing"));
+    assert_eq!(stored_pod_id(&h.core).as_deref(), Some("pod1"));
+    assert!(pod::needs_quit_confirm(&h.core));
+    wait_until("the task's failed GPU note", || {
+        last_task(&h, &t.task_id)
+            .and_then(|t| t.gpu_release)
+            .is_some_and(|r| r.state == ReleaseState::Failed && r.error.is_some())
+    })
+    .await;
+}
+
+/// UX-014 with a stop RunPod never confirms: the job must not report the pod
+/// as stopped. The GPU shows Error with the pod id kept (Stop retries, the
+/// monitor's urgent auto-stop retries, quitting asks), and the job's note ends
+/// "failed" with the error, never "stopped".
+#[tokio::test]
+async fn cancelling_the_only_job_when_the_stop_cant_confirm_keeps_the_pod_visible() {
+    let server = MockServer::start().await;
+    let sim = slow_start_server(&server).await;
+    sim.with(|s| {
+        s.fail_delete.insert("pod1".into());
+    });
+    let h = harness(&server, Some("t"), Duration::from_secs(30));
+    let id = jobs::generate(&h.core, image_job()).unwrap();
+    wait_until("the pod to be created", || pod::state(&h.core).pod_id.as_deref() == Some("pod1")).await;
+    jobs::cancel_job(&h.core, &id).unwrap();
+
+    let s = wait_for(&h.core, GpuStatus::Error).await;
+    assert_eq!(s.pod_id.as_deref(), Some("pod1"), "the unconfirmed pod stays tracked");
+    assert!(s.error.unwrap().contains("may still be billing"));
+    assert_eq!(stored_pod_id(&h.core).as_deref(), Some("pod1"));
+    assert!(pod::needs_quit_confirm(&h.core));
+    assert_eq!(sim.deletes(), vec!["pod1"], "the stop was attempted through the checked path");
+    wait_until("the job's failed GPU note", || {
+        last_job(&h, &id)
+            .and_then(|j| j.gpu_release)
+            .is_some_and(|r| r.state == ReleaseState::Failed && r.error.is_some())
+    })
+    .await;
+    let notes: Vec<ReleaseState> = h
+        .sink
+        .jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|j| j.job_id == id)
+        .filter_map(|j| j.gpu_release.as_ref().map(|r| r.state))
+        .collect();
+    assert_eq!(notes, vec![ReleaseState::Stopping, ReleaseState::Failed]);
+    assert_eq!(last_job(&h, &id).unwrap().status, JobState::Cancelled);
+    // The urgent error auto-stop keeps retrying; once RunPod cooperates the pod goes.
+    sim.with(|s| s.fail_delete.clear());
+    advance(&h, chrono::Duration::seconds(130));
+    let s = pod::idle_check(&h.core).await.expect("urgent auto-stop from Error");
+    assert_eq!(s.status, GpuStatus::Stopped);
+    assert_eq!(s.pod_id, None);
+    assert!(sim.pod_ids().is_empty(), "no pod left billing");
+}
+
+#[tokio::test]
+async fn typed_keys_are_tested_without_being_saved() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods"))
+        .and(header("authorization", "Bearer good-key"))
+        .respond_with(ok(json!({"pods": [], "pagination": {"hasNextPage": false}})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({"title": "Unauthorized", "status": 401})))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/me"))
+        .and(header("authorization", "Bearer civ-good"))
+        .respond_with(ok(json!({"id": 1, "username": "someone"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/me"))
+        .respond_with(ResponseTemplate::new(401))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+    let h = harness(&server, Some("t"), Duration::from_secs(5));
+    use app_lib::commands::check_api_keys;
+
+    let r = check_api_keys(&h.core, Some(" good-key ".into()), Some("civ-good".into())).await;
+    let rp = r.runpod.unwrap();
+    assert!(rp.ok && rp.source == "typed", "{rp:?}");
+    let civ = r.civitai.unwrap();
+    assert!(civ.ok && civ.message.contains("someone"), "{civ:?}");
+
+    let r = check_api_keys(&h.core, Some("bad".into()), Some("civ-bad".into())).await;
+    let rp = r.runpod.unwrap();
+    assert!(!rp.ok && !rp.network && rp.message.contains("rejected"), "{rp:?}");
+    let civ = r.civitai.unwrap();
+    assert!(!civ.ok && civ.message.contains("rejected"), "{civ:?}");
+
+    // Not given: the saved RunPod key ("test-key", rejected by this mock) is
+    // checked; no Civitai key is saved, so none is reported.
+    let r = check_api_keys(&h.core, None, Some("  ".into())).await;
+    assert_eq!(r.runpod.unwrap().source, "saved");
+    assert!(r.civitai.is_none());
+    // Nothing was stored, and no pod was touched.
+    assert_eq!(h.core.settings.runpod_api_key().as_deref(), Some("test-key"));
+    assert!(h.core.settings.civitai_api_key().is_none());
+    let reqs = server.received_requests().await.unwrap();
+    assert!(reqs.iter().all(|q| q.method.as_str() == "GET"));
 }

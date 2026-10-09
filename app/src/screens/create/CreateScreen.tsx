@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
+import { requestModelFocus } from "../models/ModelsScreen";
 import * as api from "../../api";
 import {
   DENOISE_DEFAULT,
@@ -12,31 +13,47 @@ import {
   type GenerateInput,
   type ImageRecord,
   type Job,
+  type Lora,
 } from "../../api";
 import { Icon } from "../../components/Icon";
 import { radioKeys } from "../../components/radio";
+import { ASPECTS } from "../../lib/aspect";
 import { useGpu } from "../../state/gpu";
 import { useLibrary } from "../../state/library";
 import { useToast } from "../../state/toast";
 import { useVault } from "../../state/vault";
 import type { Tab } from "../../App";
 import {
+  AddLoraLinkDialog,
   Advanced,
   advancedDefaults,
+  advBlocker,
   AspectPicker,
   CountPicker,
   LoraPicker,
   MAX_LORAS,
+  measureImage,
   ModelPicker,
   ModeSwitch,
+  NOT_AN_IMAGE,
+  PanelNoticeView,
+  promptHasWord,
+  ratioLabel,
+  readDraft,
+  useMoreBelow,
+  writeDraft,
+  realImageFiles,
   References,
+  removeWordFromPrompt,
   StartImage,
+  usePanelNotice,
+  useVaultLockCycle,
   type AdvancedValues,
   type CreateMode,
   type LoraPick,
   type RefItem,
 } from "./Controls";
-import { Gallery } from "./Gallery";
+import { countGallery, Gallery, totalFor, type GalleryTotals } from "./Gallery";
 import { GalleryPicker } from "./GalleryPicker";
 import { JobCard, type JobView } from "./JobCard";
 import { Lightbox } from "./Lightbox";
@@ -46,7 +63,22 @@ import { MigrationView, SaveToSwitch, VaultCreate, VaultLockScreen } from "./Vau
 const PAGE = 24;
 const LAST_MODEL_KEY = "imagestudio.lastModel";
 const MODE_KEY = "imagestudio.createMode";
+/** The user's last Save-to choice (UX-009: it never changes by itself). */
+const SAVE_TO_KEY = "imagestudio.saveTo";
 const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp|tiff?|heic)$/i;
+/** A second Generate within this long of the last one is ignored (double-click guard). */
+const GENERATE_GUARD_MS = 800;
+/** The non-vault Image form draft (UX-058): restored after a reload, never holds vault content. */
+const DRAFT_KEY = "imagestudio.draft.image";
+interface ImageDraft {
+  modelId: string;
+  prompt: string;
+  aspect: string;
+  count: number;
+  adv: AdvancedValues;
+  loraPicks: LoraPick[];
+  denoise: number;
+}
 
 function readLastModel(): string {
   try {
@@ -64,15 +96,56 @@ function readMode(): CreateMode {
   }
 }
 
+function readSaveTo(): Destination | null {
+  try {
+    const v = localStorage.getItem(SAVE_TO_KEY);
+    return v === "vault" || v === "general" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
 const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
+const listJoin = (xs: string[]) => (xs.length <= 1 ? xs.join("") : `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`);
+const clip = (s: string, n = 40) => (s.length > n ? `${s.slice(0, n - 1).trimEnd()}…` : s);
 
 export type GalleryFilter = "all" | "image" | "video";
 export type GalleryTab = "general" | "vault";
 const isVideo = (im: ImageRecord) => im.kind === "video";
 const applyFilter = (list: ImageRecord[], f: GalleryFilter) => (f === "all" ? list : list.filter((im) => (f === "video") === isVideo(im)));
 
-/** img2img start image: imported (`refId`) or a vault item used in place (`vaultId`, spec v6). */
-type StartPick = RefItem & { vaultId?: string };
+/**
+ * img2img start image: imported (`refId`) or a vault item used in place (`vaultId`, spec v6).
+ * `path` = the source file (to re-use it as a reference), `sourceId` = the gallery/vault record it came
+ * from, `label` = the one-line origin under the thumbnail, `w`/`h` = its size once known.
+ */
+type StartPick = RefItem & { vaultId?: string; path?: string; sourceId?: string; label?: string; w?: number; h?: number; exact?: boolean };
+const isVaultStart = (s: StartPick | null | undefined) => !!s && (!!s.vaultId || isVaultUrl(s.refId));
+
+/** What each image model remembers while you use another one (UX-005; memory only, never persisted). */
+interface ImageMemory {
+  adv: AdvancedValues;
+  loraPicks: LoraPick[];
+  denoise: number;
+  startImage: StartPick | null;
+  refs: RefItem[];
+  /** Holds vault-derived values: moved out of reach while the vault is locked. */
+  vault: boolean;
+}
+
+/** Vault-derived form values set aside while the vault is locked (memory only). */
+interface ImageStash {
+  form: boolean;
+  prompt: string;
+  modelId: string;
+  adv: AdvancedValues;
+  loraPicks: LoraPick[];
+  denoise: number;
+  startImage: StartPick | null;
+  refs: RefItem[];
+  tainted: boolean;
+  memory: [string, ImageMemory][];
+}
 
 export function CreateScreen({ active, onNavigate }: { active: boolean; onNavigate: (t: Tab) => void }) {
   const lib = useLibrary();
@@ -83,6 +156,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   // Pod backend with the GPU not starting/running: Generate starts it first (after the start confirmation).
   const startsGpu = gpu.profiles.image.needsStart;
   const imageModels = lib.imageModels;
+  const { notice, show: showNotice, clear: clearNotice } = usePanelNotice();
 
   // ---------- Image | Video ----------
   const [mode, setModeState] = useState<CreateMode>(readMode);
@@ -97,14 +171,28 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   const videoRef = useRef<VideoPanelHandle>(null);
   const modeSwitch = <ModeSwitch value={mode} onChange={setMode} />;
 
-  // ---------- Save to: General | Vault (spec v6; remembered for the session) ----------
-  const [saveChoice, setSaveChoice] = useState<Destination | null>(null);
+  // ---------- Save to: General | Vault (spec v6; the last choice is remembered, never switched by itself) ----------
+  const [saveChoice, setSaveChoiceState] = useState<Destination | null>(readSaveTo);
+  const setSaveChoice = useCallback((d: Destination) => {
+    setSaveChoiceState(d);
+    try {
+      localStorage.setItem(SAVE_TO_KEY, d);
+    } catch {
+      /* ignore */
+    }
+  }, []);
   /** Video mode's start image is vault content (reported by VideoPanel). */
   const [videoVaultStart, setVideoVaultStart] = useState(false);
 
   // ---------- form state ----------
-  const [modelId, setModelId] = useState<string>(readLastModel);
-  const [prompt, setPrompt] = useState("");
+  const draft = useRef(readDraft<ImageDraft>(DRAFT_KEY)).current;
+  const [modelId, setModelId] = useState<string>(() => draft?.modelId || readLastModel());
+  const [prompt, setPromptState] = useState(() => (typeof draft?.prompt === "string" ? draft.prompt : ""));
+  const [promptError, setPromptError] = useState(false);
+  const setPrompt = useCallback((p: string) => {
+    setPromptState(p);
+    if (p.trim()) setPromptError(false);
+  }, []);
   const [refs, setRefs] = useState<RefItem[]>([]);
   const [refBusy, setRefBusy] = useState(false);
   const [dragActive, setDragActive] = useState(false);
@@ -113,28 +201,42 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   const [startImage, setStartImage] = useState<StartPick | null>(null);
   const [startBusy, setStartBusy] = useState(false);
   const [startPickerOpen, setStartPickerOpen] = useState(false);
-  const [denoise, setDenoise] = useState(DENOISE_DEFAULT);
-  const [aspect, setAspect] = useState("1:1");
-  const [count, setCount] = useState(1);
+  const [refPickerOpen, setRefPickerOpen] = useState(false);
+  const [loraLinkOpen, setLoraLinkOpen] = useState(false);
+  const [denoise, setDenoise] = useState(() => (typeof draft?.denoise === "number" ? draft.denoise : DENOISE_DEFAULT));
+  const [aspect, setAspect] = useState(() => (typeof draft?.aspect === "string" ? draft.aspect : "1:1"));
+  const [count, setCount] = useState(() => (typeof draft?.count === "number" && draft.count >= 1 && draft.count <= 4 ? draft.count : 1));
   const [adv, setAdv] = useState<AdvancedValues>(() => advancedDefaults(undefined));
   const [advOpen, setAdvOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  /**
+   * The prompt / seed / LoRAs came from the vault: restored from a vault item, or sent with a job saved
+   * to the vault. They're cleared when the vault locks and come back on unlock (UX-003).
+   */
+  const [tainted, setTainted] = useState(false);
+  const memory = useRef(new Map<string, ImageMemory>());
+  /** Trigger words this form inserted with the chips (removed again with their LoRA). */
+  const chipWords = useRef(new Set<string>());
+  /** LoRAs added from a link here: added to the form once their download finishes. */
+  const pendingLoras = useRef(new Set<string>());
   const promptRef = useRef<HTMLTextAreaElement>(null);
+  const panelScrollRef = useRef<HTMLDivElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const startFileInput = useRef<HTMLInputElement>(null);
+  const inFlight = useRef(false);
+  const lastSubmit = useRef(0);
 
   const model = imageModels.find((m) => m.id === modelId);
   const maxRefs = model?.maxReferences ?? 0;
   const img2img = !!model?.supportsImg2Img;
   const startActive = img2img && !!startImage;
+  const formHasVaultInputs = isVaultStart(startImage) || refs.some((r) => isVaultUrl(r.refId));
 
   // A vault start image or reference keeps the output in the vault (the core refuses "general").
   const vaultInputs =
-    mode === "video"
-      ? videoVaultStart
-      : (startActive && !!startImage && (!!startImage.vaultId || isVaultUrl(startImage.refId))) || refs.slice(0, maxRefs).some((r) => isVaultUrl(r.refId));
-  // Until the user picks: Vault while unlocked, else General. Vault while locked is allowed (outputs are sealed).
-  const saveTo: Destination = !vault.exists ? "general" : vaultInputs ? "vault" : (saveChoice ?? (vault.unlocked ? "vault" : "general"));
+    mode === "video" ? videoVaultStart : (startActive && isVaultStart(startImage)) || refs.slice(0, maxRefs).some((r) => isVaultUrl(r.refId));
+  // The user's last choice (General until they pick). Vault while locked is allowed (outputs are sealed).
+  const saveTo: Destination = !vault.exists ? "general" : vaultInputs ? "vault" : (saveChoice ?? "general");
   const saveToSwitch = (
     <SaveToSwitch
       value={saveTo}
@@ -155,8 +257,17 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     initialised.current = true;
     const m = imageModels.find((x) => x.id === modelId) ?? imageModels.find((x) => x.installed) ?? imageModels[0];
     setModelId(m.id);
-    setAdv(advancedDefaults(m));
-  }, [imageModels, modelId]);
+    setAdv(draft?.modelId === m.id && draft.adv ? { ...advancedDefaults(m), ...draft.adv } : advancedDefaults(m));
+  }, [imageModels, modelId, draft]);
+
+  // The draft's LoRAs come back once the library has loaded (the "drop missing LoRAs" effect would clear them earlier).
+  const loraDraftApplied = useRef(false);
+  useEffect(() => {
+    if (loraDraftApplied.current || !lib.loaded) return;
+    loraDraftApplied.current = true;
+    const picks = (draft?.loraPicks ?? []).filter((p) => lib.loras.some((l) => l.id === p.loraId && l.present && l.modelId === draft?.modelId));
+    if (picks.length && draft?.modelId === modelId) setLoraPicks(picks.slice(0, MAX_LORAS));
+  }, [lib.loaded, lib.loras, draft, modelId]);
 
   useEffect(() => {
     try {
@@ -166,41 +277,198 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     }
   }, [modelId]);
 
-  // Drop LoRAs that disappeared from the library (deleted in Models).
+  // Drop LoRAs that disappeared from the library (deleted in Models); add link-added ones once downloaded.
   useEffect(() => {
     setLoraPicks((ps) => {
-      const keep = ps.filter((p) => lib.loras.some((l) => l.id === p.loraId && l.present));
-      return keep.length === ps.length ? ps : keep;
+      let keep = ps.filter((p) => lib.loras.some((l) => l.id === p.loraId && l.present));
+      for (const id of [...pendingLoras.current]) {
+        const l = lib.loras.find((x) => x.id === id);
+        if (!l) continue;
+        if (l.present) {
+          pendingLoras.current.delete(id);
+          if (l.modelId === modelId && keep.length < MAX_LORAS && !keep.some((p) => p.loraId === id)) keep = [...keep, { loraId: id, strength: 1 }];
+        } else if (l.task && (l.task.status === "failed" || l.task.status === "cancelled")) {
+          pendingLoras.current.delete(id);
+        }
+      }
+      return keep.length === ps.length && keep.every((p, i) => p === ps[i]) ? ps : keep;
     });
-  }, [lib.loras]);
+  }, [lib.loras, modelId]);
 
+  // The start image's size (for the "Size: 3:4" line): from its record, else measured from the thumbnail.
+  useEffect(() => {
+    const s = startImage;
+    if (!s || s.w) return;
+    let alive = true;
+    void measureImage(api.fileSrc(s.thumbPath)).then((sz) => {
+      if (alive && sz) setStartImage((cur) => (cur === s ? { ...s, w: sz[0], h: sz[1] } : cur));
+    });
+    return () => {
+      alive = false;
+    };
+  }, [startImage]);
+
+  // Save the draft; anything vault-derived removes it instead (never persisted).
+  useEffect(() => {
+    if (!initialised.current) return;
+    writeDraft(DRAFT_KEY, tainted || formHasVaultInputs ? null : ({ modelId, prompt, aspect, count, adv, loraPicks, denoise } satisfies ImageDraft));
+  }, [modelId, prompt, aspect, count, adv, loraPicks, denoise, tainted, formHasVaultInputs]);
+
+  useMoreBelow(panelScrollRef);
+
+  const currentMemory = (): ImageMemory => ({ adv, loraPicks, denoise, startImage, refs, vault: tainted || formHasVaultInputs });
+
+  // ---------- model switch: each model keeps its own settings (UX-005) ----------
   const selectModel = (id: string) => {
     if (id === modelId) return;
     const next = imageModels.find((m) => m.id === id);
     if (!next) return;
-    const droppedRefs = Math.max(0, refs.length - next.maxReferences);
-    const keptLoras = loraPicks.filter((p) => lib.loras.find((l) => l.id === p.loraId)?.modelId === id);
-    const droppedLoras = loraPicks.length - keptLoras.length;
-    const droppedStart = !!startImage && !next.supportsImg2Img;
+    const cur = model;
+    memory.current.set(modelId, currentMemory());
+    const mem = memory.current.get(id);
     setModelId(id);
-    setAdv(advancedDefaults(next));
-    if (droppedRefs) setRefs((r) => r.slice(0, next.maxReferences));
-    if (droppedLoras) setLoraPicks(keptLoras);
-    if (droppedStart) setStartImage(null);
-    if (droppedRefs || droppedLoras) {
-      const parts = [
-        droppedRefs && plural(droppedRefs, "reference"),
-        droppedLoras && plural(droppedLoras, "LoRA"),
-        droppedStart && "the start image",
-      ].filter(Boolean);
-      toast.info(`Removed ${parts.join(" and ")}`, `${next.name} doesn't support ${droppedRefs && !next.maxReferences ? "reference images" : "them"}.`);
-    } else if (droppedStart) {
-      toast.info("Removed the start image", `${next.name} doesn't support start images (img2img).`);
+    setAdv(mem?.adv ?? { ...advancedDefaults(next), seed: adv.seed, randomSeed: adv.randomSeed });
+    setLoraPicks((mem?.loraPicks ?? []).filter((p) => lib.loras.some((l) => l.id === p.loraId && l.present && l.modelId === id)));
+    if (mem?.vault) setTainted(true);
+    if (mem) setDenoise(mem.denoise);
+
+    // LoRAs are made for one model: set them aside (they come back with that model) and take out the
+    // trigger words the chips inserted.
+    const aside = loraPicks.map((p) => lib.loras.find((l) => l.id === p.loraId)).filter((l): l is Lora => !!l);
+    let nextPrompt = prompt;
+    const tookOut: string[] = [];
+    for (const l of aside)
+      for (const w of l.triggerWords)
+        if (chipWords.current.has(w.toLowerCase()) && promptHasWord(nextPrompt, w)) {
+          nextPrompt = removeWordFromPrompt(nextPrompt, w);
+          chipWords.current.delete(w.toLowerCase());
+          tookOut.push(w);
+        }
+    if (nextPrompt !== prompt) setPrompt(nextPrompt);
+
+    // Start image: kept when the new model takes one; else offered as a reference (UX-094) or kept for the old model.
+    let movedToRefs = false;
+    let nextRefs = next.maxReferences > 0 ? (refs.length ? refs : (mem?.refs ?? [])).slice(0, next.maxReferences) : [];
+    if (next.supportsImg2Img) {
+      setStartImage(startImage ?? mem?.startImage ?? null);
+    } else {
+      setStartImage(null);
+      if (startImage && next.maxReferences > 0 && nextRefs.length < next.maxReferences) {
+        if (startImage.refId && !nextRefs.some((r) => r.refId === startImage.refId)) {
+          nextRefs = [...nextRefs, { refId: startImage.refId, thumbPath: startImage.thumbPath }];
+          movedToRefs = true;
+        } else if (startImage.vaultId && startImage.path) {
+          movedToRefs = true;
+          const src = startImage.path;
+          setRefBusy(true);
+          api
+            .importReference(src, "vault")
+            .then((r) => setRefs((rs) => (rs.length < next.maxReferences ? [...rs, r] : rs)))
+            .catch((e) => toast.error("Couldn't add the start image as a reference", e))
+            .finally(() => setRefBusy(false));
+        }
+      }
     }
+    setRefs(nextRefs);
+
+    const asideParts = [
+      aside.length ? listJoin(aside.map((l) => l.name)) : "",
+      startImage && !next.supportsImg2Img && !movedToRefs ? "the start image" : "",
+      refs.length && !next.maxReferences ? plural(refs.length, "reference") : "",
+    ].filter(Boolean);
+    const asideCount = aside.length + (startImage && !next.supportsImg2Img && !movedToRefs ? 1 : 0) + (!next.maxReferences ? refs.length : 0);
+    const why = [
+      aside.length && cur
+        ? `LoRAs are made for a specific model: ${aside.length === 1 ? "this one is" : "these are"} for ${cur.name}, not ${next.name}${tookOut.length ? `, so ${listJoin(tookOut)} came out of the prompt too` : ""}.`
+        : "",
+      startImage && !next.supportsImg2Img && !movedToRefs ? `${next.name} doesn't take a start image.` : "",
+      refs.length && !next.maxReferences ? `${next.name} doesn't take reference images.` : "",
+    ].filter(Boolean);
+    if (asideParts.length && cur) {
+      showNotice({
+        tone: "info",
+        title: `Kept ${listJoin(asideParts)} for ${cur.name}`,
+        detail: `${why.join(" ")} Switch back to ${cur.name} to get ${asideCount === 1 ? "it" : "them"} back.`,
+      });
+    } else if (movedToRefs) {
+      showNotice({ tone: "info", title: "Start image added as a reference", detail: `${next.name} uses references, not a start image (img2img).` });
+    } else if (mem) {
+      showNotice({ tone: "ok", title: `Restored your ${next.name} settings`, detail: "LoRAs, seed, steps, CFG and negative prompt as you left them." });
+    } else {
+      clearNotice();
+    }
+    if (movedToRefs && asideParts.length) toast.info("Start image added as a reference", `${next.name} uses references, not a start image (img2img).`);
   };
 
+  // ---------- vault lock: clear every vault-derived value, restore it on unlock (UX-003 / UX-015) ----------
+  const { stashNow } = useVaultLockCycle<ImageStash>(
+    (submitted) => {
+      setStartPickerOpen(false);
+      setRefPickerOpen(false);
+      const isTainted = tainted || submitted;
+      const vStart = isVaultStart(startImage);
+      const vRefs = refs.some((r) => isVaultUrl(r.refId));
+      const form = isTainted || vStart || vRefs;
+      const memVault = [...memory.current].filter(([, m]) => m.vault);
+      for (const [k] of memVault) memory.current.delete(k);
+      if (notice?.vault || !submitted) clearNotice();
+      if (!form && !memVault.length) return null;
+      const stash: ImageStash = { form, prompt, modelId, adv, loraPicks, denoise, startImage, refs, tainted: isTainted, memory: memVault };
+      if (form) {
+        setPrompt("");
+        if (isTainted) {
+          setAdv({ ...advancedDefaults(model) });
+          setLoraPicks([]);
+        }
+        if (vStart) setStartImage(null);
+        if (vRefs) setRefs((rs) => rs.filter((r) => !isVaultUrl(r.refId)));
+        setTainted(false);
+        showNotice(
+          submitted
+            ? { tone: "info", title: "Sent to the vault — prompt cleared", detail: "The vault is locked, so nothing from this job stays on screen. Unlock to get the prompt back.", sticky: true }
+            : { tone: "info", title: "Vault locked — vault start image and prompt cleared", detail: "Unlock the vault to restore them.", sticky: true },
+        );
+      }
+      return stash;
+    },
+    (s) => {
+      for (const [k, m] of s.memory) if (!memory.current.has(k)) memory.current.set(k, m);
+      if (!s.form) return;
+      const typedMeanwhile = prompt.trim() !== "";
+      if (!typedMeanwhile) setPrompt(s.prompt);
+      if (s.modelId === modelId) {
+        if (s.tainted) {
+          setAdv(s.adv);
+          setLoraPicks(s.loraPicks.filter((p) => lib.loras.some((l) => l.id === p.loraId && l.present)));
+        }
+        if (!startImage && s.startImage) {
+          setStartImage(s.startImage);
+          setDenoise(s.denoise);
+        }
+        const vr = s.refs.filter((r) => isVaultUrl(r.refId));
+        if (vr.length) setRefs((rs) => [...rs, ...vr.filter((r) => !rs.some((x) => x.refId === r.refId))].slice(0, Math.max(maxRefs, 0)));
+      } else {
+        memory.current.set(s.modelId, { adv: s.adv, loraPicks: s.loraPicks, denoise: s.denoise, startImage: s.startImage, refs: s.refs, vault: true });
+      }
+      if (s.tainted || !typedMeanwhile) setTainted(true);
+      showNotice({
+        tone: "ok",
+        title: "Vault unlocked — restored what was cleared",
+        detail: typedMeanwhile
+          ? "Kept the prompt you typed while it was locked."
+          : s.modelId !== modelId
+            ? `The start image and settings are back on ${imageModels.find((m) => m.id === s.modelId)?.name ?? "the earlier model"}.`
+            : undefined,
+        vault: true,
+      });
+    },
+  );
+
   // ---------- references ----------
-  const addFiles = async (files: File[]) => {
+  const addFiles = async (picked: File[]) => {
+    const files = await realImageFiles(picked);
+    if (!files.length) return showNotice({ tone: "warn", title: NOT_AN_IMAGE });
+    if (files.length < picked.length) toast.info("Some files were skipped", "Only image files can be references.");
     const slots = maxRefs - refs.length;
     if (slots <= 0) return toast.info(`${model?.name} takes at most ${maxRefs} references`);
     if (files.length > slots) toast.info(`Only ${plural(slots, "more reference")} allowed`, `${model?.name} takes at most ${maxRefs}.`);
@@ -220,9 +488,9 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
 
   const addPaths = async (paths: string[]) => {
     const imgs = paths.filter((p) => IMAGE_EXT.test(p));
+    if (!imgs.length) return showNotice({ tone: "warn", title: NOT_AN_IMAGE });
     if (imgs.length < paths.length) toast.info("Some files were skipped", "Only image files can be references.");
     const slots = maxRefs - refs.length;
-    if (!imgs.length) return;
     if (slots <= 0) return toast.info(`${model?.name} takes at most ${maxRefs} references`);
     if (imgs.length > slots) toast.info(`Only ${plural(slots, "more reference")} allowed`, `${model?.name} takes at most ${maxRefs}.`);
     setRefBusy(true);
@@ -248,12 +516,27 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     }
   };
 
+  /** A gallery or vault image as a reference (UX-036); vault images stay sealed in the vault. */
+  const addRefFromGallery = async (rec: ImageRecord) => {
+    setRefPickerOpen(false);
+    if (refs.length >= maxRefs) return toast.info(`${model?.name} takes at most ${maxRefs} references`);
+    setRefBusy(true);
+    try {
+      const r = await api.importReference(rec.path, rec.vault ? "vault" : saveTo);
+      setRefs((rs) => (rs.length < maxRefs ? [...rs, r] : rs));
+    } catch (e) {
+      toast.error("Couldn't add the reference image", e);
+    } finally {
+      setRefBusy(false);
+    }
+  };
+
   // ---------- start image (img2img) ----------
   // Same import pipeline as references (downscaled to ≤1 MP); one image, replaced on re-add.
-  const setStartFrom = async (load: () => Promise<StartPick>) => {
+  const setStartFrom = async (load: () => Promise<RefItem>, extra: Partial<StartPick> = {}) => {
     setStartBusy(true);
     try {
-      setStartImage(await load());
+      setStartImage({ ...(await load()), ...extra });
     } catch (e) {
       toast.error("Couldn't add the start image", e);
     } finally {
@@ -261,18 +544,19 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     }
   };
 
-  const addStartFiles = async (files: File[]) => {
+  const addStartFiles = async (picked: File[]) => {
+    const files = await realImageFiles(picked);
     const f = files[0];
-    if (!f) return;
-    if (files.length > 1) toast.info("Only one start image is used", "The first image was added.");
-    await setStartFrom(async () => api.importReferenceBytes(await api.blobToBase64(f), f.type || "image/png", saveTo));
+    if (!f) return showNotice({ tone: "warn", title: NOT_AN_IMAGE });
+    if (picked.length > 1) toast.info("Only one start image is used", "The first image was added.");
+    await setStartFrom(async () => api.importReferenceBytes(await api.blobToBase64(f), f.type || "image/png", saveTo), { label: `From your computer · ${clip(f.name)}` });
   };
 
   const addStartPaths = async (paths: string[]) => {
     const imgs = paths.filter((p) => IMAGE_EXT.test(p));
-    if (!imgs.length) return toast.info("That isn't an image file", "The start image must be a PNG, JPEG, WebP or similar.");
+    if (!imgs.length) return showNotice({ tone: "warn", title: NOT_AN_IMAGE });
     if (imgs.length > 1) toast.info("Only one start image is used", "The first image was added.");
-    await setStartFrom(() => api.importReference(imgs[0], saveTo));
+    await setStartFrom(() => api.importReference(imgs[0], saveTo), { label: `From your computer · ${clip(imgs[0].split(/[\\/]/).pop() ?? "")}` });
   };
 
   const pickStart = async () => {
@@ -283,6 +567,54 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     } catch (e) {
       toast.error("Couldn't open the file picker", e);
     }
+  };
+
+  /** A gallery or vault record becomes the img2img start image (picker, lightbox "Redraw this image"). */
+  const startFromRecord = (rec: ImageRecord) => {
+    const label = `${rec.vault ? "From your vault" : "From gallery"} · ${clip(rec.prompt)} · ${modelNames[rec.model] ?? rec.model}`;
+    const extra = { path: rec.path, sourceId: rec.id, label, w: rec.width || undefined, h: rec.height || undefined, exact: !!rec.width };
+    // A vault item is used in place (decrypted in memory by the backend, `initImageVaultId`); it forces Save to = Vault.
+    if (rec.vault) {
+      setStartImage({ refId: "", thumbPath: rec.thumbPath || rec.path, vaultId: rec.id, ...extra });
+      return;
+    }
+    // Image mode has no gallery-id argument: import the gallery file like any other start image.
+    void setStartFrom(() => api.importReference(rec.path, saveTo), extra);
+  };
+
+  /** Lightbox "Redraw this image" (UX-037): Image mode, an img2img model, this record as the start image. */
+  const redraw = (rec: ImageRecord) => {
+    setLightboxId(null);
+    const prevMode = mode;
+    const prevStart = startImage;
+    const prevModel = modelId;
+    setMode("image");
+    if (!model?.supportsImg2Img) {
+      const capable = imageModels.filter((m) => m.supportsImg2Img);
+      const next = capable.find((m) => m.installed) ?? capable[0];
+      if (!next) return toast.info("No image model takes a start image");
+      selectModel(next.id);
+    }
+    startFromRecord(rec);
+    panelScrollRef.current?.scrollTo({ top: 0 });
+    showNotice({
+      tone: "ok",
+      title: "Start image set — describe the changes and Generate",
+      detail: [prevMode !== "image" ? "Switched to Image" : "", prevStart ? "replaced your earlier start image" : ""].filter(Boolean).join(", ") || undefined,
+      undo: () => {
+        setMode(prevMode);
+        if (prevModel !== modelId) setModelId(prevModel);
+        setStartImage(prevStart);
+      },
+      vault: !!rec.vault,
+    });
+    requestAnimationFrame(() => promptRef.current?.focus({ preventScroll: true }));
+  };
+
+  const removeStart = () => {
+    const prev = startImage;
+    setStartImage(null);
+    if (prev) showNotice({ tone: "info", title: "Start image removed", undo: () => setStartImage(prev), vault: isVaultStart(prev) });
   };
 
   // Latest handlers for long-lived listeners. Pasted/dropped images go to the
@@ -297,7 +629,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   useEffect(() => {
     if (!refsEnabled) return;
     const onPaste = (e: ClipboardEvent) => {
-      const files = Array.from(e.clipboardData?.files ?? []).filter((f) => f.type.startsWith("image/"));
+      const files = Array.from(e.clipboardData?.files ?? []);
       if (!files.length) return;
       e.preventDefault();
       void handlers.current.onPastedFiles(files);
@@ -324,9 +656,12 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
 
   // ---------- prompt helpers ----------
   const insertWord = (w: string) => {
+    if (promptHasWord(prompt, w)) return;
     const el = promptRef.current;
-    const start = el?.selectionStart ?? prompt.length;
-    const end = el?.selectionEnd ?? prompt.length;
+    // At the caret while the prompt has focus, else at the end.
+    const focused = !!el && document.activeElement === el;
+    const start = focused ? el.selectionStart : prompt.length;
+    const end = focused ? el.selectionEnd : prompt.length;
     const before = prompt.slice(0, start);
     const after = prompt.slice(end);
     const pre = before && !/[\s,]$/.test(before) ? ", " : before && !/\s$/.test(before) ? " " : "";
@@ -337,6 +672,40 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     requestAnimationFrame(() => {
       el?.focus();
       el?.setSelectionRange(caret, caret);
+    });
+  };
+
+  const toggleWord = (w: string, on: boolean) => {
+    if (on) {
+      chipWords.current.add(w.toLowerCase());
+      insertWord(w);
+    } else {
+      chipWords.current.delete(w.toLowerCase());
+      setPrompt(removeWordFromPrompt(prompt, w));
+    }
+  };
+
+  /** A LoRA's Remove button: also take out the trigger words its chips inserted (with Undo). */
+  const onLoraRemoved = (l: Lora) => {
+    const prevPicks = loraPicks;
+    const prevPrompt = prompt;
+    const words = l.triggerWords.filter((w) => chipWords.current.has(w.toLowerCase()) && promptHasWord(prompt, w));
+    let next = prompt;
+    for (const w of words) {
+      next = removeWordFromPrompt(next, w);
+      chipWords.current.delete(w.toLowerCase());
+    }
+    if (next !== prompt) setPrompt(next);
+    showNotice({
+      tone: "info",
+      title: `Removed ${l.name}`,
+      detail: words.length ? `Also took ${listJoin(words)} out of the prompt.` : undefined,
+      undo: () => {
+        setLoraPicks(prevPicks);
+        setPrompt(prevPrompt);
+        for (const w of words) chipWords.current.add(w.toLowerCase());
+      },
+      vault: tainted,
     });
   };
 
@@ -407,16 +776,9 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     };
   }, []);
 
-  // Fade out finished job cards (failed ones stay until dismissed).
-  const scheduled = useRef(new Set<string>());
-  useEffect(() => {
-    for (const j of jobs) {
-      if ((j.status === "completed" || j.status === "cancelled") && !scheduled.current.has(j.jobId)) {
-        scheduled.current.add(j.jobId);
-        window.setTimeout(() => setJobs((js) => js.filter((x) => x.jobId !== j.jobId)), j.status === "completed" ? 4000 : 2000);
-      }
-    }
-  }, [jobs]);
+  // Finished cards stay until dismissed or the next job starts (UX-041 / UX-014: the cancelled card's
+  // "GPU stopped" line needs time to be read).
+  const dropFinished = (js: JobView[]) => js.filter((j) => j.status !== "completed" && j.status !== "cancelled");
 
   const loadMore = useCallback(async () => {
     if (loadingRef.current) return;
@@ -461,75 +823,95 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     })();
   }, [vault.generalEpoch, toast]);
 
-  // On lock: drop every vault record this screen holds (open lightbox, start image, job card prompts/outputs).
+
+  // On lock: drop every vault record this screen holds (open lightbox, job card prompts/outputs).
+  // The form's own vault values are handled by useVaultLockCycle above.
   const lockEpoch = useRef(vault.lockEpoch);
   useEffect(() => {
     if (lockEpoch.current === vault.lockEpoch) return;
     lockEpoch.current = vault.lockEpoch;
     setLightboxId((id) => (id && imagesRef.current.some((x) => x.id === id) ? id : null));
-    setStartImage((s) => (s && (s.vaultId || isVaultUrl(s.refId)) ? null : s));
-    setRefs((rs) => (rs.some((r) => isVaultUrl(r.refId)) ? rs.filter((r) => !isVaultUrl(r.refId)) : rs));
-    setStartPickerOpen(false);
     setJobs((js) => js.map((j) => (j.destination === "vault" ? { ...j, prompt: "", images: [] } : j)));
   }, [vault.lockEpoch]);
 
   // ---------- generate ----------
+  const imageGpuStatus = gpu.profiles.image.state?.status;
   const blocker = !model
     ? "Choose a model"
     : !configured
       ? "Connect RunPod in Settings first"
       : !model.installed
         ? `${model.name} isn't installed`
-        : !prompt.trim()
-          ? "Write a prompt"
-          : refBusy
-            ? "Adding references…"
-            : startBusy
-              ? "Adding the start image…"
-              : null;
+        : gpu.podMode && imageGpuStatus === "stopping"
+          ? "The image GPU is stopping — Generate is available again once it has stopped"
+          : !prompt.trim()
+            ? "Write a prompt"
+            : advBlocker(adv, model)
+              ? advBlocker(adv, model)
+              : refBusy
+                ? "Adding references…"
+                : startBusy
+                  ? "Adding the start image…"
+                  : null;
 
   const doGenerate = async () => {
-    if (submitting) return;
+    // Double-click guard (UX-011): ignore while a submit is in flight and just after one.
+    if (submitting || inFlight.current || Date.now() - lastSubmit.current < GENERATE_GUARD_MS) return;
     if (blocker) {
-      if (!prompt.trim()) promptRef.current?.focus();
+      if (!prompt.trim() && blocker === "Write a prompt") {
+        setPromptError(true);
+        promptRef.current?.focus();
+      } else if (blocker.startsWith("Fix ")) setAdvOpen(true);
       else toast.info(blocker);
       return;
     }
     if (!model) return;
-    // Owner's rule: confirm before starting a billed GPU. Cancel queues nothing.
-    if (!(await gpu.confirmStart(count > 1 ? `generate ${count} images` : "generate", "image"))) return;
-    const input: GenerateInput = {
-      model: model.id,
-      prompt: prompt.trim(),
-      aspectRatio: aspect,
-      count,
-      referenceIds: refs.slice(0, maxRefs).map((r) => r.refId),
-      loras: loraPicks.slice(0, MAX_LORAS),
-    };
-    if (model.supportsNegativePrompt && adv.negativePrompt.trim()) input.negativePrompt = adv.negativePrompt.trim();
-    if (!adv.randomSeed && adv.seed !== "") input.seed = Number(adv.seed);
-    if (adv.steps !== "" && Number(adv.steps) > 0) input.steps = Math.round(Number(adv.steps));
-    if (adv.cfg !== "" && !isNaN(Number(adv.cfg))) input.cfg = Number(adv.cfg);
-    if (startActive && startImage) {
-      if (startImage.vaultId) input.initImageVaultId = startImage.vaultId;
-      else input.initImageId = startImage.refId;
-      input.denoise = denoise;
-    }
-    input.destination = saveTo;
-
-    setSubmitting(true);
+    inFlight.current = true;
+    lastSubmit.current = Date.now();
     try {
-      const { jobId } = await api.generate(input);
-      const meta = { modelName: model.name, prompt: input.prompt, destination: saveTo };
-      setJobs((js) =>
-        js.some((j) => j.jobId === jobId)
-          ? js.map((j) => (j.jobId === jobId ? { ...j, ...meta } : j))
-          : [...js, { jobId, status: "queued", total: count, completed: 0, progress: null, images: [], error: null, startedAt: Date.now(), ...meta }],
-      );
-    } catch (e) {
-      toast.error("Couldn't start the generation", e);
+      // Owner's rule: confirm before starting a billed GPU. Cancel queues nothing.
+      if (!(await gpu.confirmStart(count > 1 ? `generate ${count} images` : "generate", "image"))) return;
+      const input: GenerateInput = {
+        model: model.id,
+        prompt: prompt.trim(),
+        aspectRatio: aspect,
+        count,
+        referenceIds: refs.slice(0, maxRefs).map((r) => r.refId),
+        loras: loraPicks.slice(0, MAX_LORAS),
+      };
+      if (model.supportsNegativePrompt && adv.negativePrompt.trim()) input.negativePrompt = adv.negativePrompt.trim();
+      if (!adv.randomSeed && adv.seed.trim() !== "") input.seed = Number(adv.seed.trim());
+      if (adv.steps.trim() !== "" && Number(adv.steps) > 0) input.steps = Math.round(Number(adv.steps));
+      if (adv.cfg.trim() !== "" && !isNaN(Number(adv.cfg))) input.cfg = Number(adv.cfg);
+      if (startActive && startImage) {
+        if (startImage.vaultId) input.initImageVaultId = startImage.vaultId;
+        else input.initImageId = startImage.refId;
+        input.denoise = denoise;
+      }
+      input.destination = saveTo;
+
+      setSubmitting(true);
+      try {
+        const { jobId } = await api.generate(input);
+        const meta = { modelName: model.name, prompt: input.prompt, destination: saveTo };
+        setJobs((js) =>
+          js.some((j) => j.jobId === jobId)
+            ? js.map((j) => (j.jobId === jobId ? { ...j, ...meta } : j))
+            : [...dropFinished(js), { jobId, status: "queued", total: count, completed: 0, progress: null, images: [], error: null, startedAt: Date.now(), ...meta }],
+        );
+        // A prompt sent to the vault is vault content from now on (cleared on lock; at once while locked).
+        if (saveTo === "vault") {
+          setTainted(true);
+          if (!vault.unlocked) stashNow();
+        }
+      } catch (e) {
+        toast.error("Couldn't start the generation", e);
+      } finally {
+        setSubmitting(false);
+      }
     } finally {
-      setSubmitting(false);
+      inFlight.current = false;
+      lastSubmit.current = Date.now();
     }
   };
 
@@ -543,22 +925,24 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
 
   // ---------- restore ----------
   const applySettings = async (im: ImageRecord) => {
-    // Settings from a vault item keep the new outputs in the vault.
-    if (im.vault) setSaveChoice("vault");
+    // Save to is never changed here (UX-009); a vault start image or reference still forces Vault.
     const dest: Destination = im.vault ? "vault" : saveTo;
     if (isVideo(im)) {
       setLightboxId(null);
+      const prevMode = mode;
       setMode("video");
       // A start frame taken from the gallery (or vault) is re-selected in place (matched by its file path).
       const pool = im.vault ? vault.items : imagesRef.current;
       const galleryStart = im.initImage ? (pool.find((x) => x.kind !== "video" && x.path === im.initImage) ?? null) : null;
-      await videoRef.current?.applySettings(im, galleryStart);
+      await videoRef.current?.applySettings(im, galleryStart, prevMode !== "video" ? { undoMode: () => setMode(prevMode) } : undefined);
       return;
     }
     const m = imageModels.find((x) => x.id === im.model);
     if (!m) return toast.error("That model is no longer available", im.model);
+    const snap = { mode, modelId, prompt, aspect, adv, loraPicks, startImage, denoise, refs, tainted };
     setLightboxId(null);
     setMode("image");
+    if (m.id !== modelId) memory.current.set(modelId, currentMemory());
     setModelId(m.id);
     setPrompt(im.prompt);
     setAspect(im.aspectRatio);
@@ -570,6 +954,8 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
       negativePrompt: m.supportsNegativePrompt ? im.negativePrompt : "",
     });
     setAdvOpen(true);
+    if (im.vault) setTainted(true);
+    panelScrollRef.current?.scrollTo({ top: 0 });
 
     const missing: string[] = [];
     const picks: LoraPick[] = [];
@@ -580,25 +966,33 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     }
     setLoraPicks(picks);
 
-    // img2img: re-import the stored start image (the original file may be gone).
-    setStartImage(null);
-    setDenoise(DENOISE_DEFAULT);
+    // img2img: re-import the stored start image (the original file may be gone). Without one in the
+    // source, a start image already in the form is kept.
     let startFailed = false;
+    let replacedStart = false;
+    let keptStart = false;
     if (im.initImage && m.supportsImg2Img) {
+      replacedStart = !!startImage;
+      setStartImage(null);
       setDenoise(Math.min(DENOISE_MAX, Math.max(DENOISE_MIN, im.denoise ?? DENOISE_DEFAULT)));
       setStartBusy(true);
       try {
-        setStartImage(await api.importReference(im.initImage, dest));
+        setStartImage({ ...(await api.importReference(im.initImage, dest)), label: `Start image of the ${im.vault ? "vault item" : "image"} you restored` });
       } catch {
         startFailed = true;
       } finally {
         setStartBusy(false);
       }
+    } else if (startImage && m.supportsImg2Img) {
+      keptStart = true;
+    } else if (startImage) {
+      replacedStart = true;
+      setStartImage(null);
     }
 
-    setRefs([]);
     let refFails = 0;
     if (m.maxReferences > 0 && im.references.length) {
+      setRefs([]);
       setRefBusy(true);
       const restored: RefItem[] = [];
       for (const p of im.references.slice(0, m.maxReferences)) {
@@ -610,14 +1004,43 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
       }
       setRefs(restored);
       setRefBusy(false);
+    } else {
+      setRefs((rs) => rs.slice(0, m.maxReferences));
     }
-    const problems = [
-      missing.length && `LoRA not in library: ${missing.join(", ")}`,
-      refFails && plural(refFails, "reference") + " couldn't be restored",
-      startFailed && "The start image couldn't be restored",
+
+    const changes = [
+      snap.mode !== "image" ? "switched to Image" : "",
+      snap.prompt.trim() && snap.prompt !== im.prompt ? "replaced your prompt" : "",
+      replacedStart ? (im.initImage && m.supportsImg2Img ? "replaced your start image" : `removed your start image (${m.name} doesn't take one)`) : "",
+      keptStart ? "kept your start image" : "",
     ].filter(Boolean);
-    if (problems.length) toast.info("Settings restored, with gaps", problems.join(". "));
-    else toast.success("Settings restored", `${m.name} · seed ${im.seed}`);
+    const gaps = [
+      !m.installed ? `${m.name} isn't installed — install it in Models to generate` : "",
+      missing.length ? `LoRA not in your library: ${missing.join(", ")}` : "",
+      refFails ? `${plural(refFails, "reference")} couldn't be restored` : "",
+      startFailed ? "the start image couldn't be restored" : "",
+    ].filter(Boolean);
+    const forcedVault = im.vault && ((!!im.initImage && m.supportsImg2Img) || (im.references.length > 0 && m.maxReferences > 0));
+    const vaultNote = im.vault && !forcedVault && saveTo === "general" ? "Save to stays General — choose Vault to keep the result private." : "";
+    const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+    showNotice({
+      tone: gaps.length ? "warn" : "ok",
+      title: `Settings restored · ${m.name} · seed ${im.seed}`,
+      detail: [...changes, ...gaps].map(cap).concat(vaultNote ? [vaultNote] : []).join(". ") || undefined,
+      undo: () => {
+        setMode(snap.mode);
+        setModelId(snap.modelId);
+        setPrompt(snap.prompt);
+        setAspect(snap.aspect);
+        setAdv(snap.adv);
+        setLoraPicks(snap.loraPicks);
+        setStartImage(snap.startImage);
+        setDenoise(snap.denoise);
+        setRefs(snap.refs);
+        setTainted(snap.tainted);
+      },
+      vault: im.vault,
+    });
     requestAnimationFrame(() => promptRef.current?.focus());
   };
 
@@ -661,10 +1084,11 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   const onVideoQueued = useCallback((job: JobView) => {
     setJobs((js) =>
       js.some((j) => j.jobId === job.jobId)
-        ? js.map((j) => (j.jobId === job.jobId ? { ...j, modelName: job.modelName, prompt: job.prompt, kind: "video", destination: job.destination } : j))
-        : [...js, job],
+        ? js.map((j) => (j.jobId === job.jobId ? { ...j, modelName: job.modelName, prompt: job.prompt, kind: "video", destination: job.destination, durationS: job.durationS, resolution: job.resolution, audio: job.audio } : j))
+        : [...dropFinished(js), job],
     );
   }, []);
+
 
   // ---------- gallery tabs (General | Vault) and filters ----------
   const [galleryTab, setGalleryTabState] = useState<GalleryTab>("general");
@@ -679,7 +1103,21 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   const tabItems = galleryTab === "vault" ? (vault.unlocked ? vault.items : []) : images;
   const shown = useMemo(() => applyFilter(tabItems, filter), [tabItems, filter]);
   const videoCount = useMemo(() => tabItems.filter(isVideo).length, [tabItems]);
-  const tabHasMore = galleryTab === "vault" ? false : hasMore;
+  // Real General totals (UX-019): the list is paged, so count through every page when it changes.
+  const [generalTotals, setGeneralTotals] = useState<GalleryTotals | null>(null);
+  useEffect(() => {
+    let alive = true;
+    countGallery()
+      .then((t) => alive && setGeneralTotals(t))
+      .catch(() => alive && setGeneralTotals(null));
+    return () => {
+      alive = false;
+    };
+  }, [images.length, vault.generalEpoch]);
+  const totals: GalleryTotals | null =
+    galleryTab === "vault"
+      ? { items: tabItems.length, images: tabItems.length - videoCount, videos: videoCount }
+      : generalTotals;
   const migrating = !!vault.migration && vault.migration.phase !== "done" && vault.migration.phase !== "error";
   const lightboxIndex = lightboxId ? shown.findIndex((x) => x.id === lightboxId) : -1;
 
@@ -701,6 +1139,21 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
       ? `Starting the video GPU (${vgpu.startTarget}, ${vgpu.costLabel}) — it auto-stops after ${vgpu.idleMinutes} idle minutes.`
       : null;
 
+  const sizeAspect = startActive && startImage?.w && startImage.h ? ratioLabel(startImage.w, startImage.h) : null;
+  const sizeHighlight = sizeAspect && ASPECTS.some((a) => a.key === sizeAspect) ? sizeAspect : undefined;
+  const footHint =
+    blocker === "Write a prompt"
+      ? "Write a prompt to generate."
+      : blocker
+        ? blocker
+        : activeJobs
+          ? `${plural(activeJobs, "job")} running`
+          : startsGpu
+            ? `Starts the GPU pod first (${gpu.startTarget}, ${gpu.costLabel}; a few minutes). It auto-stops after ${gpu.idleMinutes} idle min.`
+            : gpu.podMode
+              ? `Runs on your GPU pod (${gpu.gpuName}, ${gpu.costLabel}).`
+              : "Each image is one RunPod job.";
+
   return (
     <div className="create">
       <VideoPanel
@@ -715,6 +1168,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         onQueued={onVideoQueued}
         activeJobs={activeVideoJobs}
         modelNames={modelNames}
+        history={images}
       />
       <form
         className="panel"
@@ -726,7 +1180,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
           void doGenerate();
         }}
       >
-        <div className="panel__scroll">
+        <div className="panel__scroll" ref={panelScrollRef}>
           {modeSwitch}
           <section className="section">
             <h2 className="section__title">Model</h2>
@@ -741,8 +1195,15 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
                 <span>
                   {model.task ? `${model.name} is downloading to your volume.` : `${model.name} isn't on your RunPod volume yet.`}
                 </span>
-                <button type="button" className="link-btn" onClick={() => onNavigate("models")}>
-                  {model.task ? "View progress" : "Install in Models"} →
+                <button
+                type="button"
+                className="link-btn"
+                onClick={() => {
+                  requestModelFocus(model.id);
+                  onNavigate("models");
+                }}
+              >
+                  {model.task ? `View ${model.name} progress` : `Install ${model.name} in Models`} →
                 </button>
               </div>
             )}
@@ -761,19 +1222,28 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
             <textarea
               id="prompt"
               ref={promptRef}
-              className="input textarea prompt"
+              className={`input textarea prompt ${promptError ? "is-invalid" : ""}`}
               rows={5}
               placeholder="Describe the image — subject, setting, light, lens, mood…"
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
+              aria-invalid={promptError || undefined}
+              aria-describedby={promptError ? "prompt-err" : undefined}
               spellCheck
             />
+            {promptError && (
+              <p className="field-error" id="prompt-err" role="alert">
+                Describe what you want to see first.
+              </p>
+            )}
           </section>
 
           {maxRefs > 0 && (
             <section className="section">
               <div className="section__head">
-                <h2 className="section__title">References</h2>
+                <h2 className="section__title">
+                  References <span className="section__aside">(optional, up to {maxRefs}) — guide subject, style or layout</span>
+                </h2>
                 <span className="hint mono">
                   {refs.length}/{maxRefs}
                 </span>
@@ -786,6 +1256,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
                 onRemove={(id) => setRefs((rs) => rs.filter((r) => r.refId !== id))}
                 onFiles={addFiles}
                 onPick={pickRefs}
+                onPickGallery={() => setRefPickerOpen(true)}
               />
             </section>
           )}
@@ -803,10 +1274,11 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
                 busy={startBusy}
                 dragActive={dragActive && toStart}
                 onDenoise={setDenoise}
-                onRemove={() => setStartImage(null)}
+                onRemove={removeStart}
                 onFiles={addStartFiles}
                 onPick={pickStart}
                 onPickGallery={() => setStartPickerOpen(true)}
+                caption={startImage?.label}
               />
             </section>
           )}
@@ -817,20 +1289,33 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
               model={model}
               library={lib.loras}
               picks={loraPicks}
+              prompt={prompt}
               onChange={setLoraPicks}
-              onInsertWord={insertWord}
+              onRemoved={onLoraRemoved}
+              onToggleWord={toggleWord}
               onOpenLibrary={() => onNavigate("models")}
+              onAddFromLink={() => setLoraLinkOpen(true)}
             />
           </section>
 
           <section className="section">
             <h2 className="section__title">Aspect ratio</h2>
-            <AspectPicker value={aspect} onChange={setAspect} disabled={startActive} describedBy={startActive ? "aspect-note" : undefined} />
-            {startActive && (
-              <p className="hint section__note" id="aspect-note">
-                <Icon name="info" size={12} /> Size follows the start image
+            {startActive ? (
+              <p className="hint section__note start-size" id="aspect-note">
+                <Icon name="info" size={12} /> Size:{" "}
+                {sizeAspect ? (
+                  <>
+                    <strong>{sizeAspect}</strong>
+                    {startImage?.exact && startImage.w ? ` · ${startImage.w}×${startImage.h}` : ""} (follows the start image)
+                  </>
+                ) : (
+                  "follows the start image"
+                )}
               </p>
+            ) : (
+              <AspectPicker value={aspect} onChange={setAspect} />
             )}
+            {startActive && <AspectPicker value={aspect} onChange={setAspect} disabled highlight={sizeHighlight} describedBy="aspect-note" />}
           </section>
 
           <section className="section section--row">
@@ -842,8 +1327,14 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         </div>
 
         <div className="panel__foot">
+          <PanelNoticeView notice={notice} onDismiss={clearNotice} />
           {saveToSwitch}
-          <button type="submit" className="btn btn--generate" disabled={submitting || (!!blocker && blocker !== "Write a prompt")} aria-describedby="gen-hint">
+          <button
+            type="submit"
+            className="btn btn--generate"
+            disabled={submitting || (!!blocker && blocker !== "Write a prompt" && !blocker.startsWith("Fix "))}
+            aria-describedby="gen-hint"
+          >
             <Icon name="spark" size={18} />
             <span>
               {submitting
@@ -855,14 +1346,8 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
               <kbd>↵</kbd>
             </span>
           </button>
-          <p id="gen-hint" className="hint panel__hint">
-            {blocker && blocker !== "Write a prompt" ? blocker : activeJobs
-                ? `${plural(activeJobs, "job")} running`
-                : startsGpu
-                  ? `Starts the GPU pod first (${gpu.startTarget}, ${gpu.costLabel}; a few minutes). It auto-stops after ${gpu.idleMinutes} idle min.`
-                  : gpu.podMode
-                    ? "Runs on your GPU pod."
-                    : "Each image is one RunPod job."}
+          <p id="gen-hint" className={`hint panel__hint ${blocker && blocker !== "Write a prompt" ? "panel__hint--block" : ""}`}>
+            {footHint}
           </p>
         </div>
       </form>
@@ -870,10 +1355,12 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
       <main className="canvas" ref={scrollRef} aria-label="Results">
         {jobs.length > 0 && (
           <div className="jobs" aria-label="Generations in progress">
-            {jobs.map((j) => (
+            {jobs.map((j, i) => (
               <JobCard
                 key={j.jobId}
                 job={j}
+                index={i}
+                count={jobs.length}
                 sealed={j.destination === "vault" && !vault.unlocked}
                 podMode={gpu.podMode}
                 gpuNote={j.kind === "video" && (j.status === "queued" || j.status === "starting") ? videoGpuNote : null}
@@ -886,7 +1373,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         )}
         <div className="canvas__head">
           <h2 className="canvas__title">Gallery</h2>
-          <GalleryTabs value={galleryTab} onChange={setGalleryTab} unlocked={vault.unlocked} />
+          <GalleryTabs value={galleryTab} onChange={setGalleryTab} unlocked={vault.unlocked} exists={vault.exists} />
           {(galleryTab === "general" || (vault.unlocked && !migrating)) && (
             <GalleryFilterChips
               value={filter}
@@ -897,10 +1384,10 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
             />
           )}
           <span className="hint canvas__count">
-            {tabItems.length && !(galleryTab === "vault" && migrating)
+            {totals && totals.items && !(galleryTab === "vault" && migrating)
               ? filter === "all"
-                ? `${tabItems.length}${tabHasMore ? "+" : ""} item${tabItems.length === 1 ? "" : "s"}${videoCount ? ` · ${videoCount} video${videoCount === 1 ? "" : "s"}` : ""}`
-                : `${shown.length}${tabHasMore ? "+" : ""} ${filter === "video" ? (shown.length === 1 ? "video" : "videos") : shown.length === 1 ? "image" : "images"}`
+                ? `${totals.items} item${totals.items === 1 ? "" : "s"}${totals.videos ? ` · ${totals.videos} video${totals.videos === 1 ? "" : "s"}` : ""}`
+                : `${totalFor(totals, filter)} ${filter === "video" ? (totalFor(totals, filter) === 1 ? "video" : "videos") : totalFor(totals, filter) === 1 ? "image" : "images"}`
               : ""}
           </span>
           {vault.unlocked && (
@@ -971,13 +1458,22 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         vaultExists={vault.exists}
         vaultUnlocked={vault.unlocked}
         onUseSettings={applySettings}
+        onRedraw={redraw}
+        onUseAsReference={
+          mode === "image" && maxRefs > 0
+            ? (im) => {
+                setLightboxId(null);
+                void addRefFromGallery(im);
+              }
+            : undefined
+        }
         onMakeVideo={
           lib.videoModels.some((m) => m.modes?.includes("i2v"))
             ? (im) => {
                 setLightboxId(null);
-                if (im.vault) setSaveChoice("vault");
+                const prevMode = mode;
                 setMode("video");
-                videoRef.current?.startFromImage(im);
+                videoRef.current?.startFromImage(im, prevMode !== "video" ? { undoMode: () => setMode(prevMode) } : undefined);
               }
             : undefined
         }
@@ -988,17 +1484,39 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         open={startPickerOpen}
         preferVault={saveTo === "vault"}
         modelNames={modelNames}
+        currentId={startImage?.sourceId}
         onClose={() => setStartPickerOpen(false)}
         onPick={(rec) => {
           setStartPickerOpen(false);
-          // A vault item is used in place (decrypted in memory by the backend, `initImageVaultId`).
-          if (rec.vault) {
-            setSaveChoice("vault");
-            setStartImage({ refId: "", thumbPath: rec.thumbPath || rec.path, vaultId: rec.id });
-            return;
-          }
-          // Image mode has no gallery-id argument: import the gallery file like any other start image.
-          void setStartFrom(() => api.importReference(rec.path, saveTo));
+          startFromRecord(rec);
+        }}
+      />
+
+      <GalleryPicker
+        open={refPickerOpen}
+        title="Choose a reference image"
+        purpose="reference"
+        preferVault={saveTo === "vault"}
+        modelNames={modelNames}
+        onClose={() => setRefPickerOpen(false)}
+        onPick={(rec) => void addRefFromGallery(rec)}
+      />
+
+      <AddLoraLinkDialog
+        open={loraLinkOpen}
+        model={model}
+        onClose={() => setLoraLinkOpen(false)}
+        onAdded={(l) => {
+          setLoraLinkOpen(false);
+          pendingLoras.current.add(l.id);
+          showNotice({
+            tone: "ok",
+            title: `Adding ${l.name}`,
+            detail:
+              l.modelId === modelId
+                ? "Downloading to your volume — it's added to this form when ready."
+                : `Downloading to your volume. It's made for ${modelNames[l.modelId] ?? l.modelId}, so it appears there.`,
+          });
         }}
       />
 
@@ -1031,7 +1549,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
 
 const GALLERY_TABS: GalleryTab[] = ["general", "vault"];
 
-function GalleryTabs({ value, onChange, unlocked }: { value: GalleryTab; onChange: (t: GalleryTab) => void; unlocked: boolean }) {
+function GalleryTabs({ value, onChange, unlocked, exists }: { value: GalleryTab; onChange: (t: GalleryTab) => void; unlocked: boolean; exists: boolean }) {
   return (
     <div className="gallery-tabs" role="tablist" aria-label="Gallery" onKeyDown={radioKeys(GALLERY_TABS, value, onChange)}>
       {GALLERY_TABS.map((t) => (
@@ -1050,9 +1568,15 @@ function GalleryTabs({ value, onChange, unlocked }: { value: GalleryTab; onChang
             "General"
           ) : (
             <>
-              <Icon name={unlocked ? "unlock" : "lock"} size={14} />
+              <Icon name={unlocked ? "lockOpen" : "lock"} size={14} />
               Vault
-              <span className="visually-hidden">{unlocked ? " (unlocked)" : " (locked)"}</span>
+              {!exists ? (
+                <span className="gallery-tab__state"> · Set up</span>
+              ) : unlocked ? (
+                <span className="gallery-tab__state"> · unlocked</span>
+              ) : (
+                <span className="visually-hidden"> (locked)</span>
+              )}
             </>
           )}
         </button>

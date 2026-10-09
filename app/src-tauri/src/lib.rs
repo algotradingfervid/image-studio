@@ -266,6 +266,8 @@ pub fn run() {
             commands::get_settings,
             commands::save_settings,
             commands::test_connection,
+            commands::test_api_keys,
+            commands::reveal_settings_file,
             commands::get_gpu_state,
             commands::list_gpu_states,
             commands::start_gpu,

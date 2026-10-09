@@ -6,7 +6,7 @@ use crate::jobs::{Job, JobEntry};
 use crate::links::LinkResolver;
 use crate::pod::{Gpu, GpuState};
 use crate::registry::Registry;
-use crate::runpod::{RunpodClient, DEFAULT_API_ROOT};
+use crate::runpod::DEFAULT_API_ROOT;
 use crate::settings::Settings;
 use crate::status::StatusView;
 use crate::tasks::{Task, TaskEntry};
@@ -132,18 +132,6 @@ impl Core {
         }))
     }
 
-    pub fn runpod(&self) -> Result<RunpodClient, String> {
-        let key = self
-            .settings
-            .runpod_api_key()
-            .ok_or("Add your RunPod API key in Settings first")?;
-        let endpoint = self
-            .settings
-            .endpoint_id()
-            .ok_or("Add your RunPod endpoint ID in Settings first")?;
-        Ok(RunpodClient::new(&self.cfg.runpod_root, &endpoint, &key))
-    }
-
     pub fn resolver(&self) -> LinkResolver {
         LinkResolver::new(
             &self.cfg.civitai_root,
@@ -174,6 +162,23 @@ impl Core {
     /// Emits the current vault status to the UI.
     pub fn emit_vault(&self) {
         self.sink.vault_update(&self.vault.status());
+    }
+
+    /// Changes the vault auto-lock minutes (persisted). Only while the vault
+    /// is unlocked (owner decision): locked or with no vault it is refused,
+    /// so nobody can lengthen the auto-lock of a vault they can't open.
+    pub fn set_vault_auto_lock(&self, minutes: u32) -> Result<VaultStatus, String> {
+        if !self.vault.is_unlocked() {
+            return Err(format!(
+                "{}: Unlock the vault to change its auto-lock time",
+                crate::vault::ERR_LOCKED
+            ));
+        }
+        self.settings.save_vault_auto_lock(minutes)?;
+        self.vault.set_auto_lock(minutes);
+        self.vault.touch();
+        self.emit_vault();
+        Ok(self.vault.status())
     }
 }
 

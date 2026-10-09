@@ -5,7 +5,8 @@
 use app_lib::db::{Db, ImageRecord, RunpodTimes, KIND_IMAGE, KIND_VIDEO};
 use app_lib::jobs::{self, Destination, GenerateRequest, Job, JobState, VideoRequest};
 use app_lib::registry::Registry;
-use app_lib::settings::{MemoryStore, SecretStore, Settings, ACCOUNT_RUNPOD, ENV_RUNPOD_ENDPOINT};
+use app_lib::pod::{self, GpuStatus};
+use app_lib::settings::{MemoryStore, SecretStore, Settings, ACCOUNT_POD_TOKEN, ACCOUNT_RUNPOD};
 use app_lib::state::{Core, CoreConfig, EventSink};
 use app_lib::status::StatusView;
 use app_lib::tasks::Task;
@@ -53,9 +54,8 @@ fn harness(server_uri: &str) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(MemoryStore::default());
     store.set(ACCOUNT_RUNPOD, Some("test-key")).unwrap();
-    let env: HashMap<String, String> = [(ENV_RUNPOD_ENDPOINT.to_string(), "ep1".to_string())].into();
-    std::fs::write(dir.path().join("settings.json"), r#"{"backend":"serverless"}"#).unwrap();
-    let settings = Settings::new(store, env, dir.path().join("settings.json"));
+    store.set(ACCOUNT_POD_TOKEN, Some("podtok")).unwrap();
+    let settings = Settings::new(store, HashMap::new(), dir.path().join("settings.json"));
     let sink = Arc::new(Collect::default());
     let cfg = CoreConfig {
         data_dir: dir.path().to_path_buf(),
@@ -63,6 +63,13 @@ fn harness(server_uri: &str) -> Harness {
         civitai_root: server_uri.to_string(),
         hf_root: server_uri.to_string(),
         poll_interval: Duration::from_millis(10),
+        // Never the real RunPod API: REST and the pod's worker API are mocked.
+        rest_root: server_uri.to_string(),
+        pod_proxy_template: format!("{server_uri}/proxy/{{podId}}"),
+        pod_poll_interval: Duration::from_millis(10),
+        pod_start_timeout: Duration::from_secs(5),
+        pod_stop_timeout: Duration::from_secs(2),
+        rest_timeout: Duration::from_secs(2),
         ..CoreConfig::production(dir.path().to_path_buf())
     };
     // A real database file, so its bytes can be inspected.
@@ -442,19 +449,56 @@ async fn wait_job(sink: &Collect, job_id: &str) -> Job {
     panic!("job did not finish");
 }
 
+/// The RunPod REST API with a running image pod `pod1`, and that pod's worker.
 async fn mock_server(image: Vec<u8>, video: Vec<u8>, poster: Vec<u8>) -> MockServer {
     let server = MockServer::start().await;
+    let pod = json!({"id": "pod1", "name": "image-studio-gpu", "status": "RUNNING", "cost": 2.39,
+        "gpu": {"id": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "count": 1},
+        "startedAt": "2026-10-09T10:00:05Z"});
+    Mock::given(method("GET"))
+        .and(path("/v2/pods"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pods": [pod.clone()], "pagination": {"hasNextPage": false}})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/pod1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pod))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/proxy/pod1/ping"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ok"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/proxy/pod1/health"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"jobs": {"inQueue": 0, "inProgress": 0},
+            "workers": {"idle": 1, "running": 0}, "ready": true})))
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
-        .and(path("/v2/ep1/run"))
+        .and(path("/proxy/pod1/run"))
         .respond_with(RunByAction)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path_regex("/v2/ep1/status/.*"))
+        .and(path_regex("/proxy/pod1/status/.*"))
         .respond_with(Completed { image, video, poster })
         .mount(&server)
         .await;
     server
+}
+
+/// Adopts the mocked running image pod.
+async fn adopt_running_pod(h: &Harness) {
+    pod::adopt(&h.core).await.unwrap();
+    for _ in 0..500 {
+        if pod::state(&h.core).status == GpuStatus::Running {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the mocked pod never became ready");
 }
 
 #[tokio::test]
@@ -462,6 +506,7 @@ async fn vault_jobs_never_write_plaintext_and_seal_while_locked() {
     let out_png = png(200, 64, 48);
     let server = mock_server(out_png.clone(), mp4(9), jpeg(9)).await;
     let h = harness(&server.uri());
+    adopt_running_pod(&h).await;
     let v = &h.core.vault;
 
     // No vault yet: a vault job is refused before anything is queued.
@@ -537,7 +582,7 @@ async fn vault_jobs_never_write_plaintext_and_seal_while_locked() {
     assert!(items.iter().any(|i| i.prompt.ends_with("while locked")));
 
     // The vault image as the start image of another vault job (img2img, so it
-    // runs on the mocked serverless worker): decrypted in memory, sent
+    // runs on the mocked pod worker): decrypted in memory, sent
     // downscaled, and referenced in place.
     let mut from_vault = r.clone();
     from_vault.init_image_id = None;
@@ -704,4 +749,35 @@ fn migration_moves_a_video_whose_start_image_was_a_migrated_gallery_image() {
     let v2_item = v.find_by_source("v2").unwrap().expect("v2 in the vault");
     assert!(v2_item.init_image.is_none());
     assert_eq!(&*v.open_blob(&v2_item.media.id).unwrap(), &mp4(2)[..]);
+}
+
+#[test]
+fn auto_lock_can_only_change_while_unlocked() {
+    let h = harness("http://127.0.0.1:1");
+    // No vault: refused.
+    assert!(h.core.set_vault_auto_lock(20).unwrap_err().starts_with("VAULT_LOCKED"));
+    h.core.vault.create(PW, KdfParams::fast()).unwrap();
+    let st = h.core.set_vault_auto_lock(20).unwrap();
+    assert_eq!(st.auto_lock_minutes, 20);
+    assert_eq!(h.core.settings.vault_auto_lock_minutes(), 20);
+    h.core.vault.lock();
+    // Locked: refused, and nothing changes (memory or settings file).
+    assert!(h.core.set_vault_auto_lock(240).unwrap_err().starts_with("VAULT_LOCKED"));
+    assert_eq!(h.core.settings.vault_auto_lock_minutes(), 20);
+    assert_eq!(h.core.vault.status().auto_lock_minutes, 20);
+    h.core.vault.unlock(PW).unwrap();
+    assert!(h.core.set_vault_auto_lock(0).is_err(), "range still checked");
+    assert_eq!(h.core.set_vault_auto_lock(30).unwrap().auto_lock_minutes, 30);
+}
+
+#[test]
+fn changing_the_password_to_the_same_one_is_refused() {
+    let h = harness("http://127.0.0.1:1");
+    let v = &h.core.vault;
+    v.create(PW, KdfParams::fast()).unwrap();
+    let e = v.change_password(PW, PW, KdfParams::fast()).unwrap_err();
+    assert!(e.starts_with("SAME_PASSWORD"), "{e}");
+    // The password still works.
+    v.lock();
+    v.unlock(PW).unwrap();
 }

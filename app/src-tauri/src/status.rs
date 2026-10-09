@@ -258,14 +258,37 @@ pub async fn refresh_status_opts_for(
         Profile::Image => &core.refresh_lock,
         Profile::Video => &core.video_refresh_lock,
     };
+    let r = refresh_locked(core, p, lock, &requested_at).await;
+    if allow_start {
+        // A pod this Refresh started (and nothing else uses) stops again
+        // (UX-047); the stop finishes in the background (gpu-update events).
+        if let Some(rel) = crate::pod::begin_release(core, p, crate::pod::StopReason::Finished) {
+            let c = core.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::pod::complete_release(&c, rel).await {
+                    eprintln!("[status] stopping the GPU after Refresh failed: {e}");
+                }
+            });
+        }
+    }
+    r
+}
+
+async fn refresh_locked(
+    core: &Arc<Core>,
+    p: Profile,
+    lock: &tokio::sync::Mutex<()>,
+    requested_at: &str,
+) -> Result<StatusView, String> {
     let _guard = lock.lock().await;
     if let Some((_, at)) = core.db.lock().unwrap().load_status_for(p.as_str())? {
-        if at >= requested_at {
+        if at.as_str() >= requested_at {
             drop(_guard);
             return cached_view_for(core, p);
         }
     }
-    let client = crate::worker::client_for(core, p, &mut |_| {}, &|| false).await?;
+    let client =
+        crate::worker::client_as(core, p, crate::pod::StartOrigin::Task, &mut |_| {}, &|| false).await?;
     if client.is_pod() && crate::pod::cached_volume_size_gb_for(core, p).is_none() {
         if let Ok(rest) = crate::pod::rest(core) {
             let _ = crate::pod::lookup_volume_for(core, &rest, p).await;
