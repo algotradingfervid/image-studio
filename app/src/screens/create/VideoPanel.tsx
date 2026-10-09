@@ -132,7 +132,7 @@ export const VideoPanel = forwardRef<
   const gpu = useGpu();
   const vgpu = gpu.profiles.video;
   const configured = isConfigured(lib.settings);
-  const startsGpu = gpu.podMode && api.gpuIsOff(vgpu.state);
+  const startsGpu = vgpu.needsStart;
   const models = lib.videoModels;
 
   const [modelId, setModelId] = useState(readLast);
@@ -356,6 +356,8 @@ export const VideoPanel = forwardRef<
       return;
     }
     if (!model) return;
+    // Owner's rule: confirm before starting a billed GPU. Cancel queues nothing.
+    if (!(await gpu.confirmStart("generate a video", "video"))) return;
     const input: GenerateVideoInput = {
       model: model.id,
       prompt: prompt.trim(),

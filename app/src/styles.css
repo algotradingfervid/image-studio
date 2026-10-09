@@ -412,6 +412,29 @@ kbd {
   line-height: 1.5;
 }
 
+/* Start-GPU confirmation: Pod / GPU / Price / Billing facts. */
+.start-gpu__facts {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 6px 14px;
+  margin: 0 0 12px;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.start-gpu__facts dt {
+  color: var(--text-3);
+}
+
+.start-gpu__facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.start-gpu .dialog__foot {
+  flex-wrap: wrap;
+}
+
 /* -------------------------------------------------------------- controls */
 
 .btn {

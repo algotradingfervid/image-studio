@@ -80,8 +80,8 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   const configured = isConfigured(lib.settings);
   const gpu = useGpu();
   const vault = useVault();
-  // Pod backend with the GPU off: Generate auto-starts it first.
-  const startsGpu = gpu.podMode && gpuIsOff(gpu.state);
+  // Pod backend with the GPU not starting/running: Generate starts it first (after the start confirmation).
+  const startsGpu = gpu.profiles.image.needsStart;
   const imageModels = lib.imageModels;
 
   // ---------- Image | Video ----------
@@ -496,6 +496,8 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
       return;
     }
     if (!model) return;
+    // Owner's rule: confirm before starting a billed GPU. Cancel queues nothing.
+    if (!(await gpu.confirmStart(count > 1 ? `generate ${count} images` : "generate", "image"))) return;
     const input: GenerateInput = {
       model: model.id,
       prompt: prompt.trim(),

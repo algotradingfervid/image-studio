@@ -19,6 +19,11 @@
 // unlocking waits ~1 s like Argon2. Vault media are data URLs here (vault:// in the app); a
 // vault reference's refId is a vault://localhost/… URL like the core's, its thumbPath a data URL.
 //
+// GPU-start audit (for walking the "confirm before a paid GPU start" flows): `window.mockStats`
+// counts every pod start per profile and every command that would start a stopped pod
+// (generate, generate_video, download_model, delete_model, add_lora, delete_lora,
+// refresh_status, start_gpu); `window.mockStats.reset()` zeroes it.
+//
 // Quit flow: a browser tab can't intercept closing with an in-app dialog, so call
 // `window.mockQuit()` from the console to simulate ⌘Q (`quit-requested` when a pod
 // may be billing); `confirm_quit` then logs instead of exiting.
@@ -295,9 +300,23 @@ function setGpu(p: GpuProfile, patch: Partial<GpuState>) {
   emit("gpu-update", gpus[p]);
 }
 
+/** See the header: what a Cancel in the start confirmation must never produce. */
+const GPU_START_COMMANDS = new Set(["generate", "generate_video", "download_model", "delete_model", "add_lora", "delete_lora", "refresh_status", "start_gpu"]);
+const mockStats = {
+  gpuStarts: { image: 0, video: 0 } as Record<GpuProfile, number>,
+  commands: [] as string[],
+  reset() {
+    mockStats.gpuStarts = { image: 0, video: 0 };
+    mockStats.commands = [];
+  },
+};
+(window as unknown as { mockStats: typeof mockStats }).mockStats = mockStats;
+
 function startGpuInternal(p: GpuProfile) {
   const gpu = gpus[p];
   if (gpu.status === "starting" || gpu.status === "running" || gpu.status === "stopping") return;
+  mockStats.gpuStarts[p]++;
+  console.info(`[mock] Starting the ${p} GPU pod (start #${mockStats.gpuStarts[p]})`);
   const run = ++gpuRun[p];
   setGpu(p, {
     status: "starting",
@@ -1634,6 +1653,7 @@ export function createMockBackend(): Backend {
     async invoke<T>(cmd: string, args: Record<string, unknown> = {}): Promise<T> {
       const h = commands[cmd];
       if (!h) throw new Error(`[mock] Unknown command: ${cmd}`);
+      if (GPU_START_COMMANDS.has(cmd)) mockStats.commands.push(cmd);
       await sleep(30);
       try {
         return structuredClone(await h(args)) as T;

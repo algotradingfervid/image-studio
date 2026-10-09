@@ -5,9 +5,10 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import * as api from "../api";
-import { gpuIsOff, isTaskActive, type GpuProfile, type GpuState, type Job } from "../api";
+import { isTaskActive, type GpuProfile, type GpuState, type Job } from "../api";
 import { useNow } from "../lib/useNow";
 import { Dialog } from "../components/Dialog";
+import { StartGpuDialog } from "../components/StartGpuDialog";
 import { Icon } from "../components/Icon";
 import { formatElapsed, formatUsd, shortGpuName, toDate } from "../lib/format";
 import { useLibrary } from "./library";
@@ -38,19 +39,24 @@ export interface GpuProfileInfo {
   activeWork: number;
   /** Starting, running, stopping, or in error with a pod that may still bill. */
   live: boolean;
+  /** Pod mode and the pod isn't starting/running: an action on this profile starts it (after confirmStart). */
+  needsStart: boolean;
 }
 
-interface Gpu extends Omit<GpuProfileInfo, "profile" | "live"> {
+interface Gpu extends Omit<GpuProfileInfo, "profile" | "live" | "needsStart"> {
   /** The image profile's fields are spread at the top level (state, gpuName, costLabel, …) for older callers. */
   profiles: Record<GpuProfile, GpuProfileInfo>;
   /** The pod backend is selected (false for legacy serverless: no pill, no prompts). */
   podMode: boolean;
+  /** Starts that profile's pod — after the start confirmation when it isn't already starting/running. */
   start(profile?: GpuProfile): Promise<void>;
   /** Stops that profile's pod; asks first (in-app) when a job or task is active on it. */
   stop(profile?: GpuProfile): void;
   /**
-   * Before an action that auto-starts a GPU: resolves true at once when that profile's GPU is
-   * starting/running (or in serverless mode); otherwise asks and resolves with the answer.
+   * THE confirmation before anything that would start a billed GPU pod (owner's rule: always
+   * confirm). Resolves true at once when that profile's GPU is already starting/running (or in
+   * serverless mode); otherwise shows the start dialog and resolves with the answer. Callers must
+   * not touch the backend when it resolves false.
    */
   confirmStart(action?: string, profile?: GpuProfile): Promise<boolean>;
 }
@@ -69,6 +75,9 @@ const jobProfile = (j: Job): GpuProfile => (j.kind === "video" ? "video" : "imag
 /** A pod may exist (and bill) in this state. */
 export const gpuIsLive = (g: GpuState | null | undefined): boolean =>
   !!g && (g.status === "starting" || g.status === "running" || g.status === "stopping" || (g.status === "error" && !!g.podId));
+
+/** Work on this pod would (re)start it: anything but starting/running — stopped, stopping, error, or not known yet. */
+export const gpuNeedsStart = (g: GpuState | null | undefined): boolean => !g || (g.status !== "starting" && g.status !== "running");
 
 const emptyStates: Record<GpuProfile, GpuState | null> = { image: null, video: null };
 
@@ -112,6 +121,7 @@ export function GpuProvider({ children }: { children: ReactNode }) {
       idleMinutes: state?.idleMinutes ?? s?.idleMinutes ?? DEFAULT_IDLE,
       activeWork: jobsOf(p) + tasksOf(p),
       live: gpuIsLive(state),
+      needsStart: podMode && gpuNeedsStart(state),
     };
   };
   const profiles: Record<GpuProfile, GpuProfileInfo> = { image: info("image"), video: info("video") };
@@ -224,8 +234,31 @@ export function GpuProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
+  const statesRef = useRef(states);
+  statesRef.current = states;
+  const podModeRef = useRef(podMode);
+  podModeRef.current = podMode;
+  const pendingAsk = useRef<((ok: boolean) => void) | null>(null);
+  const confirmStart = useCallback((action?: string, profile: GpuProfile = "image") => {
+    if (!podModeRef.current || !gpuNeedsStart(statesRef.current[profile])) return Promise.resolve(true);
+    // A newer request replaces an open one; the older caller gets "no".
+    pendingAsk.current?.(false);
+    return new Promise<boolean>((resolve) => {
+      pendingAsk.current = resolve;
+      setStartAsk({ action, profile, resolve });
+    });
+  }, []);
+
+  const answerStart = (ok: boolean) => {
+    const resolve = startAsk?.resolve;
+    pendingAsk.current = null;
+    setStartAsk(null);
+    resolve?.(ok);
+  };
+
   const start = useCallback(
     async (profile: GpuProfile = "image") => {
+      if (!(await confirmStart(undefined, profile))) return;
       try {
         const g = await api.startGpu(profile);
         apply({ ...g, profile: g.profile ?? profile });
@@ -233,7 +266,7 @@ export function GpuProvider({ children }: { children: ReactNode }) {
         toast.error(profile === "video" ? "Couldn't start the video GPU" : "Couldn't start the GPU", e);
       }
     },
-    [apply, toast],
+    [apply, toast, confirmStart],
   );
 
   const doStop = useCallback(
@@ -262,19 +295,6 @@ export function GpuProvider({ children }: { children: ReactNode }) {
     [doStop],
   );
 
-  const statesRef = useRef(states);
-  statesRef.current = states;
-  const podModeRef = useRef(podMode);
-  podModeRef.current = podMode;
-  const confirmStart = useCallback((action?: string, profile: GpuProfile = "image") => {
-    if (!podModeRef.current || !gpuIsOff(statesRef.current[profile])) return Promise.resolve(true);
-    return new Promise<boolean>((resolve) => setStartAsk({ action, profile, resolve }));
-  }, []);
-
-  const answerStart = (ok: boolean) => {
-    startAsk?.resolve(ok);
-    setStartAsk(null);
-  };
 
   const img = profiles.image;
   const value: Gpu = {
@@ -392,37 +412,20 @@ export function GpuProvider({ children }: { children: ReactNode }) {
         )}
       </Dialog>
 
-      <Dialog
+      <StartGpuDialog
         open={!!startAsk}
-        onClose={() => answerStart(false)}
-        title={
-          startAsk?.profile === "video"
-            ? startAsk.action
-              ? `Start the video GPU to ${startAsk.action}?`
-              : "Start the video GPU?"
-            : startAsk?.action
-              ? `Start the GPU to ${startAsk.action}?`
-              : "Start the GPU?"
+        action={startAsk?.action}
+        onAnswer={answerStart}
+        info={
+          startInfo && {
+            profile: startInfo.profile,
+            gpu: startInfo.state?.gpuType ? startInfo.gpuName : startInfo.startTarget,
+            costPerHr: startInfo.costPerHr,
+            costKnown: startInfo.state?.costPerHr != null,
+            idleMinutes: startInfo.idleMinutes,
+          }
         }
-        footer={
-          <>
-            <button type="button" className="btn" onClick={() => answerStart(false)}>
-              Cancel
-            </button>
-            <button type="button" className="btn btn--primary" onClick={() => answerStart(true)} autoFocus>
-              <Icon name="bolt" /> Start GPU &amp; continue
-            </button>
-          </>
-        }
-      >
-        {startInfo && (
-          <p className="gpu-dialog__lede">
-            This starts the {startInfo.profile === "video" ? "video GPU pod in Canada" : "GPU pod"} ({startInfo.startTarget}, {startInfo.costLabel}). It auto-stops
-            after {startInfo.idleMinutes} idle minutes.
-          </p>
-        )}
-        <p className="hint">Starting takes a few minutes; the action waits in the queue until the GPU is ready.</p>
-      </Dialog>
+      />
     </Ctx.Provider>
   );
 }

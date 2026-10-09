@@ -1,7 +1,12 @@
-import { useEffect, useId, useRef, type ReactNode } from "react";
+import { useEffect, useId, useRef, type KeyboardEvent, type ReactNode, type RefObject } from "react";
 import { Icon } from "./Icon";
 
-/** Modal built on the native <dialog> element: focus trap, Esc and backdrop for free. */
+const FOCUSABLE = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/**
+ * Modal built on the native <dialog> element: Esc and backdrop for free; Tab / Shift+Tab
+ * cycle inside the dialog (the browser alone would let focus escape to its own chrome).
+ */
 export function Dialog({
   open,
   onClose,
@@ -10,6 +15,8 @@ export function Dialog({
   footer,
   className,
   labelledBy,
+  initialFocusRef,
+  onKeyDown,
 }: {
   open: boolean;
   onClose: () => void;
@@ -18,6 +25,9 @@ export function Dialog({
   footer?: ReactNode;
   className?: string;
   labelledBy?: string;
+  /** Focused once the dialog opens (otherwise the browser focuses the first control: the close button). */
+  initialFocusRef?: RefObject<HTMLElement | null>;
+  onKeyDown?: (e: KeyboardEvent<HTMLDialogElement>) => void;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   const onCloseRef = useRef(onClose);
@@ -26,9 +36,27 @@ export function Dialog({
   useEffect(() => {
     const d = ref.current;
     if (!d) return;
-    if (open && !d.open) d.showModal();
-    else if (!open && d.open) d.close();
-  }, [open]);
+    if (open && !d.open) {
+      d.showModal();
+      initialFocusRef?.current?.focus();
+    } else if (!open && d.open) d.close();
+  }, [open, initialFocusRef]);
+
+  const trapTab = (e: KeyboardEvent<HTMLDialogElement>) => {
+    if (e.key !== "Tab" || !ref.current) return;
+    const items = [...ref.current.querySelectorAll<HTMLElement>(FOCUSABLE)].filter((el) => el.offsetParent !== null);
+    if (items.length === 0) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    const at = document.activeElement;
+    if (e.shiftKey && (at === first || !ref.current.contains(at))) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && (at === last || !ref.current.contains(at))) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
 
   useEffect(() => {
     const d = ref.current;
@@ -48,6 +76,10 @@ export function Dialog({
       ref={ref}
       className={`dialog ${className ?? ""}`}
       aria-labelledby={title ? titleId : undefined}
+      onKeyDown={(e) => {
+        onKeyDown?.(e);
+        if (!e.defaultPrevented) trapTab(e);
+      }}
       onMouseDown={(e) => {
         if (e.target === ref.current) onClose();
       }}

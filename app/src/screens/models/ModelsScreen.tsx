@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import * as api from "../../api";
-import { gpuIsOff, isTaskActive, type DeletePreview, type GpuProfile, type ModelView } from "../../api";
+import { isTaskActive, type DeletePreview, type GpuProfile, type ModelView } from "../../api";
 import { Dialog, ProgressBar } from "../../components/Dialog";
 import { Icon } from "../../components/Icon";
 import { formatBytes, formatRelative, pct, toDate } from "../../lib/format";
@@ -309,8 +309,8 @@ function DeleteDialog({ model: m, profile, open, onClose }: { model: ModelView; 
   const lib = useLibrary();
   const gpu = useGpu();
   const pg = gpu.profiles[profile];
-  // This dialog is already a confirmation, so the GPU-start notice lives inside it.
-  const startsGpu = gpu.podMode && gpuIsOff(pg.state);
+  // Deleting runs on the GPU: when it isn't starting/running, the shared start confirmation follows.
+  const startsGpu = pg.needsStart;
   const toast = useToast();
   const [preview, setPreview] = useState<DeletePreview | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -331,6 +331,8 @@ function DeleteDialog({ model: m, profile, open, onClose }: { model: ModelView; 
   }, [open, m.id]);
 
   const confirm = async () => {
+    // The start confirmation opens over this dialog; Cancel there leaves this one open and deletes nothing.
+    if (!(await gpu.confirmStart(`delete ${m.name}`, profile))) return;
     setBusy(true);
     try {
       const r = await api.deleteModel(m.id);
@@ -366,15 +368,15 @@ function DeleteDialog({ model: m, profile, open, onClose }: { model: ModelView; 
             <Icon name="trash" />{" "}
             {busy
               ? "Deleting…"
-              : `${startsGpu ? "Start GPU & delete" : "Delete"}${preview ? ` ${preview.deleteFiles.length} file${preview.deleteFiles.length === 1 ? "" : "s"}` : ""}`}
+              : `Delete${preview ? ` ${preview.deleteFiles.length} file${preview.deleteFiles.length === 1 ? "" : "s"}` : ""}`}
           </button>
         </>
       }
     >
       {startsGpu && preview && !nothing && (
         <p className="notice notice--warn">
-          <Icon name="bolt" /> This starts the {profile === "video" ? "video GPU in Canada" : "GPU pod"} ({pg.startTarget}, {pg.costLabel}) if it isn't running. It
-          auto-stops after {pg.idleMinutes} idle minutes.
+          <Icon name="bolt" /> Deleting needs the {profile === "video" ? "video GPU (Canada)" : "Images GPU (EU-RO-1)"}, which isn't running — you'll confirm
+          starting it ({pg.costLabel}) next.
         </p>
       )}
       {error && <p className="notice notice--error">{error}</p>}
