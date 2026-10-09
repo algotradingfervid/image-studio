@@ -365,3 +365,70 @@ Each video model entry carries:
   - a job card with stages and an ETA
 - **Gallery and storage.** The gallery shows video tiles (poster image plus duration badge; plays muted on hover). The lightbox plays the video with sound and offers Download (.mp4) and Use these settings. Records live in the same `images` table with `kind = 'video'` and extra columns: duration, fps, hasAudio, posterPath.
 - **Models screen.** The Models screen lists the video models under their own heading, showing their region.
+
+---
+
+# v6 — Vault (password-protected, encrypted content) — 2026-10-09
+
+## Goal
+Two gallery tabs: **General** and **Vault**. Vault content is encrypted on disk and invisible
+everywhere in the app until the user unlocks the vault with a password. All content created
+before v6 (24 images, 1 video, their posters and the start images in `references/`) moves into
+the vault. For new creations the user picks the destination (General / Vault) on the Create
+screen.
+
+## Crypto design (crate versions pinned, audited RustCrypto / libsodium-equivalent crates only)
+- **Keys:** on vault creation generate an X25519 key pair. The **public key** is stored in plain
+  text (`vault/vault.json`). The **private key** is encrypted with a key derived from the
+  password: Argon2id (m = 256 MiB, t = 3, p = 1, 16-byte random salt, params stored in
+  `vault.json`) → XChaCha20-Poly1305. A wrong password fails the AEAD check (no separate hash).
+- **Writing never needs the password:** each vault item is encrypted with a fresh random
+  32-byte content key (XChaCha20-Poly1305); the content key is sealed to the public key
+  (X25519 ephemeral + HKDF-SHA256 → XChaCha20-Poly1305, i.e. a sealed box). So a vault job
+  that finishes while the vault is locked is saved encrypted without prompting.
+- **Reading needs the unlocked private key**, held only in memory (zeroized on lock).
+- **Large files:** chunked AEAD (STREAM construction, 1 MiB chunks, chunk index + last-chunk flag
+  in the nonce/AD) so videos can be decrypted with random access for seeking.
+- **On disk:** `vault/blobs/<random-uuid>.bin` per file (media, poster, thumbnail, start
+  image); no extensions, no plaintext names. Metadata (prompt, negative prompt, model, seed,
+  settings, LoRAs, dimensions, created time, kind) lives in an encrypted JSON record per item
+  (`vault/items/<uuid>.bin`). The SQLite DB stores nothing about vault items.
+- No password recovery. Changing the password re-wraps only the private key.
+
+## Behaviour
+- **Locked (default at launch):** vault items appear nowhere — not in the gallery, filters,
+  counts, the "From gallery" start-image picker, lightbox navigation or job history. The Vault
+  tab shows a lock screen (password field; "Create vault" on first use).
+- **Unlock:** password → private key in memory. Gallery Vault tab lists decrypted items
+  (records decrypted into memory; thumbnails decrypted on demand).
+- **Auto-lock:** on app quit, on Mac sleep / screen lock, after N minutes without interaction
+  (setting, default 10), and a Lock button. Locking wipes the key and in-memory caches and
+  reloads the UI's vault views.
+- **Viewing:** a custom Tauri URI scheme (`vault://`) serves decrypted bytes from memory with
+  HTTP Range support (video seeking) and `Cache-Control: no-store`; refuses when locked.
+  Plaintext is never written to disk (no temp files).
+- **Create screen:** a **Save to: General | Vault** switch (remembered per session; defaults to
+  Vault when the vault is unlocked, else General). Jobs carry their destination; vault outputs
+  are encrypted the moment they arrive and the plaintext is never written. The job card for a
+  vault job hides its prompt and thumbnail once the vault is locked.
+- **Start images:** a vault item can be the i2v / img2img start image only while unlocked; it
+  is decrypted in memory and sent to the pod. "Make video" / "Use these settings" from a vault
+  item set Save-to = Vault. Start images imported from disk for a vault job are stored
+  encrypted in the vault, not in `references/`.
+- **Move:** "Move to vault" (General → Vault: encrypt, verify by decrypting, then delete the
+  plaintext) and "Move to General" (explicit confirm).
+- **Export / Download** from the vault: explicit, to a user-chosen location, with a note that
+  the exported copy is not encrypted.
+- **Migration (one time, on vault creation):** every existing image/video record, its file,
+  poster and referenced start images move into the vault (encrypt → verify round-trip →
+  delete original → delete DB row). Interrupt-safe: an item is deleted only after its
+  encrypted copy is verified; a re-run resumes. Report counts. FileVault is on, so deleted
+  plaintext is protected at rest; APFS gives no reliable overwrite, so no "secure wipe" is
+  claimed.
+- **Remote side:** the worker already deletes ComfyUI outputs/inputs after each job and does
+  not log prompts; keep it that way (add a test that `generate`/`generate_video` log lines
+  never contain the prompt).
+
+## Out of scope
+Hiding the app itself, multiple vaults, cloud sync, biometrics (Touch ID could later wrap the
+private key via the Keychain — not now, the user wants no Keychain prompts).
