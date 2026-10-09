@@ -22,3 +22,9 @@
 - Vault inside the real WKWebView: vault:// video playback + real Mac-sleep lock not yet exercised end to end.
 - Fast-load copier and container-disk throughput unmeasured; `--fast-disk` intentionally off.
 - CUDA 13 hosts (driver ≥ 580) availability unknown; pods request `gpu.minCudaVersion: "13.0"`.
+
+## Update 2026-10-09 ~11:40 IST
+- UX review COMPLETE: report at ~/ux-reviews/127.0.0.1-5180-20261009-0703/report.html (95 findings: 4 critical, 13 high, 37 medium, 41 low; UX-001 already fixed).
+- Owner decisions recorded in docs/ux-fix-plan.md.
+- Fixes in progress: 4 parallel agents (A layout, C create, D gallery/lightbox/jobs/vault views, E GPU/settings/models/Rust) per docs/ux-fix-plan.md ownership. After they finish: run tsc/build/cargo test/clippy, commit, rebuild app, install to /Applications, ask owner to push (worker unchanged unless E touched it).
+- Commits since pause: f90832b (always confirm paid GPU start), e9166a9 (video confirm/pill in serverless).
