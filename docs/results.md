@@ -29,3 +29,10 @@ Cold start, seconds per image per model, and cost per image. Filled in after the
 ## Video gotchas
 - **Pods load worker code from GitHub `main` at boot.** A pod started before `git push` ran the old code and failed with `UNKNOWN_ACTION: 'generate_video'`. Fix: push first, then Stop and Start the GPU.
 - **RTX PRO 6000 was often unavailable in CA-MTL-3,** so the app fell back to an H200 at $5.29/h.
+
+## 2026-10-09 — first pod on the CUDA 13 runtime + local-disk model copy (video, H200, CA-MTL-3)
+- Pod created 12:34 IST; server answering 12:38:33; ComfyUI ready 12:38:48 (code `681a189`).
+- `/health.cudaKernels`: enabled, torch CUDA 13.0, comfy-kitchen 0.2.37, no fallback reason.
+- `PREFETCH_MODELS=h3`: 4 files, 53.9 GB copied volume → container disk in ~6 min (12:38:33 → 12:44:47), 141 MB/s average (54 MB/s at start, 134+ MB/s later).
+- Warm-up `skipped` ("a real job is queued, running or already ran") — correct: an i2v job was submitted at ~12:38:48 and loaded from the network volume while the copy ran.
+- That first job completed at ~12:47 (~9 min end to end, volume load included). Next H3 job on this pod loads from local disk — time it to compare.
