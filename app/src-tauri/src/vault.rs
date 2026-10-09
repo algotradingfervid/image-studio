@@ -1683,3 +1683,4 @@ mod tests {
         hay.windows(needle.len()).any(|w| w == needle)
     }
 }
+

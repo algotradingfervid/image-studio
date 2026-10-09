@@ -50,24 +50,35 @@ impl state::EventSink for TauriSink {
 }
 
 /// `vault://<uuid>.<ext>`: decrypted bytes from memory, with Range support,
-/// `Cache-Control: no-store`, and 403 while the vault is locked.
+/// `Cache-Control: no-store`, and 403 while the vault is locked. Answered on a
+/// blocking worker thread: decrypting on the main thread stalled the UI and
+/// made vault videos stutter (WebKit sends many range requests while playing).
 fn vault_protocol<R: Runtime>(
     ctx: tauri::UriSchemeContext<'_, R>,
     request: tauri::http::Request<Vec<u8>>,
-) -> tauri::http::Response<Vec<u8>> {
+    responder: tauri::UriSchemeResponder,
+) {
     let range = request
         .headers()
         .get("range")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let served = match ctx.app_handle().try_state::<Arc<state::Core>>() {
-        Some(core) => core.vault.serve(request.uri().path(), range.as_deref()),
-        None => vault::Served {
-            status: 503,
-            headers: vec![],
-            body: vec![],
-        },
-    };
+    let path = request.uri().path().to_string();
+    let core = ctx.app_handle().try_state::<Arc<state::Core>>().map(|c| c.inner().clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        let served = match core {
+            Some(core) => core.vault.serve(&path, range.as_deref()),
+            None => vault::Served {
+                status: 503,
+                headers: vec![],
+                body: vec![],
+            },
+        };
+        responder.respond(vault_response(served));
+    });
+}
+
+fn vault_response(served: vault::Served) -> tauri::http::Response<Vec<u8>> {
     let mut b = tauri::http::Response::builder().status(served.status);
     for (k, v) in &served.headers {
         b = b.header(*k, v);
@@ -173,7 +184,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(QuitGuard::default())
-        .register_uri_scheme_protocol("vault", vault_protocol)
+        .register_asynchronous_uri_scheme_protocol("vault", vault_protocol)
         .menu(app_menu)
         .on_menu_event(|app, event| {
             if event.id() == QUIT_MENU_ID {
