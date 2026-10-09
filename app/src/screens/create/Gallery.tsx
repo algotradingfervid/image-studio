@@ -287,7 +287,12 @@ function VideoTile({ im, modelName, onOpen }: { im: ImageRecord; modelName: stri
     <button
       type="button"
       className="tile tile--video"
-      onClick={onOpen}
+      onClick={() => {
+        // Stop the hover preview: left looping behind the lightbox it kept a second
+        // video decoding and re-blurred the dialog backdrop every frame.
+        setHover(false);
+        onOpen();
+      }}
       aria-label={label}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}

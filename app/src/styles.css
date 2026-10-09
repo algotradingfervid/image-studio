@@ -2233,6 +2233,13 @@ input[type="range"]:focus-visible {
 
 /* lightbox */
 
+/* No backdrop blur behind the viewer: re-blurring on every video frame kept
+   WindowServer at ~30-40% CPU. Nearly opaque instead. */
+.lightbox::backdrop {
+  background: rgba(6, 5, 4, 0.92);
+  backdrop-filter: none;
+}
+
 .lightbox {
   width: calc(100vw - 48px);
   max-width: 1480px;
