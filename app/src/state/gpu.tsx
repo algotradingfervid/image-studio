@@ -98,6 +98,8 @@ export function GpuProvider({ children }: { children: ReactNode }) {
 
   const s = lib.settings;
   const podMode = (s?.backend ?? "pod") === "pod";
+  /** Video always runs on its (billed) Canada pod; "serverless" only applies to images. */
+  const usesPod = (p: GpuProfile) => p === "video" || podMode;
 
   const videoModelIds = useMemo(() => new Set(lib.videoModels.map((m) => m.id)), [lib.videoModels]);
   const tasksOf = (p: GpuProfile) =>
@@ -121,7 +123,7 @@ export function GpuProvider({ children }: { children: ReactNode }) {
       idleMinutes: state?.idleMinutes ?? s?.idleMinutes ?? DEFAULT_IDLE,
       activeWork: jobsOf(p) + tasksOf(p),
       live: gpuIsLive(state),
-      needsStart: podMode && gpuNeedsStart(state),
+      needsStart: usesPod(p) && gpuNeedsStart(state),
     };
   };
   const profiles: Record<GpuProfile, GpuProfileInfo> = { image: info("image"), video: info("video") };
@@ -238,9 +240,10 @@ export function GpuProvider({ children }: { children: ReactNode }) {
   statesRef.current = states;
   const podModeRef = useRef(podMode);
   podModeRef.current = podMode;
+  const usesPodRef = (p: GpuProfile) => p === "video" || podModeRef.current;
   const pendingAsk = useRef<((ok: boolean) => void) | null>(null);
   const confirmStart = useCallback((action?: string, profile: GpuProfile = "image") => {
-    if (!podModeRef.current || !gpuNeedsStart(statesRef.current[profile])) return Promise.resolve(true);
+    if (!usesPodRef(profile) || !gpuNeedsStart(statesRef.current[profile])) return Promise.resolve(true);
     // A newer request replaces an open one; the older caller gets "no".
     pendingAsk.current?.(false);
     return new Promise<boolean>((resolve) => {

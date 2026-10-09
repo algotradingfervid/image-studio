@@ -28,12 +28,12 @@ function Shell() {
   const gpu = useGpu();
   // Startup banner: a pod of either profile was found running at launch and re-adopted.
   const [keptPods, setKeptPods] = useState<Set<string>>(() => new Set());
-  const leftRunning = gpu.podMode
-    ? PROFILES.map((p) => gpu.profiles[p]).filter((x) => {
+  const leftRunning = PROFILES.filter((p) => gpu.podMode || p === "video")
+    .map((p) => gpu.profiles[p])
+    .filter((x) => {
         const g = x.state;
-        return !keptPods.has(x.profile) && !!g?.leftRunning && (g.status === "running" || g.status === "starting");
-      })
-    : [];
+      return !keptPods.has(x.profile) && !!g?.leftRunning && (g.status === "running" || g.status === "starting");
+    });
   const activeDownloads = lib.models.filter((m) => m.task && (m.task.status === "running" || m.task.status === "queued")).length;
 
   useEffect(() => {

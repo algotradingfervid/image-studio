@@ -14,11 +14,12 @@ export { useNow };
  */
 export function GpuPills() {
   const gpu = useGpu();
-  if (!gpu.podMode) return null;
+  // Serverless (legacy) applies to images only: the video pod still bills, so its pill shows.
   const shown = PROFILES.filter((p) => {
     const g = gpu.profiles[p].state;
-    return g && g.status !== "stopped";
+    return (gpu.podMode || p === "video") && g && g.status !== "stopped";
   });
+  if (!gpu.podMode && shown.length === 0) return null;
   if (shown.length === 0) {
     return gpu.profiles.image.state ? <GpuPill profile="image" /> : null;
   }
@@ -40,7 +41,7 @@ export function GpuPill({ profile = "image" }: { profile?: GpuProfile }) {
   const now = useNow(running);
   const [busy, setBusy] = useState(false);
 
-  if (!gpu.podMode || !g) return null;
+  if ((!gpu.podMode && profile !== "video") || !g) return null;
 
   const label = PROFILE_LABEL[profile];
   const what = profile === "video" ? "video GPU" : "GPU";
