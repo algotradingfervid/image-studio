@@ -1319,6 +1319,14 @@ const commands: Record<string, Handler> = {
     }
     return { ...settings };
   },
+  reveal_logs: () => {
+    const path = "~/Library/Logs/Image Studio/app.log";
+    console.info(`[mock] Would show ${path} in Finder.`);
+    return path;
+  },
+  log_ui: (a) => {
+    console.info(`[mock log] ${a?.level}: ${a?.message}`);
+  },
   reveal_settings_file: () => {
     const path = "~/Library/Application Support/com.naren.imagestudio/settings.json";
     console.info(`[mock] Would show ${path} in Finder.`);

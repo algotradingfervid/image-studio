@@ -218,3 +218,35 @@ def test_step_updates_throttled_but_transitions_forced(env):
     steps = [p["step"] for p in env.sent if p["stage"] == "sampling"]
     # entry (step 0) + the forced final step; intermediate steps fell within 0.5 s
     assert steps == [0, 30]
+
+
+def test_watch_records_wall_time_per_node(monkeypatch):
+    """Diagnostics: _watch times each executed node; node_timings names them by class
+    type (never prompt text), slowest first."""
+    import handler
+    t = [100.0]
+    monkeypatch.setattr(handler, "clock", lambda: t[0])
+
+    class Client:
+        def iter_messages(self, ws):
+            for node, dt in (("8", 2.0), ("9", 30.0), ("10", 180.0)):
+                yield {"type": "executing", "data": {"prompt_id": "p", "node": node}}
+                t[0] += dt
+            yield {"type": "executing", "data": {"prompt_id": "p", "node": None}}
+
+        def interrupt(self):
+            pass
+
+        def history(self, pid):
+            return {}
+
+    prog = handler.Throttle({"id": "j", "_progress": lambda p: None})
+    res = handler._watch(Client(), None, "p", set(), 1, prog, handler.clock())
+    assert res["node_ms"] == {"8": 2000, "9": 30000, "10": 180000}
+    graph = {"8": {"class_type": "VAEDecode", "inputs": {}},
+             "9": {"class_type": "CreateVideo", "inputs": {}},
+             "10": {"class_type": "SaveVideo", "inputs": {"filename_prefix": "x"}},
+             "5": {"class_type": "MiniMaxH3ImageToVideo", "inputs": {"prompt": "secret words"}}}
+    rows = handler.node_timings(graph, res["node_ms"])
+    assert rows == [["10", "SaveVideo", 180000], ["9", "CreateVideo", 30000], ["8", "VAEDecode", 2000]]
+    assert "secret" not in repr(rows)

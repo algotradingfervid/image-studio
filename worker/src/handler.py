@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import math
 import os
 import random
@@ -416,6 +417,12 @@ class StageTracker:
             **(self.copy or {}),
         }
 
+    def stage_times(self) -> dict:
+        """{stage: ms} including the stage in progress (diagnostics)."""
+        out = dict(self.times)
+        out[self.stage] = out.get(self.stage, 0) + _ms(clock() - self.stage_start)
+        return out
+
     def send(self, force: bool = False) -> None:
         self.progress(self.payload(), force=force)
 
@@ -483,6 +490,13 @@ def _watch(client: ComfyClient, ws, prompt_id: str, samplers: set[str], total_st
     deadline = t_queued + timeout_s
     sample_start = sample_end = None
     interrupted = False
+    node_ms: dict[str, int] = {}  # wall time per executed node (diagnostics)
+    cur_node, cur_start = None, None
+
+    def close_node(t: float) -> None:
+        if cur_node is not None and cur_start is not None:
+            node_ms[cur_node] = node_ms.get(cur_node, 0) + _ms(t - cur_start)
+
     for msg in client.iter_messages(ws):
         now = clock()
         if not interrupted and cancelled(tracker.job):
@@ -515,6 +529,8 @@ def _watch(client: ComfyClient, ws, prompt_id: str, samplers: set[str], total_st
             tracker.on_cached(data.get("nodes") or [])
         elif mtype == "executing":
             node = data.get("node")
+            close_node(now)
+            cur_node, cur_start = (None, None) if node is None else (str(node), now)
             if node is None:
                 if data.get("prompt_id") == prompt_id:
                     break
@@ -531,7 +547,29 @@ def _watch(client: ComfyClient, ws, prompt_id: str, samplers: set[str], total_st
             break
     if sample_start is not None and sample_end is None:
         sample_end = clock()
-    return {"sample_start": sample_start, "sample_end": sample_end}
+    close_node(clock())
+    return {"sample_start": sample_start, "sample_end": sample_end, "node_ms": node_ms}
+
+
+# Diagnostics: per-node wall times of the last video job (node ids and class
+# types only, never prompts), served as /health "lastJob".
+_LAST_TIMINGS: dict | None = None
+
+
+def node_timings(graph: dict, node_ms: dict) -> list:
+    """[[node id, class type, ms], …] slowest first."""
+    rows = [[n, str((graph.get(n) or {}).get("class_type", "?")), ms] for n, ms in node_ms.items()]
+    return sorted(rows, key=lambda r: -r[2])
+
+
+def record_last_timings(t: dict) -> None:
+    global _LAST_TIMINGS
+    _LAST_TIMINGS = t
+    print("[timings] " + json.dumps(t), flush=True)
+
+
+def last_timings() -> dict | None:
+    return _LAST_TIMINGS
 
 
 def format_execution_error(data: dict) -> str:
@@ -627,6 +665,7 @@ def do_generate(job: dict, inp: dict) -> dict:
         t_queued = clock()
         prompt_id = client.queue_prompt(graph)
         res = _watch(client, ws, prompt_id, samplers, steps, progress, t_queued, tracker)
+        t_done = clock()
     finally:
         try:
             ws.close()
@@ -651,10 +690,16 @@ def do_generate(job: dict, inp: dict) -> dict:
     s0, s1 = res["sample_start"], res["sample_end"]
     load_ms = _ms((s0 if s0 is not None else t_end) - t0)
     sample_ms = _ms(s1 - s0) if s0 is not None and s1 is not None else 0
+    nodes = node_timings(graph, res.get("node_ms") or {})
+    record_last_timings({"kind": "image", "model": params["model"], "width": size[0], "height": size[1],
+                         "steps": steps, "totalMs": _ms(t_end - t0),
+                         "saveMs": _ms(t_end - t_done),
+                         "stages": tracker.stage_times(), "nodes": nodes})
     return {
         "image": {"base64": base64.b64encode(data).decode("ascii"), "seed": params["seed"],
                   "width": size[0], "height": size[1]},
-        "timings": {"loadMs": load_ms, "sampleMs": sample_ms, "totalMs": _ms(t_end - t0)},
+        "timings": {"loadMs": load_ms, "sampleMs": sample_ms, "totalMs": _ms(t_end - t0),
+                    "nodes": nodes, "stages": tracker.stage_times()},
     }
 
 
@@ -869,6 +914,7 @@ def do_generate_video(job: dict, inp: dict) -> dict:
         prompt_id = client.queue_prompt(graph)
         res = _watch(client, ws, prompt_id, set(offsets), info["totalSteps"], progress, t_queued,
                      tracker, step_offsets=offsets, timeout_s=VIDEO_TIMEOUT_S)
+        t_done = clock()
     finally:
         try:
             ws.close()
@@ -917,13 +963,19 @@ def do_generate_video(job: dict, inp: dict) -> dict:
     s0, s1 = res["sample_start"], res["sample_end"]
     load_ms = _ms((s0 if s0 is not None else t_end) - t0)
     sample_ms = _ms(s1 - s0) if s0 is not None and s1 is not None else 0
+    nodes = node_timings(graph, res.get("node_ms") or {})
+    record_last_timings({"kind": "video", "model": params.get("model"), "frames": video["frames"],
+                         "durationS": video["durationS"], "audio": video["hasAudio"],
+                         "width": video["width"], "height": video["height"],
+                         "totalMs": _ms(t_end - t0), "saveMs": _ms(t_end - t_done),
+                         "stages": tracker.stage_times(), "nodes": nodes})
     return {
         "video": video,
         "poster": poster,
         "seed": params["seed"],
         "timings": {"loadMs": load_ms, "sampleMs": sample_ms,
                     "encodeMs": _ms(t_end - s1) if s1 is not None else 0,
-                    "totalMs": _ms(t_end - t0)},
+                    "totalMs": _ms(t_end - t0), "nodes": nodes, "stages": tracker.stage_times()},
     }
 
 

@@ -165,3 +165,12 @@ def file_server():
     s = FileServer()
     yield s
     s.close()
+
+
+@pytest.fixture(autouse=True)
+def _reset_last_timings():
+    """handler keeps the last job's node timings process-wide (/health lastJob)."""
+    import handler
+    handler._LAST_TIMINGS = None
+    yield
+    handler._LAST_TIMINGS = None

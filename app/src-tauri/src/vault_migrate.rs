@@ -143,8 +143,7 @@ fn seal_attachment(core: &Core, path: &str) -> Result<Option<BlobRef>, String> {
             return seal_verified(core, &bytes, &item.media.ext).map(Some);
         }
     }
-    eprintln!(
-        "[vault] attachment {} is missing; sealing the record without it",
+    crate::alog!("vault", "attachment {} is missing; sealing the record without it",
         p.file_name().unwrap_or_default().to_string_lossy()
     );
     Ok(None)
@@ -275,7 +274,7 @@ fn delete_originals(core: &Core, rec: &ImageRecord) -> Result<(), String> {
 fn remove_quiet(p: &Path) {
     if let Err(e) = std::fs::remove_file(p) {
         if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("[vault] could not delete {}: {e}", p.display());
+            crate::alog!("vault", "could not delete {}: {e}", p.display());
         }
     }
 }
@@ -461,7 +460,7 @@ fn migrate_inner(
         match result {
             Ok(()) => progress.done += 1,
             Err(e) => {
-                eprintln!("[vault] migration: item {id} skipped: {e}");
+                crate::alog!("vault", "migration: item {id} skipped: {e}");
                 progress.errors += 1;
                 progress.done += 1;
             }

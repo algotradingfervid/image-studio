@@ -266,7 +266,7 @@ pub async fn refresh_status_opts_for(
             let c = core.clone();
             tokio::spawn(async move {
                 if let Err(e) = crate::pod::complete_release(&c, rel).await {
-                    eprintln!("[status] stopping the GPU after Refresh failed: {e}");
+                    crate::alog!("status", "stopping the GPU after Refresh failed: {e}");
                 }
             });
         }

@@ -65,6 +65,8 @@ use zeroize::{Zeroize, Zeroizing};
 pub const CHUNK_SIZE: u32 = 1 << 20;
 /// Largest body one `vault://` response carries (ranges are served in pieces).
 pub const MAX_RANGE_RESPONSE: u64 = 4 << 20;
+/// `vault://` responses slower than this are logged (playback stutter diagnostics).
+const SLOW_SERVE_MS: u128 = 40;
 pub const MIN_PASSWORD_CHARS: usize = 8;
 pub const DEFAULT_AUTO_LOCK_MINUTES: u32 = 10;
 pub const MIN_AUTO_LOCK_MINUTES: u32 = 1;
@@ -1012,8 +1014,7 @@ impl Vault {
                 Ok(item) => {
                     items.insert(item.id.clone(), item);
                 }
-                Err(e) => eprintln!(
-                    "[vault] skipping unreadable item {}: {e}",
+                Err(e) => crate::alog!("vault", "skipping unreadable item {}: {e}",
                     path.file_name().unwrap_or_default().to_string_lossy()
                 ),
             }
@@ -1118,6 +1119,16 @@ impl Vault {
     /// single `Range` header. 403 while locked, 404 for unknown blobs, 416 for
     /// unsatisfiable ranges. Responses are `Cache-Control: no-store`.
     pub fn serve(&self, path: &str, range: Option<&str>) -> Served {
+        let t = Instant::now();
+        let out = self.serve_inner(path, range);
+        let ms = t.elapsed().as_millis();
+        if ms >= SLOW_SERVE_MS {
+            crate::alog!("vault", "slow vault:// read: {ms} ms, status {}, {} bytes, range {}", out.status, out.body.len(), range.unwrap_or("-"));
+        }
+        out
+    }
+
+    fn serve_inner(&self, path: &str, range: Option<&str>) -> Served {
         let no_store = ("Cache-Control", "no-store".to_string());
         let empty = |status: u16, extra: Vec<(&'static str, String)>| Served {
             status,

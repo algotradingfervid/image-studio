@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { logUi } from "../api";
 import { Icon } from "../components/Icon";
 
 export type ToastKind = "error" | "info" | "success";
@@ -143,7 +144,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   const api = useMemo<ToastApi>(
     () => ({
       push,
-      error: (title, err) => push("error", title, msg(err)),
+      error: (title, err) => {
+        logUi("error", `toast: ${title}${err === undefined ? "" : ` — ${msg(err)}`}`);
+        push("error", title, msg(err));
+      },
       info: (title, message) => push("info", title, message),
       success: (title, message) => push("success", title, message),
       notify,

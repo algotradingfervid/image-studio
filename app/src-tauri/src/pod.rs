@@ -698,7 +698,21 @@ pub fn subscribe_for(core: &Core, p: Profile) -> watch::Receiver<GpuState> {
 }
 
 fn emit(core: &Core, p: Profile, s: &GpuState) {
-    core.gpu.slot(p).tx.send_replace(s.clone());
+    let prev = core.gpu.slot(p).tx.send_replace(s.clone());
+    if prev.status != s.status || prev.phase != s.phase || prev.pod_id != s.pod_id {
+        crate::alog!(
+            "gpu",
+            "{} {:?}→{:?} phase={} pod={} gpu={} reason={:?}{}",
+            p.as_str(),
+            prev.status,
+            s.status,
+            s.phase.as_deref().unwrap_or("-"),
+            s.pod_id.as_deref().unwrap_or("-"),
+            s.gpu_type.as_deref().unwrap_or("-"),
+            s.stop_reason,
+            s.error.as_deref().map(|e| format!(" error={e}")).unwrap_or_default()
+        );
+    }
     core.sink.gpu_update(s);
 }
 
@@ -743,7 +757,7 @@ fn persist_pod_id(core: &Core, p: Profile, id: Option<&str>) {
     let db = core.db.lock().unwrap();
     let r = db.set_setting(p.db_pod_id(), id.unwrap_or(""));
     if let Err(e) = r {
-        eprintln!("[pod:{}] could not persist the pod id: {e}", p.as_str());
+        crate::alog!("pod", "[pod:{}] could not persist the pod id: {e}", p.as_str());
     }
 }
 
@@ -764,7 +778,7 @@ fn valid_model_id(id: &str) -> bool {
 pub fn record_last_model(core: &Core, p: Profile, model_id: &str) {
     let id = model_id.trim();
     if !valid_model_id(id) {
-        eprintln!("[pod:{}] not recording invalid model id {id:?}", p.as_str());
+        crate::alog!("pod", "[pod:{}] not recording invalid model id {id:?}", p.as_str());
         return;
     }
     let db = core.db.lock().unwrap();
@@ -772,7 +786,7 @@ pub fn record_last_model(core: &Core, p: Profile, model_id: &str) {
         return;
     }
     if let Err(e) = db.set_setting(p.db_last_model(), id) {
-        eprintln!("[pod:{}] could not record the last model: {e}", p.as_str());
+        crate::alog!("pod", "[pod:{}] could not record the last model: {e}", p.as_str());
     }
 }
 
@@ -885,7 +899,7 @@ fn fail_with_pod(core: &Core, p: Profile, id: &str, msg: &str) {
 
 /// A start (or adopt) loop failed: Error for this epoch.
 fn fail_start(core: &Core, p: Profile, epoch: u64, msg: String) {
-    eprintln!("[pod:{}] start failed: {msg}", p.as_str());
+    crate::alog!("pod", "[pod:{}] start failed: {msg}", p.as_str());
     let applied = set_state(core, p, Some(epoch), |s| {
         s.status = GpuStatus::Error;
         s.phase = None;
@@ -1031,8 +1045,7 @@ async fn claim_named_pod(
     let extra = live.iter().skip(1).copied();
     for x in dead.into_iter().chain(extra) {
         let Some(id) = pod_str(x, "id") else { continue };
-        eprintln!(
-            "[pod] terminating leftover {name} pod {id} ({})",
+        crate::alog!("pod", "terminating leftover {name} pod {id} ({})",
             pod_str(x, "status").unwrap_or("unknown")
         );
         if let Err(e) = terminate(core, id).await {
@@ -1046,7 +1059,7 @@ async fn claim_named_pod(
     let Some(id) = pod_str(pod, "id") else {
         return Ok(None);
     };
-    eprintln!("[pod] adopting existing {name} pod {id} instead of creating one");
+    crate::alog!("pod", "adopting existing {name} pod {id} instead of creating one");
     track_pod(core, p, epoch, pod, None);
     Ok(Some(id.to_string()))
 }
@@ -1086,7 +1099,7 @@ async fn create_pod(core: &Arc<Core>, p: Profile, rest: &RestClient, epoch: u64)
             ambiguous: true,
             gpu,
         }) => {
-            eprintln!("[pod] create failed ambiguously; checking whether the pod exists: {message}");
+            crate::alog!("pod", "create failed ambiguously; checking whether the pod exists: {message}");
             match find_created_pod(core, p, rest).await {
                 Some(pod) => (pod, gpu),
                 None if !is_current(core, p, epoch) => {
@@ -1134,14 +1147,13 @@ async fn find_created_pod(core: &Core, p: Profile, rest: &RestClient) -> Option<
         match find_named_pods(rest, p).await {
             Ok(pods) => {
                 if let Some(x) = pods.into_iter().find(|x| is_live(x) && pod_str(x, "id").is_some()) {
-                    eprintln!(
-                        "[pod] the pod was created despite the error; adopting {}",
+                    crate::alog!("pod", "the pod was created despite the error; adopting {}",
                         pod_str(&x, "id").unwrap_or("")
                     );
                     return Some(x);
                 }
             }
-            Err(e) => eprintln!("[pod] listing pods failed (attempt {attempt}/3): {}", e.message),
+            Err(e) => crate::alog!("pod", "listing pods failed (attempt {attempt}/3): {}", e.message),
         }
     }
     None
@@ -1171,7 +1183,7 @@ async fn create_with_fallback(
     let image = core.settings.pod_image();
     let worker_ref = core.settings.worker_ref();
     let prefetch = prefetch_models(core, p);
-    eprintln!("[pod] image {image}, WORKER_REF {worker_ref}, PREFETCH_MODELS {prefetch:?}");
+    crate::alog!("pod", "image {image}, WORKER_REF {worker_ref}, PREFETCH_MODELS {prefetch:?}");
     let mut last = String::new();
     for gpu in &gpus {
         let body = create_payload_for(
@@ -1195,7 +1207,7 @@ async fn create_with_fallback(
                 })
             }
             Err(e) if matches!(e.status, Some(400 | 403)) => {
-                eprintln!("[pod] {gpu} not placeable in {}: {}", vol.data_center, e.message);
+                crate::alog!("pod", "{gpu} not placeable in {}: {}", vol.data_center, e.message);
                 last = e.message;
             }
             Err(e) => {
@@ -1520,8 +1532,7 @@ pub async fn adopt_for(core: &Arc<Core>, p: Profile) -> Result<GpuState, String>
         return Ok(state_for(core, p));
     };
     if ours.len() > 1 {
-        eprintln!(
-            "[pod] {} pods named {name} exist; adopting one (Stop terminates all)",
+        crate::alog!("pod", "{} pods named {name} exist; adopting one (Stop terminates all)",
             ours.len()
         );
     }
@@ -1726,8 +1737,7 @@ pub fn begin_release(core: &Core, p: Profile, reason: StopReason) -> Option<Rele
             && !g.served
             && !is_busy(core, p)
     })?;
-    eprintln!(
-        "[pod:{}] stopping: nothing uses the pod it was started for ({reason:?})",
+    crate::alog!("pod", "[pod:{}] stopping: nothing uses the pod it was started for ({reason:?})",
         p.as_str()
     );
     Some(Release {
@@ -1853,8 +1863,7 @@ pub async fn idle_check_for(core: &Arc<Core>, p: Profile) -> Option<GpuState> {
     if idle_for < limit {
         return None;
     }
-    eprintln!(
-        "[pod:{}] auto-stop after {} idle minutes",
+    crate::alog!("pod", "[pod:{}] auto-stop after {} idle minutes",
         p.as_str(),
         core.settings.idle_minutes()
     );
@@ -1889,7 +1898,7 @@ async fn error_auto_stop(core: &Arc<Core>, p: Profile, s: &GpuState) -> Option<G
     if !has_pod {
         return None;
     }
-    eprintln!("[pod:{}] auto-stop from the error state", p.as_str());
+    crate::alog!("pod", "[pod:{}] auto-stop from the error state", p.as_str());
     stop_for(core, p, StopReason::Idle).await.ok()
 }
 
@@ -1926,7 +1935,7 @@ pub async fn liveness_check_for(core: &Arc<Core>, p: Profile) {
             if !is_current(core, p, epoch) {
                 return;
             }
-            eprintln!("[pod:{}] pod {id} exited; terminating it", p.as_str());
+            crate::alog!("pod", "[pod:{}] pod {id} exited; terminating it", p.as_str());
             match terminate(core, &id).await {
                 Ok(()) => mark_external(core, p, epoch, &id),
                 Err(e) => {
@@ -1982,7 +1991,7 @@ async fn tick_for(core: &Arc<Core>, p: Profile) {
     };
     if retry_adopt && rest(core).is_ok() {
         if let Err(e) = adopt_for(core, p).await {
-            eprintln!("[pod] {} adopt retry failed: {e}", p.as_str());
+            crate::alog!("pod", "{} adopt retry failed: {e}", p.as_str());
         }
         return;
     }

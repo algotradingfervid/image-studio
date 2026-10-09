@@ -73,6 +73,12 @@ export const testConnection = () => call<ConnectionTest>("test_connection");
  */
 /** Shows the settings file in Finder (creating it first); resolves with its path. */
 export const revealSettingsFile = () => call<string>("reveal_settings_file");
+/** Shows ~/Library/Logs/Image Studio/app.log in Finder. */
+export const revealLogs = () => call<string>("reveal_logs");
+/** Best-effort line in the diagnostics log; never throws. Callers never pass prompts. */
+export const logUi = (level: "error" | "warn" | "info", message: string) => {
+  void call<void>("log_ui", { level, message: message.slice(0, 2000) }).catch(() => {});
+};
 export const testApiKeys = (input: { apiKey?: string; civitaiKey?: string }) => callObj<KeyTestReport>("test_api_keys", input);
 export const listModels = () => call<ModelView[]>("list_models");
 /** Asks the worker for fresh status — auto-starts the GPU pod when stopped (can take minutes). */

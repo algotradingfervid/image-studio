@@ -598,6 +598,7 @@ class Health:
         if self._warmup is not None:
             out["warmup"] = self._warmup()
         if (cuda := cuda_info.status()) is not None: out["cudaKernels"] = cuda  # noqa: E701
+        if (last := worker.last_timings()) is not None: out["lastJob"] = last  # noqa: E701
         return out
 
 

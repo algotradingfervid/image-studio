@@ -724,6 +724,14 @@ export function SettingsScreen() {
             <button type="button" className="btn" onClick={() => void reveal()}>
               <Icon name="search" /> Show settings file
             </button>
+            <button
+              type="button"
+              className="btn"
+              title="Diagnostics log: GPU, job stages and timings, errors. Never prompts or vault content."
+              onClick={() => void api.revealLogs().catch((err) => setRevealError(api.errorMessage(err)))}
+            >
+              <Icon name="search" /> Show logs
+            </button>
           </div>
           {revealError && <p className="hint hint--error">{revealError}</p>}
         </section>

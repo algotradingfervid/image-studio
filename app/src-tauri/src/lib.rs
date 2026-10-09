@@ -1,3 +1,4 @@
+pub mod applog;
 pub mod commands;
 pub mod db;
 pub mod delete_rule;
@@ -11,6 +12,7 @@ pub mod settings;
 pub mod state;
 pub mod status;
 pub mod tasks;
+pub mod timings;
 pub mod vault;
 pub mod vault_macos;
 pub mod vault_migrate;
@@ -138,7 +140,7 @@ fn ask_quit<R: Runtime>(app: &AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         let core = app.state::<Arc<state::Core>>().inner().clone();
         if let Err(e) = pod::stop_for_quit(&core).await {
-            eprintln!("[quit] could not stop every GPU pod before quitting: {e}");
+            crate::alog!("quit", "could not stop every GPU pod before quitting: {e}");
         }
         app.state::<QuitGuard>().0.store(true, std::sync::atomic::Ordering::SeqCst);
         app.exit(0);
@@ -201,6 +203,15 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            if let Some(dir) = applog::default_dir() {
+                applog::init(&dir);
+            }
+            crate::alog!(
+                "startup",
+                "Image Studio {} ({}) starting",
+                env!("CARGO_PKG_VERSION"),
+                if cfg!(debug_assertions) { "debug build" } else { "release build" }
+            );
             let core = build_core(app)?;
             app.manage(core.clone());
             // Vault auto-lock: inactivity timer (every 10 s), plus macOS sleep /
@@ -220,7 +231,7 @@ pub fn run() {
                     hook_core.emit_vault();
                 }
             }) {
-                eprintln!("[vault] no system sleep/lock hook on this platform; the inactivity timer locks the vault");
+                crate::alog!("vault", "no system sleep/lock hook on this platform; the inactivity timer locks the vault");
             }
             // GPU pod: re-adopt a pod left running, cache the volume size,
             // and run the idle/error auto-stop and liveness monitor (it
@@ -236,10 +247,10 @@ pub fn run() {
                     // a pod, and an adopted idle pod is auto-stopped.
                     for p in pod::Profile::ALL {
                         if let Err(e) = pod::lookup_volume_for(&core, &rest, p).await {
-                            eprintln!("[startup] {} volume lookup failed: {e}", p.as_str());
+                            crate::alog!("startup", "{} volume lookup failed: {e}", p.as_str());
                         }
                         if let Err(e) = pod::adopt_for(&core, p).await {
-                            eprintln!("[startup] {} pod adopt failed: {e}", p.as_str());
+                            crate::alog!("startup", "{} pod adopt failed: {e}", p.as_str());
                         }
                     }
                     // Let an adopted image pod finish its readiness check.
@@ -267,7 +278,7 @@ pub fn run() {
                     && status::is_stale(checked.as_deref(), chrono::Utc::now())
                 {
                     if let Err(e) = status::refresh_status_opts(&core, false).await {
-                        eprintln!("[startup] status refresh failed: {e}");
+                        crate::alog!("startup", "status refresh failed: {e}");
                     }
                 }
             });
@@ -279,6 +290,8 @@ pub fn run() {
             commands::test_connection,
             commands::test_api_keys,
             commands::reveal_settings_file,
+            commands::reveal_logs,
+            commands::log_ui,
             commands::get_gpu_state,
             commands::list_gpu_states,
             commands::start_gpu,

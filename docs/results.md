@@ -36,3 +36,10 @@ Cold start, seconds per image per model, and cost per image. Filled in after the
 - `PREFETCH_MODELS=h3`: 4 files, 53.9 GB copied volume → container disk in ~6 min (12:38:33 → 12:44:47), 141 MB/s average (54 MB/s at start, 134+ MB/s later).
 - Warm-up `skipped` ("a real job is queued, running or already ran") — correct: an i2v job was submitted at ~12:38:48 and loaded from the network volume while the copy ran.
 - That first job completed at ~12:47 (~9 min end to end, volume load included). Next H3 job on this pod loads from local disk — time it to compare.
+
+## Diagnostics: where to look (2026-10-09)
+- **App log:** `~/Library/Logs/Image Studio/app.log` (Settings → Show logs; rotates at 5 MB, keeps 3). GPU state changes, job queue → stage → finish with the previous stage's duration, slow `vault://` reads (≥40 ms), startup, UI errors and error toasts, panics. Never prompts, seeds, keys or vault content.
+- **Per-job timings:** `~/Library/Application Support/com.naren.imagestudio/timings.jsonl`, one line per finished job: model, GPU, size, steps, video length/frames, worker `stages` (ms per stage) and `nodes` ([node id, ComfyUI class, ms], slowest first).
+- **Pod:** `/health.lastJob` holds the last job's breakdown; the worker also prints `[timings] {...}` to the pod log.
+- Quick look: `jq -c '{model, gpu, frames, total: .timings.totalMs, top: .timings.nodes[:3]}' ~/Library/Application\ Support/com.naren.imagestudio/timings.jsonl`
+- Open question: "Encoding MP4" on a 15 s H3 video takes 3–4 min, but x264 for 362 frames at 1344×768 takes ~3 s (24 s single-threaded) on the Mac, so the time is elsewhere inside CreateVideo/SaveVideo/ImageFromBatch/SaveImage — the node timings will show which.

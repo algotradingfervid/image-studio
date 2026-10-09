@@ -761,8 +761,24 @@ fn start_job(core: &Arc<Core>, plan: Plan) -> Result<String, String> {
     crate::worker::precheck_for(core, profile)?;
     // Before any pod start: the next pod prefetches this model to local disk.
     crate::pod::record_last_model(core, profile, &plan.record.model);
+    let job_id = uuid::Uuid::new_v4().to_string();
+    crate::alog!(
+        "job",
+        "{} queued kind={:?} model={} {}x{} steps={} count={}{}",
+        short(&job_id),
+        plan.kind,
+        plan.record.model,
+        plan.record.width,
+        plan.record.height,
+        plan.record.steps,
+        plan.seeds.len(),
+        plan.record
+            .duration_s
+            .map(|d| format!(" durationS={d}"))
+            .unwrap_or_default()
+    );
     let job = Job {
-        job_id: uuid::Uuid::new_v4().to_string(),
+        job_id,
         kind: plan.kind,
         destination: plan.destination,
         status: JobState::Queued,
@@ -842,6 +858,7 @@ fn update(core: &Core, id: &str, f: impl FnOnce(&mut Job)) {
         let Some(e) = jobs.get_mut(id) else { return };
         let before = e.job.clone();
         f(&mut e.job);
+        log_transition(id, &before, &e.job);
         (e.job != before).then(|| e.job.clone())
     };
     if let Some(j) = snapshot {
@@ -849,7 +866,37 @@ fn update(core: &Core, id: &str, f: impl FnOnce(&mut Job)) {
     }
 }
 
+/// Logs status and stage changes with how long the previous stage took.
+fn log_transition(id: &str, before: &Job, after: &Job) {
+    let stage = |j: &Job| j.progress.as_ref().and_then(|p| p.stage.clone());
+    let (s0, s1) = (stage(before), stage(after));
+    if before.status != after.status || s0 != s1 {
+        let took = before.progress.as_ref().and_then(|p| p.stage_elapsed_ms);
+        crate::alog!(
+            "job",
+            "{} {:?}/{} → {:?}/{}{}",
+            short(id),
+            before.status,
+            s0.as_deref().unwrap_or("-"),
+            after.status,
+            s1.as_deref().unwrap_or("-"),
+            took.filter(|_| s0 != s1).map(|ms| format!(" (prev stage ~{ms} ms)")).unwrap_or_default()
+        );
+    }
+}
+
+fn short(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
 fn finish(core: &Core, id: &str, status: JobState, error: Option<String>) {
+    crate::alog!(
+        "job",
+        "{} finished {:?}{}",
+        short(id),
+        status,
+        error.as_deref().map(|e| format!(" error={e}")).unwrap_or_default()
+    );
     let kind = core.jobs.lock().unwrap().get(id).map(|e| e.job.kind);
     crate::pod::touch_for(core, kind.unwrap_or_default().profile());
     let done = core.jobs.lock().unwrap().remove(id).map(|mut e| {
@@ -955,6 +1002,8 @@ fn save_video(
         delay_ms: s.delay_time_ms,
         execution_ms: s.execution_time_ms,
     };
+    let gpu = crate::pod::state_for(core, plan.kind.profile()).gpu_type;
+    crate::timings::append(core, &crate::timings::entry(&rec, gpu.as_deref(), out, &rec.created_at));
     if plan.destination == Destination::Vault {
         // Encrypted the moment it arrives; the plaintext never touches disk.
         return vault_migrate::seal_output(core, &rec, &bytes, poster.as_deref());
@@ -974,7 +1023,7 @@ fn save_video(
         match std::fs::write(&p, &b) {
             Ok(()) => Some(p.to_string_lossy().into_owned()),
             Err(e) => {
-                eprintln!("[jobs] could not save the video poster: {e}");
+                crate::alog!("jobs", "could not save the video poster: {e}");
                 None
             }
         }
@@ -1033,6 +1082,8 @@ fn save_image(
         delay_ms: s.delay_time_ms,
         execution_ms: s.execution_time_ms,
     };
+    let gpu = crate::pod::state_for(core, plan.kind.profile()).gpu_type;
+    crate::timings::append(core, &crate::timings::entry(&rec, gpu.as_deref(), out, &rec.created_at));
     if plan.destination == Destination::Vault {
         return vault_migrate::seal_output(core, &rec, &bytes, None);
     }

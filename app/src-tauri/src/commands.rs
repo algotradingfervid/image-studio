@@ -84,6 +84,28 @@ pub fn reveal_settings_file(core: CoreState<'_>) -> Res<String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// Shows the diagnostics log (`~/Library/Logs/Image Studio/app.log`) in Finder.
+#[tauri::command]
+pub fn reveal_logs() -> Res<String> {
+    let dir = crate::applog::default_dir().ok_or("No home folder")?;
+    let path = dir.join("app.log");
+    let target = if path.exists() { path } else { dir };
+    tauri_plugin_opener::reveal_item_in_dir(&target).map_err(|e| format!("Couldn't show the logs: {e}"))?;
+    Ok(target.to_string_lossy().into_owned())
+}
+
+/// A UI error or warning for the diagnostics log (from window.onerror and
+/// error toasts). Capped; the UI never sends prompts here.
+#[tauri::command]
+pub fn log_ui(level: String, message: String) {
+    let level: String = level.chars().filter(|c| c.is_ascii_alphabetic()).take(8).collect();
+    let mut msg: String = message.chars().take(2000).collect();
+    if message.chars().count() > 2000 {
+        msg.push('…');
+    }
+    crate::alog!("ui", "{level}: {msg}");
+}
+
 #[tauri::command]
 pub fn get_settings(core: CoreState<'_>) -> SettingsResponse {
     settings_response(&core)
@@ -635,7 +657,7 @@ fn spawn_migration(core: &Arc<Core>) {
     let c = core.clone();
     tauri::async_runtime::spawn_blocking(move || {
         if let Err(e) = vault_migrate::migrate(&c, MigrateOptions::default()) {
-            eprintln!("[vault] migration stopped: {e}");
+            crate::alog!("vault", "migration stopped: {e}");
         }
     });
 }

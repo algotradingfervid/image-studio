@@ -171,7 +171,7 @@ def test_generate_video_h3_t2v(venv, monkeypatch):
                              "mime": "image/jpeg", "width": 64, "height": 32}
     assert out["seed"] == 7
     t = out["timings"]
-    assert set(t) == {"loadMs", "sampleMs", "encodeMs", "totalMs"}
+    assert set(t) == {"loadMs", "sampleMs", "encodeMs", "totalMs", "nodes", "stages"}
     assert t["sampleMs"] == 20 * 300 and t["totalMs"] >= t["loadMs"] + t["sampleMs"]
     # the queued graph
     graph = fake.prompts[0]["prompt"]

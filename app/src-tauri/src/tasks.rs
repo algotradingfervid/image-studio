@@ -448,7 +448,7 @@ async fn finish(core: &Arc<Core>, profile: Profile, id: &str, status: TaskStatus
     // Refresh the cache before reporting the end so list_models is current
     // (only if the worker is up — never start the GPU just for this).
     if let Err(e) = refresh_status_opts_for(core, profile, false).await {
-        eprintln!("[tasks] status refresh after task failed: {e}");
+        crate::alog!("tasks", "status refresh after task failed: {e}");
     }
     end(core, profile, id, status, error).await;
 }
@@ -552,7 +552,7 @@ async fn run_task(
             RunStatus::Completed => {
                 if let OnDone::RemoveLora(lid) = &on_done {
                     if let Err(e) = core.db.lock().unwrap().delete_lora(lid) {
-                        eprintln!("[tasks] could not remove LoRA record: {e}");
+                        crate::alog!("tasks", "could not remove LoRA record: {e}");
                     }
                 }
                 update(&core, &id, |t| t.bytes = t.total_bytes);

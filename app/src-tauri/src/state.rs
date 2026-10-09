@@ -152,6 +152,11 @@ impl CoreConfig {
     pub fn videos_dir(&self) -> PathBuf {
         self.data_dir.join("videos")
     }
+    /// Per-job stage and ComfyUI node timings, one JSON object per line
+    /// (performance analysis; never prompts, seeds or file names).
+    pub fn timings_log(&self) -> PathBuf {
+        self.data_dir.join("timings.jsonl")
+    }
     /// Encrypted vault files (spec v6).
     pub fn vault_dir(&self) -> PathBuf {
         self.data_dir.join("vault")

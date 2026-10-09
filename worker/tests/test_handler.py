@@ -255,7 +255,7 @@ def test_generate_ok(env):
     assert base64.b64decode(out["image"]["base64"]) == fake.out_png
     assert out["image"] == {"base64": out["image"]["base64"], "seed": 42, "width": 1216, "height": 832}
     t = out["timings"]
-    assert set(t) == {"loadMs", "sampleMs", "totalMs"}
+    assert set(t) == {"loadMs", "sampleMs", "totalMs", "nodes", "stages"}
     assert t["sampleMs"] == 1200 and t["totalMs"] >= t["loadMs"] + t["sampleMs"]
 
     # references uploaded and wired into the graph
