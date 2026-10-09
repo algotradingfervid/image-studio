@@ -118,6 +118,38 @@ fn seal_path(core: &Core, path: &str) -> Result<BlobRef, String> {
     seal_verified(core, &bytes, &ext_of(path, &bytes))
 }
 
+/// A start image or reference of a record being sealed. When the file is
+/// gone because it was another gallery item that already moved into the
+/// vault (image→video from the gallery reads that item's file in place),
+/// the vault copy of that item's media is re-sealed instead. Anything else
+/// missing is dropped (`None`) so the record's own media still moves: a
+/// lost start image must never keep a video out of the vault.
+fn seal_attachment(core: &Core, path: &str) -> Result<Option<BlobRef>, String> {
+    if let Some(b) = BlobRef::parse(path) {
+        return Ok(Some(b));
+    }
+    let p = Path::new(path);
+    if p.exists() {
+        return seal_path(core, path).map(Some);
+    }
+    let owned = [core.cfg.images_dir(), core.cfg.videos_dir()];
+    let source = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|_| owned.iter().any(|d| p.starts_with(d)));
+    if let Some(stem) = source {
+        if let Some(item) = core.vault.find_by_source(stem)? {
+            let bytes = core.vault.open_blob(&item.media.id)?;
+            return seal_verified(core, &bytes, &item.media.ext).map(Some);
+        }
+    }
+    eprintln!(
+        "[vault] attachment {} is missing; sealing the record without it",
+        p.file_name().unwrap_or_default().to_string_lossy()
+    );
+    Ok(None)
+}
+
 fn thumb_for(core: &Core, rec_kind: &str, media: &[u8]) -> Option<BlobRef> {
     if rec_kind == KIND_VIDEO {
         return None;
@@ -190,15 +222,20 @@ fn seal_record(core: &Core, rec: &ImageRecord) -> Result<Sealed, String> {
     let thumb = thumb_for(core, &rec.kind, &media);
     let init = match &rec.init_image {
         Some(p) => {
-            counts.start_images += 1;
-            Some(seal_path(core, p)?)
+            let b = seal_attachment(core, p)?;
+            if b.is_some() {
+                counts.start_images += 1;
+            }
+            b
         }
         None => None,
     };
     let mut refs = Vec::new();
     for p in &rec.references {
-        refs.push(seal_path(core, p)?);
-        counts.references += 1;
+        if let Some(b) = seal_attachment(core, p)? {
+            refs.push(b);
+            counts.references += 1;
+        }
     }
     let item = item_from_record(
         rec,

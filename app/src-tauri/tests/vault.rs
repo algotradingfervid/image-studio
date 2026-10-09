@@ -660,3 +660,48 @@ fn locked_vault_hides_items_from_every_query_and_touch_resets_auto_lock() {
     .unwrap_err();
     assert!(err.starts_with("VAULT_LOCKED"), "{err}");
 }
+
+/// Regression (seen on real data): a video made image→video from a gallery
+/// image keeps that image's file as its start image. The image migrates
+/// first and its file is deleted; the video must still move, with its start
+/// image taken from the image's vault copy. A start image that is gone
+/// entirely must not keep the video out of the vault either.
+#[test]
+fn migration_moves_a_video_whose_start_image_was_a_migrated_gallery_image() {
+    let h = harness("http://127.0.0.1:1");
+    let imgs = h.core.cfg.images_dir();
+    let vids = h.core.cfg.videos_dir();
+    let src_png = png(42, 64, 48);
+    let src_path = imgs.join("src-image.png");
+    std::fs::write(&src_path, &src_png).unwrap();
+    let v1 = vids.join("v1.mp4");
+    let v2 = vids.join("v2.mp4");
+    std::fs::write(&v1, mp4(1)).unwrap();
+    std::fs::write(&v2, mp4(2)).unwrap();
+    {
+        let db = h.core.db.lock().unwrap();
+        db.insert_image(&record("src-image", KIND_IMAGE, &src_path, "2026-01-01T00:00:00Z")).unwrap();
+        let mut a = record("v1", KIND_VIDEO, &v1, "2026-01-02T00:00:00Z");
+        a.init_image = Some(src_path.to_string_lossy().into_owned());
+        db.insert_image(&a).unwrap();
+        let mut b = record("v2", KIND_VIDEO, &v2, "2026-01-03T00:00:00Z");
+        b.init_image = Some(imgs.join("gone.png").to_string_lossy().into_owned());
+        db.insert_image(&b).unwrap();
+    }
+    let v = &h.core.vault;
+    v.create(PW, KdfParams::fast()).unwrap();
+    let report = vault_migrate::migrate(&h.core, MigrateOptions::default()).unwrap();
+    assert_eq!(report.errors, 0, "{report:?}");
+    assert!(db_rows(&h).is_empty(), "every record moved");
+    assert_eq!(files_in(&imgs) + files_in(&vids), 0, "no plaintext left");
+
+    let v1_item = v.find_by_source("v1").unwrap().expect("v1 in the vault");
+    let start = v1_item.init_image.expect("start image kept");
+    assert_eq!(&*v.open_blob(&start.id).unwrap(), &src_png[..]);
+    let src_item = v.find_by_source("src-image").unwrap().unwrap();
+    assert_ne!(start.id, src_item.media.id, "a copy, so deleting one item never breaks the other");
+
+    let v2_item = v.find_by_source("v2").unwrap().expect("v2 in the vault");
+    assert!(v2_item.init_image.is_none());
+    assert_eq!(&*v.open_blob(&v2_item.media.id).unwrap(), &mp4(2)[..]);
+}
