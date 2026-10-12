@@ -112,13 +112,11 @@ function useTopModal(): HTMLElement | null {
 const STICKY_BARS = "[data-sticky-bar], .settings-bar";
 
 /**
- * Keeps the toast stack clear of sticky action bars (it sits above the highest one it would
- * overlap), and publishes the space it takes as `--toast-reserve` on <html> so scrolling pages
- * can pad their end by it: the last rows then scroll up out from under the toasts.
+ * Keeps the toast stack clear of sticky action bars: it sits above the highest one it would
+ * overlap. Scrolling pages keep fixed room at their end for the stack (styles/jobs.css).
  */
 function useClearOfStickyBars(layerRef: RefObject<HTMLDivElement | null>, count: number) {
   useLayoutEffect(() => {
-    const root = document.documentElement;
     let frame = 0;
     const place = () => {
       frame = 0;
@@ -135,8 +133,6 @@ function useClearOfStickyBars(layerRef: RefObject<HTMLDivElement | null>, count:
         bottom = Math.max(bottom, vh - r.top + 10);
       }
       layer.style.bottom = `${bottom}px`;
-      const h = count ? layer.offsetHeight + bottom : 0;
-      root.style.setProperty("--toast-reserve", `${Math.round(h)}px`);
     };
     const schedule = () => {
       if (!frame) frame = requestAnimationFrame(place);

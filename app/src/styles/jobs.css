@@ -297,14 +297,15 @@
   width: min(320px, calc(100vw - 36px));
 }
 
-/* Scrolling pages end with room for the toast stack (--toast-reserve, set by the provider), so
-   their last rows and buttons can always be scrolled out from under it. */
+/* Scrolling pages end with fixed room for the toast stack, so their last rows and buttons can
+   always be scrolled out from under it. Fixed, not --toast-reserve: a reserve that shrank when a
+   toast left made the end of a scrolled-down page jump. */
 .models-page > .page__inner {
-  padding-bottom: calc(48px + var(--toast-reserve, 0px));
+  padding-bottom: 200px;
 }
 
 .canvas {
-  padding-bottom: calc(28px + var(--toast-reserve, 0px));
+  padding-bottom: 160px;
 }
 
 /* Both pods billing: compact pills that fit side by side at 1440 and 820 px without "…" — state

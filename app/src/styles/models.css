@@ -139,6 +139,13 @@
   min-width: 72px;
 }
 
+/* Touch: the destructive confirm gets the full 44px target (UI-068). */
+@media (pointer: coarse) {
+  .lora-row__confirm-actions > .btn {
+    height: 44px;
+  }
+}
+
 .lora-row__stage {
   white-space: nowrap;
   overflow: hidden;

@@ -339,6 +339,7 @@ export function Lightbox({
       onMovedToVault?.(afterMove(id));
       toast.notify({
         kind: "success",
+        key: "vault-move",
         title: `${Noun} moved to the vault`,
         message: "Encrypted and verified; the unencrypted file was deleted.",
         actions: [

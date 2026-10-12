@@ -1163,12 +1163,30 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   const migrating = !!vault.migration && vault.migration.phase !== "done" && vault.migration.phase !== "error";
   const lightboxIndex = lightboxId ? shown.findIndex((x) => x.id === lightboxId) : -1;
 
+  // An erased vault takes its items with it: a "moved to the vault · Undo · View in vault" toast
+  // can no longer do either.
+  const erasedAt = useRef(vault.eraseEpoch);
+  useEffect(() => {
+    if (erasedAt.current === vault.eraseEpoch) return;
+    erasedAt.current = vault.eraseEpoch;
+    toast.dismissKey("vault-move");
+  }, [vault.eraseEpoch, toast]);
+
   /** Job card thumbnail → open it in the right tab (clearing a filter that hides it). */
   const openFromJob = (id: string) => {
     const inVault = vault.unlocked && vault.items.some((x) => x.id === id);
     const tab: GalleryTab = inVault ? "vault" : "general";
     const list = inVault ? vault.items : images;
-    if (!list.some((x) => x.id === id)) return;
+    if (!list.some((x) => x.id === id)) {
+      // Moved into a locked or erased vault, or deleted: say so rather than do nothing.
+      toast.notify({
+        kind: "info",
+        key: "job-open-missing",
+        title: vault.exists && !vault.unlocked ? "That item is in the locked vault" : "That item isn't in the gallery any more",
+        message: vault.exists && !vault.unlocked ? "Unlock the vault to open it." : "It was moved into a vault that has since been erased, or deleted.",
+      });
+      return;
+    }
     setGalleryTabState(tab);
     if (!applyFilter(list, filters[tab]).some((x) => x.id === id)) setFilter("all", tab);
     setLightboxId(id);

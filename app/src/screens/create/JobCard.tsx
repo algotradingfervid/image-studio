@@ -594,23 +594,9 @@ export function JobList({
   const [open, setOpen] = useState<Record<string, boolean>>({});
   const collapsedAt = (j: JobView, i: number) => !(open[j.jobId] ?? (active.length === 0 && i === 0));
 
-  // After a card goes, focus the next card (else the previous one, else the gallery tab), never <body>.
-  const dismiss = (ids: string[]) => {
-    const cards = [...(rootRef.current?.querySelectorAll<HTMLElement>("[data-job-id]") ?? [])];
-    const gone = new Set(ids);
-    const first = cards.findIndex((c) => gone.has(c.dataset.jobId ?? ""));
-    const rest = cards.filter((c) => !gone.has(c.dataset.jobId ?? ""));
-    const next = rest.find((c) => cards.indexOf(c) > first) ?? [...rest].reverse().find((c) => cards.indexOf(c) < first);
-    onDismiss(ids);
-    requestAnimationFrame(() => {
-      const target = next?.querySelector<HTMLElement>(".job-card__row, .job-card__dismiss, .btn") ?? galleryTab();
-      target?.focus();
-    });
-  };
-
-  // Clear finished hides them at once and offers Undo; they go for good when the toast does.
-  const clearFinished = () => {
-    const ids = finished.map((j) => j.jobId);
+  // Hides cards at once and offers Undo; they go for good when the toast does (a late click
+  // on a card's Dismiss, or on Clear finished, can always be taken back).
+  const hideWithUndo = (ids: string[], title: string) => {
     const unhide = () =>
       setHidden((h) => {
         const n = new Set(h);
@@ -618,16 +604,35 @@ export function JobList({
         return n;
       });
     setHidden((h) => new Set([...h, ...ids]));
-    requestAnimationFrame(() => (rootRef.current?.querySelector<HTMLElement>(".job-card .btn") ?? galleryTab())?.focus());
     toast.notify({
       kind: "info",
-      title: `Cleared ${ids.length} finished job${ids.length === 1 ? "" : "s"}`,
+      title,
       actions: [{ label: "Undo", onClick: unhide }],
       onClose: () => {
         onDismiss(ids);
         unhide();
       },
     });
+  };
+
+  // After a card goes, focus the next card (else the previous one, else the gallery tab), never <body>.
+  const dismiss = (ids: string[]) => {
+    const cards = [...(rootRef.current?.querySelectorAll<HTMLElement>("[data-job-id]") ?? [])];
+    const gone = new Set(ids);
+    const first = cards.findIndex((c) => gone.has(c.dataset.jobId ?? ""));
+    const rest = cards.filter((c) => !gone.has(c.dataset.jobId ?? ""));
+    const next = rest.find((c) => cards.indexOf(c) > first) ?? [...rest].reverse().find((c) => cards.indexOf(c) < first);
+    hideWithUndo(ids, ids.length === 1 ? `Dismissed job ${numbers.current.get(ids[0]) ?? ""}`.trim() : `Dismissed ${ids.length} jobs`);
+    requestAnimationFrame(() => {
+      const target = next?.querySelector<HTMLElement>(".job-card__row, .job-card__dismiss, .btn") ?? galleryTab();
+      target?.focus();
+    });
+  };
+
+  const clearFinished = () => {
+    const ids = finished.map((j) => j.jobId);
+    hideWithUndo(ids, `Cleared ${ids.length} finished job${ids.length === 1 ? "" : "s"}`);
+    requestAnimationFrame(() => (rootRef.current?.querySelector<HTMLElement>(".job-card .btn") ?? galleryTab())?.focus());
   };
 
   if (!shownJobs.length) return null;

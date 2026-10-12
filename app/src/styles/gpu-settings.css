@@ -289,10 +289,10 @@
   scroll-padding: 64px 0 80px;
 }
 
-/* The toast stack sits above the sticky bar (state/toast.tsx) and publishes its height as
-   --toast-reserve: the page's end can scroll out from under it. */
+/* The toast stack sits above the sticky bar (state/toast.tsx); fixed end room lets the last
+   content scroll out from under it without the page end jumping as toasts come and go. */
 .settings-page > .page__inner {
-  padding-bottom: max(48px, calc(var(--toast-reserve, 0px) + 16px));
+  padding-bottom: 200px;
 }
 
 /* Unsaved-changes bar (UX-021). */
