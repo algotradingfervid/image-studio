@@ -2,7 +2,7 @@
 
 ## State
 - All work committed. `main` is 1 commit ahead of origin (`aaa7172` vault-migration fix, app-only) — owner pushes when back (`git push`; not needed by pods).
-- Installed app: /Applications/Image Studio.app = build of `aaa7172`. App data: ~/Library/Application Support/com.naren.imagestudio (vault created; 24 images migrated).
+- Installed app: /Applications/Image Studio.app = build of `7bff12f`. App data: ~/Library/Application Support/com.naren.imagestudio (vault created; 24 images migrated).
 - No RunPod pods running (checked at pause). Runtime image `image-studio-runtime:latest` = CUDA 13 (cu130) build, CI success 2026-10-09 01:38 UTC.
 - Volumes: image-studio-models (EU-RO-1), image-studio-video (CA-MTL-3, H3 + LTX-2.5 files verified).
 
