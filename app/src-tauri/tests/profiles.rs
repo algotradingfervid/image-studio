@@ -63,6 +63,21 @@ fn video_model() -> Model {
     .unwrap()
 }
 
+/// An r2v (character reference) fixture model, like `h3ref`.
+fn ref_video_model() -> Model {
+    serde_json::from_value(json!({
+        "id": "h3ref", "name": "MiniMax H3 · Character", "license": "MiniMax H3 Community",
+        "modes": ["r2v"], "maxReferences": 2, "audio": true, "volume": "image-studio-video",
+        "defaults": {"durationS": 5, "fps": 24, "resolution": "864x480", "steps": 20, "cfg": 1.0},
+        "limits": {"minDurationS": 2, "maxDurationS": 15, "resolutions": ["864x480"], "fpsOptions": [24]},
+        "files": [
+            {"folder": "unet", "filename": "minimax_h3_ref2va_pruned_fp8_scaled.safetensors", "url": "https://x/r", "sizeBytes": 100},
+            {"folder": "vae", "filename": "minimax_h3_video_vae_fp16.safetensors", "url": "https://x/v", "sizeBytes": 10}
+        ]
+    }))
+    .unwrap()
+}
+
 /// `config`: settings.json body (None = defaults).
 fn harness(server: &MockServer, config: Option<&str>) -> Harness {
     let dir = tempfile::tempdir().unwrap();
@@ -93,7 +108,7 @@ fn harness(server: &MockServer, config: Option<&str>) -> Harness {
     };
     let mut registry = Registry::embedded();
     // A fixed fixture (independent of the real `videoModels` in models.json).
-    registry.video_models = vec![video_model()];
+    registry.video_models = vec![video_model(), ref_video_model()];
     let core = Core::new(registry, Db::open_in_memory().unwrap(), settings, sink.clone(), cfg).unwrap();
     Harness {
         core,
@@ -351,7 +366,7 @@ async fn starting_video_creates_its_own_pod_even_while_the_image_pod_runs() {
     assert_eq!(posts.len(), 1);
     let body = &posts[0];
     assert_eq!(body["name"], VID);
-    assert_eq!(body["gpu"]["id"], "NVIDIA RTX PRO 6000 Blackwell Server Edition");
+    assert_eq!(body["gpu"]["id"], "NVIDIA H200");
     assert_eq!(body["dataCenterIds"], json!(["CA-MTL-3"]));
     assert_eq!(body["mounts"]["network"][0]["volumeId"], "v7hzxkm304");
     assert_eq!(stored(&h.core, pod::DB_VIDEO_POD_ID).as_deref(), Some("vpod1"));
@@ -373,7 +388,7 @@ async fn video_gpu_fallback_uses_the_video_gpu_list() {
     Mock::given(method("POST"))
         .and(path("/v2/pods"))
         .and(wiremock::matchers::body_partial_json(
-            json!({"gpu": {"id": "NVIDIA RTX PRO 6000 Blackwell Server Edition"}}),
+            json!({"gpu": {"id": "NVIDIA H200"}}),
         ))
         .respond_with(ResponseTemplate::new(400).set_body_json(json!({"status": 400, "detail": "no capacity"})))
         .with_priority(1)
@@ -383,8 +398,8 @@ async fn video_gpu_fallback_uses_the_video_gpu_list() {
     let h = harness(&server, None);
     pod::start_for(&h.core, Profile::Video).unwrap();
     let s = wait_for(&h.core, Profile::Video, GpuStatus::Running).await;
-    assert_eq!(s.gpu_type.as_deref(), Some("NVIDIA H200"));
-    assert_eq!(sim.posts()[0]["gpu"]["id"], "NVIDIA H200");
+    assert_eq!(s.gpu_type.as_deref(), Some("NVIDIA RTX PRO 6000 Blackwell Server Edition"));
+    assert_eq!(sim.posts()[0]["gpu"]["id"], "NVIDIA RTX PRO 6000 Blackwell Server Edition");
 }
 
 #[tokio::test]
@@ -793,6 +808,72 @@ async fn video_job_start_image_from_gallery_is_read_in_place() {
     .contains("one start image"));
 }
 
+fn png_bytes() -> Vec<u8> {
+    let img = image::RgbImage::from_pixel(64, 36, image::Rgb([1, 2, 3]));
+    let mut buf = Vec::new();
+    image::DynamicImage::ImageRgb8(img)
+        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .unwrap();
+    buf
+}
+
+#[tokio::test]
+async fn video_job_r2v_sends_references_and_records_them() {
+    let server = MockServer::start().await;
+    mount_volumes(&server).await;
+    let sim = Sim::default();
+    sim.add("vid1", VID, "RUNNING");
+    sim.mount(&server).await;
+    mount_ready_pods(&server).await;
+    mount_pod_job(
+        &server,
+        "vid1",
+        json!({"video": {"base64": base64::engine::general_purpose::STANDARD.encode(mp4_bytes())}}),
+    )
+    .await;
+    let h = harness(&server, None);
+    pod::adopt_for(&h.core, Profile::Video).await.unwrap();
+    wait_for(&h.core, Profile::Video, GpuStatus::Running).await;
+    let dir = h.core.cfg.references_dir();
+    let r1 = app_lib::references::import_bytes(&dir, &png_bytes()).unwrap();
+    let r2 = app_lib::references::import_bytes(&dir, &png_bytes()).unwrap();
+    let r2v = |ids: Vec<String>| VideoRequest {
+        model: "h3ref".into(),
+        resolution: "864x480".into(),
+        reference_ids: ids,
+        ..video_req()
+    };
+    let job_id = jobs::generate_video(&h.core, r2v(vec![r1.ref_id.clone(), r2.ref_id.clone()])).unwrap();
+    let job = wait_job(&h).await;
+    assert_eq!((job.job_id.as_str(), job.status), (job_id.as_str(), JobState::Completed), "{:?}", job.error);
+    let rec = &job.images[0];
+    assert_eq!(rec.references.len(), 2);
+    assert!(rec.references.iter().all(|p| std::path::Path::new(p).exists()));
+    assert_eq!(rec.init_image, None);
+    let db_rec = h.core.db.lock().unwrap().get_image(&rec.id).unwrap().unwrap();
+    assert_eq!(db_rec.references, rec.references);
+    let reqs = server.received_requests().await.unwrap();
+    let run: Value = reqs.iter().find(|r| r.url.path() == "/proxy/vid1/run").unwrap().body_json().unwrap();
+    let input = &run["input"];
+    assert_eq!(input["model"], "h3ref");
+    let refs = input["references"].as_array().unwrap();
+    assert_eq!(refs.len(), 2);
+    assert!(refs.iter().all(|r| r["name"].as_str().is_some() && r["base64"].as_str().unwrap().len() > 10));
+    assert!(input.get("initImage").is_none());
+
+    // Validation.
+    let err = |r: VideoRequest| jobs::generate_video(&h.core, r).unwrap_err();
+    assert!(err(r2v(vec![])).contains("Add at least one character reference"));
+    assert!(err(r2v(vec![r1.ref_id.clone(), r2.ref_id.clone(), r1.ref_id.clone()])).contains("at most 2"));
+    assert!(err(VideoRequest { init_image_id: Some(r1.ref_id.clone()), ..r2v(vec![r1.ref_id.clone()]) })
+        .contains("does not take a start image"));
+    assert!(err(r2v(vec!["missing".into()])).contains("reference image is missing"));
+    assert!(err(r2v(vec!["vault://localhost/0b6f1c3e-2c55-4a8e-9d1e-6e2f4b9c1a00.png".into()])).contains("vault"));
+    // Non-r2v models refuse references.
+    assert!(err(VideoRequest { reference_ids: vec![r1.ref_id.clone()], ..video_req() })
+        .contains("does not take character reference"));
+}
+
 #[tokio::test]
 async fn video_job_rejects_non_mp4_output_and_bad_requests() {
     let server = MockServer::start().await;
@@ -875,5 +956,5 @@ async fn video_model_tasks_and_status_use_the_video_pod_and_cache() {
     assert_eq!(h3["installed"], json!(true));
     assert_eq!(h3["limits"]["maxDurationS"], json!(10.0));
     assert_eq!(views.iter().find(|m| m["id"] == "chroma").unwrap()["kind"], "image");
-    assert_eq!(views.iter().filter(|m| m["kind"] == "video").count(), 1);
+    assert_eq!(views.iter().filter(|m| m["kind"] == "video").count(), 2, "h3 + h3ref fixtures");
 }

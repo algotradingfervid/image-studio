@@ -58,11 +58,11 @@ pub const VIDEO_GPU_TYPE: &str = crate::settings::DEFAULT_VIDEO_GPU_TYPES[0];
 /// Container disk (GB) per profile. The pod worker copies the models it
 /// uses from the network volume to this disk (`/models-local`,
 /// worker/src/local_models.py), so it must hold the profile's models plus
-/// headroom: image ≈ 76 GB for all four image models, video ≈ 94 GB for
-/// H3 + LTX-2.5. RunPod documents the container disk as ephemeral (wiped on
+/// headroom: image ≈ 76 GB for all four image models, video ≈ 115 GB for
+/// H3 + H3 ref (shared text encoder and VAEs) + LTX-2.5. RunPod documents the container disk as ephemeral (wiped on
 /// restart); the app terminates pods rather than stopping them anyway.
 pub const CONTAINER_DISK_GB_IMAGE: u32 = 100;
-pub const CONTAINER_DISK_GB_VIDEO: u32 = 120;
+pub const CONTAINER_DISK_GB_VIDEO: u32 = 150;
 /// ComfyUI log level on the pod (`COMFY_LOG_LEVEL`, read by worker/boot/boot.py;
 /// its default is DEBUG, which floods the log with per-layer lines).
 pub const COMFY_LOG_LEVEL: &str = "INFO";

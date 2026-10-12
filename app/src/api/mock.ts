@@ -109,7 +109,7 @@ const settings: Settings = {
   fallbackCostPerHr: GPU_COST,
   workerRef: "main",
   podImage: "ghcr.io/algotradingfervid/image-studio-runtime:latest",
-  videoGpuTypes: [GPU_TYPE, "NVIDIA H200", "NVIDIA H100 80GB HBM3"],
+  videoGpuTypes: ["NVIDIA H200", GPU_TYPE, "NVIDIA H100 80GB HBM3"],
   videoVolumeNames: ["image-studio-video"],
 };
 
@@ -653,6 +653,8 @@ function makeVideo(input: {
   delayMs: number;
   executionMs: number;
   initImage?: string | null;
+  /** r2v character references (paths). */
+  references?: string[];
 }): ImageRecord {
   const [width, height] = resolutionSize(input.resolution);
   const m = videoModels.find((x) => x.id === input.model);
@@ -672,7 +674,7 @@ function makeVideo(input: {
     seed: input.seed,
     steps: input.steps,
     cfg: input.cfg,
-    references: [],
+    references: input.references ?? [],
     loras: [],
     createdAt: new Date(input.createdAt).toISOString(),
     durationMs: input.delayMs + input.executionMs + 400,
@@ -1143,11 +1145,13 @@ async function runJob(jobId: string, input: GenerateInput) {
 async function runVideoStages(job: Job, input: GenerateVideoInput, steps: number, cancelled: () => boolean): Promise<boolean | "failed"> {
   const warm = loadedModels.video.has(input.model);
   const initUsed = !!(input.initImageId || input.initImageGalleryId || input.initImageVaultId);
+  const refsUsed = (input.referenceIds?.length ?? 0) > 0;
   const stages = [
     "loading_text_encoder",
     "encoding_prompt",
     "loading_model",
     ...(initUsed ? ["preparing_init_image"] : []),
+    ...(refsUsed ? ["preparing_references"] : []),
     "sampling",
     "video_decoding",
     ...(input.audio ? ["audio_decoding"] : []),
@@ -1208,6 +1212,10 @@ async function runVideoStages(job: Job, input: GenerateVideoInput, steps: number
   if (initUsed) {
     enter("preparing_init_image");
     if (!(await hold(700))) return false;
+  }
+  if (refsUsed) {
+    enter("preparing_references");
+    if (!(await hold(900))) return false;
   }
   enter("sampling");
   const perStep = Math.max(250, 9000 / steps);
@@ -1294,6 +1302,7 @@ async function runVideoJob(jobId: string, input: GenerateVideoInput) {
     delayMs,
     executionMs: Date.now() - execStart + 1200,
     initImage: initPath,
+    references: (input.referenceIds ?? []).map((id) => refs.get(id) ?? "").filter(Boolean),
   });
   saveOutput(rec, destination);
   job.images = [rec];
@@ -1607,8 +1616,19 @@ const commands: Record<string, Handler> = {
     const missing = m.files.filter((f) => !present.has(f.filename)).map((f) => f.filename);
     if (missing.length) throw new Error(`MODEL_NOT_INSTALLED: ${missing.join(", ")}`);
     if (!i.prompt?.trim()) throw new Error("Write a prompt first.");
-    if ((i.initImageId || i.initImageGalleryId || i.initImageVaultId) && !(m.modes ?? []).includes("i2v")) throw new Error(`${m.name} does not take a start image`);
-    checkVaultStart(i.initImageVaultId, i.destination, [i.initImageId]);
+    const hasInit = !!(i.initImageId || i.initImageGalleryId || i.initImageVaultId);
+    const refIds = i.referenceIds ?? [];
+    if ((m.modes ?? []).includes("r2v")) {
+      // Mirrors build_video_plan: r2v takes 1..maxReferences character references and no start image.
+      if (hasInit) throw new Error(`${m.name} does not take a start image; add character references instead`);
+      if (!refIds.length) throw new Error("Add at least one character reference image");
+      if (refIds.length > m.maxReferences) throw new Error(`${m.name} takes at most ${m.maxReferences} character reference images`);
+      if (refIds.some((id) => !refs.has(id))) throw new Error("The reference image is missing; please add it again");
+    } else {
+      if (refIds.length) throw new Error(`${m.name} does not take character reference images`);
+      if (hasInit && !(m.modes ?? []).includes("i2v")) throw new Error(`${m.name} does not take a start image`);
+    }
+    checkVaultStart(i.initImageVaultId, i.destination, [i.initImageId, ...refIds]);
     if (i.initImageId && i.initImageGalleryId) throw new Error("Pass either initImageId or initImageGalleryId, not both.");
     if (i.initImageId && !refs.has(i.initImageId)) throw new Error("The start image is missing; please add it again");
     if (i.initImageGalleryId) {

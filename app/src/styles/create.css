@@ -593,3 +593,47 @@
 .picker__empty p {
   margin: 0 0 6px;
 }
+
+/* ---------- reference prompt tags (<image1>, <Picture 1>): insertable labels + "Same person" ---------- */
+.ref-thumb .ref-thumb__tag {
+  left: 2px;
+  bottom: 2px;
+  padding: 0 3px;
+  font-family: inherit;
+  font-size: 10px;
+  max-width: calc(100% - 4px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: 0;
+  color: #fff;
+  line-height: 16px;
+  cursor: pointer;
+}
+
+.ref-thumb .ref-thumb__tag:hover {
+  background: rgba(0, 0, 0, 0.85);
+  color: var(--accent-hi);
+}
+
+/* Thumbnails wide enough for the tag label: three per row on a narrow panel instead of four. */
+.refs--tagged .dropzone {
+  grid-template-columns: repeat(auto-fill, minmax(76px, 1fr));
+}
+
+.refs__tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  margin-top: 6px;
+}
+
+.refs__tags .hint {
+  flex: 1 1 200px;
+  margin: 0;
+}
+
+.refs__tag-name {
+  white-space: nowrap;
+}

@@ -1,5 +1,5 @@
-// Create screen, Video mode (spec v5): video model, optional start image (i2v), prompt,
-// duration / resolution / fps, audio, seed + advanced, Generate → `generate_video`.
+// Create screen, Video mode (spec v5): video model, optional start image (i2v) or character
+// references (r2v), prompt, duration / resolution / fps, audio, seed + advanced, Generate → `generate_video`.
 
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import { requestModelFocus } from "../models/ModelsScreen";
@@ -24,6 +24,10 @@ import {
   ratioLabel,
   readDraft,
   realImageFiles,
+  REF_TAGS,
+  References,
+  refTag,
+  refTagging,
   StartImage,
   usePanelNotice,
   useMoreBelow,
@@ -45,14 +49,17 @@ const REPEAT_WINDOW_MS = 4000;
 const DRAFT_KEY = "imagestudio.draft.video";
 
 const MODEL_GLYPH: Record<string, string> = { h3: "H3", ltx25: "LX" };
+/** Every MiniMax H3 variant (h3, h3ref, …) shares the H3 glyph, licence and region notes. */
+const isH3 = (id: string) => id.startsWith("h3");
+const glyphOf = (m: ModelView) => MODEL_GLYPH[m.id] ?? (isH3(m.id) ? "H3" : m.name.slice(0, 2));
 const clip = (s: string, n = 40) => (s.length > n ? `${s.slice(0, n - 1).trimEnd()}…` : s);
 
 /** Licence / placement notes shown under the video model picker. */
 function modelNotes(m: ModelView): { tone: "warn" | "info"; text: string }[] {
   const notes: { tone: "warn" | "info"; text: string }[] = [];
-  if (m.id === "h3") {
+  if (isH3(m.id)) {
     notes.push({ tone: "warn", text: "Runs in Canada — licence excludes EU/UK/KR/US" });
-    notes.push({ tone: "info", text: "MiniMax H3 · MiniMax H3 Community licence (commercial use over $20M revenue needs permission)" });
+    notes.push({ tone: "info", text: `${m.name} · MiniMax H3 Community licence (commercial use over $20M revenue needs permission)` });
   } else if (m.id === "ltx25") {
     notes.push({ tone: "info", text: "Runs in Canada on the video volume" });
     notes.push({ tone: "info", text: `${m.name} · LTX-2.x Community licence (free under $10M revenue)` });
@@ -162,8 +169,13 @@ interface VideoMemory {
   form: VideoForm;
   adv: AdvancedValues;
   startImage: VideoStart | null;
+  /** r2v character references. */
+  refs: RefItem[];
   vault: boolean;
 }
+
+/** Some character reference is vault content. */
+const refsAreVault = (refs: RefItem[]) => refs.some((r) => isVaultUrl(r.refId));
 
 /** Vault-derived values set aside while the vault is locked (memory only). */
 interface VideoStash {
@@ -172,6 +184,7 @@ interface VideoStash {
   modelId: string;
   adv: AdvancedValues;
   startImage: VideoStart | null;
+  refs: RefItem[];
   sourcePrompt: { text: string; vault: boolean } | null;
   tainted: boolean;
   memory: [string, VideoMemory][];
@@ -187,14 +200,14 @@ export interface VideoPanelHandle {
 export const VideoPanel = forwardRef<
   VideoPanelHandle,
   {
-    /** The Create screen is visible and in Video mode (paste/drop go to the start image). */
+    /** The Create screen is visible and in Video mode (paste/drop go to the start image or the references). */
     active: boolean;
     hidden: boolean;
     modeSwitch: ReactNode;
     /** Where outputs go (spec v6) and the shared Save-to switch. */
     saveTo: Destination;
     saveToSwitch: ReactNode;
-    /** Reports whether the start image is vault content (forces Save to = Vault). */
+    /** Reports whether the start image or a character reference is vault content (forces Save to = Vault). */
     onVaultStart: (vault: boolean) => void;
     onNavigate: (t: Tab) => void;
     onQueued: (job: JobView) => void;
@@ -224,7 +237,11 @@ export const VideoPanel = forwardRef<
   };
   const [form, setForm] = useState<VideoForm>(() => formDefaults(undefined));
   const [startImage, setStartImage] = useState<VideoStart | null>(null);
-  const [pickerOpen, setPickerOpen] = useState(false);
+  /** r2v character references (models whose modes include "r2v"). */
+  const [refs, setRefs] = useState<RefItem[]>([]);
+  const [refBusy, setRefBusy] = useState(false);
+  /** The gallery picker is open for the start image or for a character reference. */
+  const [pickerOpen, setPickerOpen] = useState<false | "start" | "refs">(false);
   const [startBusy, setStartBusy] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [adv, setAdv] = useState<AdvancedValues>(() => advancedDefaults(undefined));
@@ -241,6 +258,7 @@ export const VideoPanel = forwardRef<
   const promptRef = useRef<HTMLTextAreaElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const startSectionRef = useRef<HTMLElement>(null);
+  const refSectionRef = useRef<HTMLElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const inFlight = useRef(false);
   const lastSubmit = useRef(0);
@@ -248,12 +266,14 @@ export const VideoPanel = forwardRef<
   const lastQueued = useRef<{ key: string; at: number } | null>(null);
   const formRef = useRef<HTMLFormElement>(null);
 
-  // Report vault start images upward.
-  const vaultStart = startIsVault(startImage);
-  useEffect(() => onVaultStart(vaultStart), [vaultStart, onVaultStart]);
-
   const model = models.find((m) => m.id === modelId);
   const i2v = !!model?.modes?.includes("i2v");
+  const r2v = !!model?.modes?.includes("r2v");
+  const maxRefs = r2v ? Math.max(0, model?.maxReferences ?? 0) : 0;
+
+  // Report vault start images / references upward.
+  const vaultStart = startIsVault(startImage) || refsAreVault(refs);
+  useEffect(() => onVaultStart(vaultStart), [vaultStart, onVaultStart]);
   const lim = model?.limits;
   const minDur = Math.max(1, Math.ceil(lim?.minDurationS ?? 1));
   const maxDur = Math.max(minDur, lim?.maxDurationS ?? 10);
@@ -323,12 +343,12 @@ export const VideoPanel = forwardRef<
   // Save the draft; anything vault-derived removes it instead (never persisted).
   useEffect(() => {
     if (!initialised.current) return;
-    writeDraft(DRAFT_KEY, tainted || startIsVault(startImage) || !!sourcePrompt?.vault ? null : { modelId, prompt, form, adv });
-  }, [modelId, prompt, form, adv, tainted, startImage, sourcePrompt]);
+    writeDraft(DRAFT_KEY, tainted || startIsVault(startImage) || refsAreVault(refs) || !!sourcePrompt?.vault ? null : { modelId, prompt, form, adv });
+  }, [modelId, prompt, form, adv, tainted, startImage, refs, sourcePrompt]);
 
   useMoreBelow(scrollRef);
 
-  const currentMemory = (): VideoMemory => ({ form, adv, startImage, vault: tainted || startIsVault(startImage) });
+  const currentMemory = (): VideoMemory => ({ form, adv, startImage, refs, vault: tainted || startIsVault(startImage) || refsAreVault(refs) });
 
   const selectModel = (id: string) => {
     if (id === modelId) return;
@@ -355,8 +375,20 @@ export const VideoPanel = forwardRef<
     // A remembered form keeps its own resolution choice.
     if (mem && nextStart) autoMatchedFor.current = `${startKey(nextStart)}:${id}`;
     setStartImage(nextStart);
+    const nextMax = next.modes?.includes("r2v") ? Math.max(0, next.maxReferences) : 0;
+    setRefs(nextMax ? (refs.length ? refs : (mem?.refs ?? [])).slice(0, nextMax) : []);
     if (startImage && !takesStart && cur) {
-      showNotice({ tone: "info", title: `Kept the start image for ${cur.name}`, detail: `${next.name} only does text → video. Switch back to ${cur.name} to get it back.` });
+      showNotice({
+        tone: "info",
+        title: `Kept the start image for ${cur.name}`,
+        detail: `${next.name} ${nextMax ? "uses character references instead of a start image" : "only does text → video"}. Switch back to ${cur.name} to get it back.`,
+      });
+    } else if (refs.length && !nextMax && cur) {
+      showNotice({
+        tone: "info",
+        title: `Kept the character references for ${cur.name}`,
+        detail: `${next.name} doesn't take character references. Switch back to ${cur.name} to get them back.`,
+      });
     } else if (mem) {
       showNotice({ tone: "ok", title: `Restored your ${next.name} settings`, detail: "Duration, resolution, audio, seed and steps as you left them." });
     } else {
@@ -370,23 +402,31 @@ export const VideoPanel = forwardRef<
       setPickerOpen(false);
       const isTainted = tainted || submitted;
       const vStart = startIsVault(startImage);
+      const vRefs = refsAreVault(refs);
       const vSource = !!sourcePrompt?.vault;
-      const formHas = isTainted || vStart || vSource;
+      const formHas = isTainted || vStart || vRefs || vSource;
       const memVault = [...memory.current].filter(([, m]) => m.vault);
       for (const [k] of memVault) memory.current.delete(k);
       if (notice?.vault || !submitted) clearNotice();
       if (!formHas && !memVault.length) return null;
-      const stash: VideoStash = { form: formHas, prompt, modelId, adv, startImage, sourcePrompt, tainted: isTainted, memory: memVault };
+      const stash: VideoStash = { form: formHas, prompt, modelId, adv, startImage, refs, sourcePrompt, tainted: isTainted, memory: memVault };
       if (formHas) {
         setPrompt("");
         if (isTainted) setAdv({ ...advancedDefaults(model), steps: adv.steps, cfg: adv.cfg });
         if (vStart) setStartImage(null);
+        if (vRefs) setRefs((rs) => rs.filter((r) => !isVaultUrl(r.refId)));
         if (vSource) setSourcePrompt(null);
         setTainted(false);
         showNotice(
           submitted
             ? { tone: "info", title: "Sent to the vault — prompt cleared", detail: "The vault is locked, so nothing from this job stays on screen. Unlock to get the prompt back.", sticky: true, vault: true }
-            : { tone: "info", title: "Vault locked — vault start image and prompt cleared", detail: "Unlock the vault to restore them.", sticky: true, vault: true },
+            : {
+                tone: "info",
+                title: `Vault locked — vault ${vRefs && !vStart ? "references" : "start image"} and prompt cleared`,
+                detail: "Unlock the vault to restore them.",
+                sticky: true,
+                vault: true,
+              },
         );
       }
       return stash;
@@ -403,8 +443,10 @@ export const VideoPanel = forwardRef<
           autoMatchedFor.current = `${startKey(s.startImage)}:${modelId}`;
           setStartImage(s.startImage);
         }
+        const vr = s.refs.filter((r) => isVaultUrl(r.refId));
+        if (vr.length && maxRefs) setRefs((rs) => [...rs, ...vr.filter((r) => !rs.some((x) => x.refId === r.refId))].slice(0, maxRefs));
       } else {
-        memory.current.set(s.modelId, { form, adv: s.adv, startImage: s.startImage, vault: true });
+        memory.current.set(s.modelId, { form, adv: s.adv, startImage: s.startImage, refs: s.refs, vault: true });
       }
       if (s.sourcePrompt) setSourcePrompt(s.sourcePrompt);
       if (s.tainted || !typedMeanwhile) setTainted(true);
@@ -471,16 +513,68 @@ export const VideoPanel = forwardRef<
       });
   };
 
-  const handlers = useRef({ addStartFiles, addStartPaths });
-  handlers.current = { addStartFiles, addStartPaths };
-  const listen = active && i2v;
+  // ---------- character references (r2v): same import pipeline as the image references ----------
+  const refLimitNote = () => toast.info(`${model?.name} takes at most ${maxRefs} character references`);
+  const addRefs = async (load: (() => Promise<RefItem>)[]) => {
+    setRefBusy(true);
+    try {
+      for (const l of load) {
+        const r = await l();
+        setRefs((rs) => (rs.length < maxRefs ? [...rs, r] : rs));
+      }
+    } catch (e) {
+      toast.error("Couldn't add the reference image", e);
+    } finally {
+      setRefBusy(false);
+    }
+  };
+  const addRefFiles = async (picked: File[]) => {
+    const files = await realImageFiles(picked);
+    if (!files.length) return showNotice({ tone: "warn", title: NOT_AN_IMAGE });
+    if (files.length < picked.length) toast.info("Some files were skipped", "Only image files can be references.");
+    const slots = maxRefs - refs.length;
+    if (slots <= 0) return refLimitNote();
+    if (files.length > slots) toast.info(`Only ${slots} more reference${slots === 1 ? "" : "s"} allowed`, `${model?.name} takes at most ${maxRefs}.`);
+    await addRefs(files.slice(0, slots).map((f) => async () => api.importReferenceBytes(await api.blobToBase64(f), f.type || "image/png", saveTo)));
+  };
+  const addRefPaths = async (paths: string[]) => {
+    const imgs = paths.filter((p) => IMAGE_EXT.test(p));
+    if (!imgs.length) return showNotice({ tone: "warn", title: NOT_AN_IMAGE });
+    if (imgs.length < paths.length) toast.info("Some files were skipped", "Only image files can be references.");
+    const slots = maxRefs - refs.length;
+    if (slots <= 0) return refLimitNote();
+    if (imgs.length > slots) toast.info(`Only ${slots} more reference${slots === 1 ? "" : "s"} allowed`, `${model?.name} takes at most ${maxRefs}.`);
+    await addRefs(imgs.slice(0, slots).map((p) => () => api.importReference(p, saveTo)));
+  };
+  const pickRefs = async () => {
+    try {
+      const paths = await api.pickImagePaths();
+      if (paths === null) fileInput.current?.click();
+      else if (paths.length) await addRefPaths(paths);
+    } catch (e) {
+      toast.error("Couldn't open the file picker", e);
+    }
+  };
+  /** A gallery or vault image as a character reference; vault images stay sealed in the vault. */
+  const addRefFromGallery = async (rec: ImageRecord) => {
+    if (refs.length >= maxRefs) return refLimitNote();
+    await addRefs([() => api.importReference(rec.path, rec.vault ? "vault" : saveTo)]);
+  };
+  const removeRef = (id: string) => setRefs((rs) => rs.filter((r) => r.refId !== id));
+
+  // Pasted / dropped images go to the references for r2v models, else to the start image.
+  const onPastedFiles = r2v ? addRefFiles : addStartFiles;
+  const onDroppedPaths = r2v ? addRefPaths : addStartPaths;
+  const handlers = useRef({ onPastedFiles, onDroppedPaths });
+  handlers.current = { onPastedFiles, onDroppedPaths };
+  const listen = active && (i2v || maxRefs > 0);
   useEffect(() => {
     if (!listen) return;
     const onPaste = (e: ClipboardEvent) => {
       const files = Array.from(e.clipboardData?.files ?? []);
       if (!files.length) return;
       e.preventDefault();
-      void handlers.current.addStartFiles(files);
+      void handlers.current.onPastedFiles(files);
     };
     document.addEventListener("paste", onPaste);
     let un: (() => void) | undefined;
@@ -491,7 +585,7 @@ export const VideoPanel = forwardRef<
         else if (e.type === "leave") setDragActive(false);
         else {
           setDragActive(false);
-          void handlers.current.addStartPaths(e.paths);
+          void handlers.current.onDroppedPaths(e.paths);
         }
       })
       .then((f) => (dead ? f() : (un = f)));
@@ -505,7 +599,7 @@ export const VideoPanel = forwardRef<
   // ---------- restore ("Use these settings") / "Make video" ----------
   useImperativeHandle(ref, () => ({
     startFromImage(rec: ImageRecord, opts?: { undoMode?: () => void }) {
-      const snap = { modelId, form, adv, startImage, sourcePrompt };
+      const snap = { modelId, form, adv, startImage, refs, sourcePrompt };
       const cur = models.find((x) => x.id === modelId);
       let switchedTo: string | null = null;
       if (!cur?.modes?.includes("i2v")) {
@@ -517,6 +611,7 @@ export const VideoPanel = forwardRef<
         }
         memory.current.set(modelId, currentMemory());
         setModelId(next.id);
+        setRefs([]);
         setForm(memory.current.get(next.id)?.form ?? formDefaults(next));
         setAdv((a) => ({ ...advancedDefaults(next), seed: a.seed, randomSeed: a.randomSeed }));
         switchedTo = next.name;
@@ -540,6 +635,7 @@ export const VideoPanel = forwardRef<
           setAdv(snap.adv);
           autoMatchedFor.current = snap.startImage ? `${startKey(snap.startImage)}:${snap.modelId}` : "";
           setStartImage(snap.startImage);
+          setRefs(snap.refs);
           setSourcePrompt(snap.sourcePrompt);
           opts?.undoMode?.();
         },
@@ -558,7 +654,7 @@ export const VideoPanel = forwardRef<
         toast.error("That video model is no longer available", rec.model);
         return;
       }
-      const snap = { modelId, prompt, form, adv, startImage, tainted };
+      const snap = { modelId, prompt, form, adv, startImage, refs, tainted };
       const d = formDefaults(m);
       const resOpts = m.limits?.resolutions ?? [];
       const resIds = resOpts.map(resolutionId);
@@ -617,6 +713,26 @@ export const VideoPanel = forwardRef<
       autoMatchedFor.current = next ? `${startKey(next)}:${m.id}` : "";
       setStartImage(next);
       setMatched(null);
+      // r2v: the character references are re-imported from the record (vault ones stay in the vault).
+      const mMax = m.modes?.includes("r2v") ? Math.max(0, m.maxReferences) : 0;
+      const recRefs = (rec.references ?? []).slice(0, mMax);
+      let refFails = 0;
+      if (recRefs.length) {
+        setRefs([]);
+        setRefBusy(true);
+        const restored: RefItem[] = [];
+        for (const p of recRefs) {
+          try {
+            restored.push(await api.importReference(p, dest));
+          } catch {
+            refFails++;
+          }
+        }
+        setRefs(restored);
+        setRefBusy(false);
+      } else {
+        setRefs([]);
+      }
       const parts = [
         opts?.undoMode ? "Switched to Video" : "",
         snap.prompt.trim() && snap.prompt !== rec.prompt ? "Replaced your prompt" : "",
@@ -624,9 +740,11 @@ export const VideoPanel = forwardRef<
         !m.installed ? `${m.name} isn't installed — install it in Models to generate` : "",
         resNote,
         startFailed ? "The start image couldn't be restored" : "",
+        refFails ? `${refFails} of ${recRefs.length} character references couldn't be restored` : "",
+        snap.refs.length && !recRefs.length ? "Removed your character references (the restored video had none)" : "",
       ].filter(Boolean);
       showNotice({
-        tone: startFailed || resNote || !m.installed ? "warn" : "ok",
+        tone: startFailed || refFails || resNote || !m.installed ? "warn" : "ok",
         title: `Settings restored · ${m.name} · seed ${rec.seed}`,
         detail: parts.join(". ") || undefined,
         undo: () => {
@@ -636,6 +754,7 @@ export const VideoPanel = forwardRef<
           setAdv(snap.adv);
           autoMatchedFor.current = snap.startImage ? `${startKey(snap.startImage)}:${snap.modelId}` : "";
           setStartImage(snap.startImage);
+          setRefs(snap.refs);
           setTainted(snap.tainted);
           opts?.undoMode?.();
         },
@@ -660,6 +779,8 @@ export const VideoPanel = forwardRef<
             !model.installed ? `${model.name} isn't installed` : "",
             gpu.podMode && videoGpuStatus === "stopping" ? "The video GPU is stopping — Generate is available again once it has stopped" : "",
             startBusy ? "Adding the start image…" : "",
+            refBusy ? "Adding the references…" : "",
+            r2v && !refBusy && refs.length === 0 ? "Add at least one character reference image" : "",
             !prompt.trim() ? "Write a prompt" : "",
             !form.resolution ? "Choose a resolution" : "",
             advProblem ?? "",
@@ -672,6 +793,9 @@ export const VideoPanel = forwardRef<
     if (blocker) {
       if (model && !model.installed) {
         formRef.current?.querySelector<HTMLElement>(".model-missing .link-btn")?.focus();
+      } else if (r2v && !refBusy && refs.length === 0) {
+        refSectionRef.current?.scrollIntoView({ block: "nearest" });
+        refSectionRef.current?.querySelector<HTMLElement>(".refs button")?.focus();
       } else if (!prompt.trim()) {
         setPromptError(true);
         promptRef.current?.focus();
@@ -701,7 +825,8 @@ export const VideoPanel = forwardRef<
       if (!adv.randomSeed && adv.seed.trim() !== "") input.seed = Number(adv.seed.trim());
       if (adv.steps.trim() !== "" && Number(adv.steps) > 0) input.steps = Math.round(Number(adv.steps));
       if (adv.cfg.trim() !== "" && !isNaN(Number(adv.cfg))) input.cfg = Number(adv.cfg);
-      if (i2v && startImage?.vaultId) input.initImageVaultId = startImage.vaultId;
+      if (r2v) input.referenceIds = refs.slice(0, maxRefs).map((r) => r.refId);
+      else if (i2v && startImage?.vaultId) input.initImageVaultId = startImage.vaultId;
       else if (i2v && startImage?.galleryId) input.initImageGalleryId = startImage.galleryId;
       else if (i2v && startImage?.refId) input.initImageId = startImage.refId;
       input.destination = saveTo;
@@ -874,7 +999,31 @@ export const VideoPanel = forwardRef<
               onRemove={removeStart}
               onFiles={addStartFiles}
               onPick={pickStart}
-              onPickGallery={() => setPickerOpen(true)}
+              onPickGallery={() => setPickerOpen("start")}
+            />
+          </section>
+        )}
+
+        {maxRefs > 0 && (
+          <section className="section" aria-labelledby="video-refs-title" ref={refSectionRef}>
+            <div className="section__head">
+              <h2 className="section__title" id="video-refs-title">
+                Character references <span className="section__aside">(1–{maxRefs}) — kept the same through the whole clip</span>
+              </h2>
+              <span className="hint mono">
+                {refs.length}/{maxRefs}
+              </span>
+            </div>
+            <References
+              max={maxRefs}
+              refs={refs}
+              busy={refBusy}
+              dragActive={dragActive}
+              tags={refTagging(model?.id, promptRef, prompt, setPrompt)}
+              onRemove={removeRef}
+              onFiles={addRefFiles}
+              onPick={pickRefs}
+              onPickGallery={() => setPickerOpen("refs")}
             />
           </section>
         )}
@@ -895,7 +1044,9 @@ export const VideoPanel = forwardRef<
             className={`input textarea prompt ${promptError ? "is-invalid" : ""}`}
             rows={5}
             placeholder={
-              startImage
+              r2v
+                ? `Describe the shot, naming the references by tag — e.g. ${refTag(REF_TAGS[model?.id ?? ""]?.format ?? "<Picture {n}>", 1)} walks into the café, camera follows${soundWord ? ", the sound" : ""}…`
+                : startImage
                 ? `Describe the motion — what happens, how the camera moves${soundWord ? ", the sound" : ""}…`
                 : `Describe the shot — subject, action, camera move, light${soundWord ? ", sound" : ""}…`
             }
@@ -1084,14 +1235,22 @@ export const VideoPanel = forwardRef<
       </div>
 
       <GalleryPicker
-        open={pickerOpen}
+        open={!!pickerOpen}
+        title={pickerOpen === "refs" ? "Choose a character reference" : undefined}
+        purpose={pickerOpen === "refs" ? "reference" : "start"}
         preferVault={saveTo === "vault"}
         modelNames={modelNames}
-        currentId={startImage?.vaultId ?? startImage?.galleryId ?? undefined}
+        currentId={pickerOpen === "start" ? (startImage?.vaultId ?? startImage?.galleryId ?? undefined) : undefined}
         returnFocusRef={promptRef}
         onClose={() => setPickerOpen(false)}
         onPick={(rec) => {
+          const target = pickerOpen;
           setPickerOpen(false);
+          if (target === "refs") {
+            void addRefFromGallery(rec);
+            requestAnimationFrame(() => refSectionRef.current?.querySelector<HTMLElement>(".refs button")?.focus());
+            return;
+          }
           setStartImage(fromGallery(rec, modelNames[rec.model]));
           setSourcePrompt(rec.prompt ? { text: rec.prompt, vault: !!rec.vault } : null);
           // The picker's opener ("From gallery") is replaced by the thumbnail: continue at the prompt (UI-006).
@@ -1103,11 +1262,12 @@ export const VideoPanel = forwardRef<
         ref={fileInput}
         type="file"
         accept="image/*"
+        multiple={r2v}
         hidden
         onChange={(e) => {
           const files = Array.from(e.target.files ?? []);
           e.target.value = "";
-          if (files.length) void addStartFiles(files);
+          if (files.length) void (r2v ? addRefFiles(files) : addStartFiles(files));
         }}
       />
     </form>
@@ -1145,7 +1305,7 @@ function VideoModelPicker({ models, value, onChange }: { models: ModelView[]; va
             title={`${m.name} · ${m.license}`}
           >
             <span className="model-card__glyph" aria-hidden>
-              {MODEL_GLYPH[m.id] ?? m.name.slice(0, 2)}
+              {glyphOf(m)}
             </span>
             <span className="model-card__text">
               <span className="model-card__name">{m.name}</span>
@@ -1156,6 +1316,7 @@ function VideoModelPicker({ models, value, onChange }: { models: ModelView[]; va
                   !m.installed && <span className="badge badge--muted">Not installed</span>
                 )}
                 {m.modes?.includes("i2v") && <span className="tag">i2v</span>}
+                {m.modes?.includes("r2v") && <span className="tag">ref</span>}
                 {m.audio && <span className="tag">audio</span>}
                 {m.limits?.maxDurationS ? <span className="tag">≤{m.limits.maxDurationS} s</span> : null}
                 {biggest >= 1080 ? <span className="tag">1080p</span> : null}

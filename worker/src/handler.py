@@ -21,14 +21,18 @@ Actions (docs/spec.md, "Worker job protocol"):
             (up to 3 files in parallel; progress is aggregated, see _run_downloads)
   delete    {files: [{folder, filename}]} -> {deleted: [filename], missing: [filename]}
   generate_video (spec "v5")
-            {model: "h3" | "ltx25", prompt, negativePrompt?, initImage?: {name, base64},
+            {model: "h3" | "h3ref" | "ltx25", prompt, negativePrompt?,
+             initImage?: {name, base64}, references?: [{name, base64}],
              durationS, fps, resolution: "WxH", seed?, steps?, cfg?, audio: bool}
             -> {video: {base64, mime: "video/mp4", width, height, fps, frames, durationS,
                         hasAudio},
                 poster: {base64, mime: "image/jpeg", width, height},
                 seed, timings: {loadMs, sampleMs, encodeMs, totalMs}}
             initImage makes it image->video; the output keeps its aspect ratio
-            at the preset's pixel count. See worker/README.md.
+            at the preset's pixel count. references (models with mode "r2v",
+            i.e. h3ref): 1..maxReferences character images, required there
+            and rejected (REFERENCES_NOT_SUPPORTED) elsewhere; the output is
+            the preset size. See worker/README.md.
 
 Failures are returned as {"error": "<CODE>: <detail>"}; the RunPod SDK then
 marks the job FAILED with that message.
@@ -190,6 +194,18 @@ def _decode_reference(ref: Any, index: int) -> tuple[bytes, str, str]:
     return _decode_image(ref, "INVALID_REFERENCE", f"reference {index}")
 
 
+def _decode_references(inp: dict, model: dict) -> list[tuple[bytes, str, str]]:
+    """The request's `references` (a list of at most the model's
+    maxReferences images), decoded."""
+    refs = inp.get("references") or []
+    if not isinstance(refs, list):
+        raise InputError("INVALID_INPUT: references must be a list")
+    if len(refs) > int(model.get("maxReferences", 0)):
+        raise InputError(f"TOO_MANY_REFERENCES: {model['id']} accepts at most "
+                         f"{model.get('maxReferences', 0)}")
+    return [_decode_reference(r, i) for i, r in enumerate(refs)]
+
+
 def _jpeg_exif_transposed(seg: bytes) -> bool:
     """True if an APP1 Exif segment has an orientation that swaps the sides (5-8)."""
     if not seg.startswith(b"Exif\x00\x00") or len(seg) < 14:
@@ -321,13 +337,7 @@ def validate_generate(inp: dict, registry: dict) -> dict:
     steps = _number(inp, "steps", int, 1, MAX_STEPS, required=False)
     cfg = _number(inp, "cfg", float, 0.0, 30.0, required=False)
 
-    refs = inp.get("references") or []
-    if not isinstance(refs, list):
-        raise InputError("INVALID_INPUT: references must be a list")
-    if len(refs) > int(model.get("maxReferences", 0)):
-        raise InputError(
-            f"TOO_MANY_REFERENCES: {mid} accepts at most {model.get('maxReferences', 0)}")
-    decoded = [_decode_reference(r, i) for i, r in enumerate(refs)]
+    decoded = _decode_references(inp, model)
 
     loras = inp.get("loras") or []
     if not isinstance(loras, list) or len(loras) > MAX_LORAS:
@@ -743,6 +753,16 @@ def validate_generate_video(inp: dict, registry: dict) -> dict:
         if size is None or size[0] <= 0 or size[1] <= 0:
             raise InputError("INVALID_INIT_IMAGE: could not read the size of initImage")
         init = {"data": data, "ext": ext, "mime": mime, "width": size[0], "height": size[1]}
+    # Reference images (r2v): required by r2v models, not accepted by the others.
+    if "r2v" in model.get("modes", []):
+        refs = _decode_references(inp, model)
+        if not refs:
+            raise InputError(f"INVALID_INPUT: {mid} needs 1-{model.get('maxReferences', 0)} "
+                             "reference images (references)")
+    elif inp.get("references"):
+        raise InputError(f"REFERENCES_NOT_SUPPORTED: {mid} does not accept reference images")
+    else:
+        refs = []
     duration = _number(inp, "durationS", float, float(lim.get("minDurationS", 0)),
                        float(lim["maxDurationS"]), required=False)
     fps = _number(inp, "fps", float, 1, 120, required=False)
@@ -767,6 +787,7 @@ def validate_generate_video(inp: dict, registry: dict) -> dict:
         "fps": int(d["fps"] if fps is None else fps),
         "resolution": d["resolution"] if resolution is None else resolution,
         "seed": seed, "steps": steps, "cfg": cfg, "audio": audio, "initImage": init,
+        "references": refs,
     }
 
 
@@ -874,13 +895,15 @@ def do_generate_video(job: dict, inp: dict) -> dict:
 
     init = params["initImage"]
 
-    def graph_params(init_name: str | None) -> dict:
+    def graph_params(init_name: str | None, ref_names: list[str]) -> dict:
         gi = None if init is None else {"name": init_name, "width": init["width"],
                                         "height": init["height"]}
-        return {**params, "initImage": gi}
+        return {**params, "initImage": gi, "references": ref_names}
 
     progress = Throttle(job)
-    preview, info = build_video_workflow(graph_params("init"), registry)
+    # Placeholder names: the stage list only depends on the graph's shape.
+    preview, info = build_video_workflow(
+        graph_params("init", [f"ref{i}" for i in range(len(params["references"]))]), registry)
     copies = local_models.begin_for_job(params["model"])
     tracker = StageTracker(progress, preview, info["totalSteps"], t0,
                            pre_stages=(COPY_STAGE,) if copies else ())
@@ -898,8 +921,12 @@ def do_generate_video(job: dict, inp: dict) -> dict:
     if init is not None:
         init_name = client.upload_image(f"is_{tag}_init.{init['ext']}", init["data"], init["mime"])
         uploads.append(init_name)
+    ref_names = []
+    for i, (data, ext, mime) in enumerate(params["references"], start=1):
+        ref_names.append(client.upload_image(f"is_{tag}_ref{i}.{ext}", data, mime))
+    uploads += ref_names
 
-    graph, info = build_video_workflow(graph_params(init_name), registry)
+    graph, info = build_video_workflow(graph_params(init_name, ref_names), registry)
     tracker.set_graph(graph)
     offsets, acc = {}, 0
     for node, n in info["samplers"]:

@@ -34,17 +34,20 @@ terminate is retried every RETRY_S while the pod stays idle.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hmac
 import json
 import logging
 import os
 import queue
 import shutil
+import struct
 import subprocess
 import sys
 import threading
 import time
 import uuid
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
@@ -606,11 +609,24 @@ class Health:
 # warm-up
 # ---------------------------------------------------------------------------
 WARMUP_IMAGE_SIDE = 256  # valid for every image model; the weights load the same
+WARMUP_REF_SIDE = 64     # r2v warm-up reference: one small grey PNG
+
+
+def _grey_png(side: int) -> bytes:
+    """A `side` x `side` mid-grey RGB PNG (standard library only)."""
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data)))
+    raw = b"".join(b"\x00" + b"\x80" * 3 * side for _ in range(side))
+    ihdr = struct.pack(">IIBBBBB", side, side, 8, 2, 0, 0, 0)  # 8-bit RGB
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw))
+            + chunk(b"IEND", b""))
 
 
 def warmup_input(registry: dict, model_id: str) -> dict | None:
     """The cheapest valid job for `model_id`: 1 step, smallest size / frame
-    count. None for an unknown id."""
+    count; models that require reference images (mode "r2v") get one small
+    grey PNG. None for an unknown id."""
     for m in registry.get("models", []):
         if m["id"] == model_id:
             return {"action": "generate", "model": model_id, "prompt": "warm-up",
@@ -624,11 +640,15 @@ def warmup_input(registry: dict, model_id: str) -> dict | None:
                 w, h = r.split("x")
                 return int(w) * int(h)
 
-            return {"action": "generate_video", "model": model_id, "prompt": "warm-up",
-                    "resolution": min(lim["resolutions"], key=pixels),
-                    "durationS": lim.get("minDurationS") or 1,
-                    "fps": min(lim["fpsOptions"]), "steps": 1, "seed": 0,
-                    "audio": bool(m.get("audio", False))}
+            inp = {"action": "generate_video", "model": model_id, "prompt": "warm-up",
+                   "resolution": min(lim["resolutions"], key=pixels),
+                   "durationS": lim.get("minDurationS") or 1,
+                   "fps": min(lim["fpsOptions"]), "steps": 1, "seed": 0,
+                   "audio": bool(m.get("audio", False))}
+            if "r2v" in m.get("modes", []):
+                png = base64.b64encode(_grey_png(WARMUP_REF_SIDE)).decode("ascii")
+                inp["references"] = [{"name": "warmup.png", "base64": png}]
+            return inp
     return None
 
 

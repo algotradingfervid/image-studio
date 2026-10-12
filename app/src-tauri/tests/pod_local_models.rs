@@ -67,7 +67,7 @@ fn vol() -> VolumeInfo {
 
 #[test]
 fn payload_disk_env_and_cuda_filter_per_profile() {
-    for (p, disk) in [(Profile::Image, 100), (Profile::Video, 120)] {
+    for (p, disk) in [(Profile::Image, 100), (Profile::Video, 150)] {
         let body = pod::create_payload_for(p, &vol(), "G", "tok", 30, None, "img", "main", "flux2");
         assert_eq!(body["disk"], disk, "{p:?}");
         assert_eq!(p.container_disk_gb(), disk);

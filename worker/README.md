@@ -284,7 +284,8 @@ disk-backed path for files that fall back to the volume.
 - **Warm-up.** Once the first prefetched model is copied and ComfyUI is up, the
   server runs one 1-step job through the normal handler and discards its
   output. Image jobs are 256x256; video jobs use the smallest resolution and
-  the minimum duration. The warm-up is skipped once any real generate job has
+  the minimum duration. Models that need reference images (`h3ref`) get one
+  64x64 grey PNG as their reference. The warm-up is skipped once any real generate job has
   been submitted, and a job that arrives during it waits only for that
   warm-up. It is not a job: it is not listed or counted and does not reset the
   idle watchdog.
@@ -328,7 +329,7 @@ On any failure the handler returns `{"error": "<CODE>: <detail>"}`, and RunPod m
 | `status` | — | `{files: [{folder, filename, sizeBytes}], volume: {totalBytes, freeBytes}, comfyuiVersion}` |
 | `download` | `files: [{folder, filename, url, sizeBytes?, sha256?}]` | `{downloaded, skipped, elapsedMs, avgMBps}` |
 | `delete` | `files: [{folder, filename}]` | `{deleted, missing}`, then `POST /free` to ComfyUI |
-| `generate_video` | `model, prompt, negativePrompt?, initImage?: {name, base64}, durationS, fps, resolution, seed, steps?, cfg?, audio` | `{video: {base64 (MP4), mime, width, height, fps, frames, durationS, hasAudio, sizeBytes}, poster: {base64 (JPEG), mime, width, height}, seed, timings: {loadMs, sampleMs, encodeMs, totalMs}}` |
+| `generate_video` | `model, prompt, negativePrompt?, initImage?: {name, base64}, references?: [{name, base64}], durationS, fps, resolution, seed, steps?, cfg?, audio` | `{video: {base64 (MP4), mime, width, height, fps, frames, durationS, hasAudio, sizeBytes}, poster: {base64 (JPEG), mime, width, height}, seed, timings: {loadMs, sampleMs, encodeMs, totalMs}}` |
 
 ### `generate`
 
@@ -347,14 +348,16 @@ On any failure the handler returns `{"error": "<CODE>: <detail>"}`, and RunPod m
 
 ### `generate_video` (v5)
 
-Video models come from `videoModels` in `shared/models.json` (`h3` MiniMax H3, `ltx25`
-LTX-2.5 distilled). Each has `modes`, `audio`, `volume`, `defaults {durationS, fps,
-resolution, steps, cfg, …}`, `limits {minDurationS, maxDurationS, resolutions, fpsOptions}`
-and `tunable {steps, cfg}`. Each file also has a `role` (`unet`, `clip`, `video_vae`,
+Video models come from `videoModels` in `shared/models.json` (`h3` MiniMax H3, `h3ref`
+MiniMax H3 reference-to-video, `ltx25` LTX-2.5 distilled). Each has `modes` (`t2v`, `i2v`,
+`r2v`), `audio`, `volume`, `defaults {durationS, fps, resolution, steps, cfg, …}`,
+`limits {minDurationS, maxDurationS, resolutions, fpsOptions}` and `tunable {steps, cfg}`;
+`r2v` models also have `maxReferences`. Each file also has a `role` (`unet`, `clip`, `video_vae`,
 `audio_vae`, `spatial_upscaler`), which is how the graph builder picks it.
 
-| | `h3` | `ltx25` |
+| | `h3`, `h3ref` | `ltx25` |
 |---|---|---|
+| modes | `h3`: t2v, i2v; `h3ref`: r2v (1–4 `references`, required) | t2v, i2v |
 | defaults | 5 s, 24 fps, `864x480`, 20 steps | 5 s, 24 fps, `1280x704`, cfg 1.0 |
 | durationS | 2–15 | 2–20 |
 | fps | 24 (fixed by the model) | 24, 25 |
@@ -371,6 +374,15 @@ and `tunable {steps, cfg}`. Each file also has a `role` (`unet`, `clip`, `video_
   i2v. The output keeps the start image's aspect ratio at the preset's pixel count, rounded
   to multiples of 32 (H3) or 64 (LTX). The templates instead stretch (H3) or centre-crop (LTX)
   the image to a fixed canvas. Read the real size from `video.width/height`.
+- **Character references (`h3ref`, mode `r2v`):** `references: [{name, base64}]`, 1 to
+  `maxReferences` (4) PNG, JPEG or WebP images (a `data:` URL prefix is accepted), uploaded
+  like image-job references as `is_<tag>_ref<i>.<ext>` and removed after the job. They are
+  required for `r2v` models (`INVALID_INPUT` without them, `TOO_MANY_REFERENCES` above the
+  limit, `INVALID_REFERENCE` for a bad image) and rejected for every other video model
+  (`REFERENCES_NOT_SUPPORTED`). `h3ref` takes no start image (`I2V_NOT_SUPPORTED`). The
+  identity of the people or characters in the references is held through the whole clip
+  (reference tokens ride through every sampling step); refer to them in the prompt as
+  `<Picture 1>`, `<Picture 2>`… in request order. The output is the preset `resolution`.
 - **Audio off:** both models still sample the joint audio+video latent, which is how they
   are trained, but the audio is not decoded and the MP4 has no audio track.
 - **Output:** the MP4 is H.264 (`yuv420p`) with AAC audio, written by ComfyUI's
@@ -381,7 +393,9 @@ and `tunable {steps, cfg}`. Each file also has a `role` (`unet`, `clip`, `video_
   (`ImageFromBatch` → `SaveImage`), re-encoded as JPEG q90 with Pillow (PNG with
   `mime: image/png` if Pillow is missing, which it never is in the image).
 - **Errors:** `UNKNOWN_MODEL`, `INVALID_INPUT: …` (prompt, durationS, fps, resolution,
-  seed, steps 1–100, cfg 0–30, audio), `INVALID_INIT_IMAGE: …`,
+  seed, steps 1–100, cfg 0–30, audio, references), `INVALID_INIT_IMAGE: …`,
+  `I2V_NOT_SUPPORTED`, `INVALID_REFERENCE: …`, `TOO_MANY_REFERENCES`,
+  `REFERENCES_NOT_SUPPORTED`,
   `MODEL_NOT_INSTALLED: <folder/file>, …` (every file of the model's `videoModels` entry
   must be on the volume), `COMFYUI_INVALID_PROMPT`, `COMFYUI_EXECUTION_ERROR`,
   `COMFYUI_NO_OUTPUT: the workflow produced no video`, and `COMFYUI_TIMEOUT` after
@@ -403,9 +417,10 @@ and `tunable {steps, cfg}`. Each file also has a `role` (`unet`, `clip`, `video_
   - `cachedStages` are stages whose nodes ComfyUI reported in `execution_cached` (they never run). `cached` is true when a loader stage is among them, meaning the weights were already in memory.
   - `elapsedMs` counts from the start of the job; `stageElapsedMs` from the start of the current stage.
 - `generate_video`: the same shape. Its stages are `loading_text_encoder`, `encoding_prompt`
-  (CLIPTextEncode, LTXVConditioning, MiniMaxH3ImageToVideo), `loading_model` (UNETLoader,
-  LatentUpscaleModelLoader), `preparing_init_image` (i2v: LoadImage, ResizeImageMaskNode,
-  LTXVPreprocess, LTXVImgToVideoInplace), `sampling` (SamplerCustomAdvanced, and for LTX the
+  (CLIPTextEncode, LTXVConditioning, MiniMaxH3ImageToVideo, MiniMaxH3ReferenceToVideo),
+  `loading_model` (UNETLoader, LatentUpscaleModelLoader), `preparing_init_image` (i2v:
+  LoadImage, ResizeImageMaskNode, LTXVPreprocess, LTXVImgToVideoInplace),
+  `preparing_references` (r2v: the LoadImage nodes feeding MiniMaxH3ReferenceToVideo), `sampling` (SamplerCustomAdvanced, and for LTX the
   upscaler and stage-2 image conditioning between the two samplers), `video_decoding`
   (VAEDecode / VAEDecodeTiled), `audio_decoding` (VAEDecodeAudio / LTXVAudioVAEDecode; only
   with audio), `encoding_video` (CreateVideo, SaveVideo, poster) and `saving` (fetching the
@@ -460,11 +475,17 @@ templates commit:
 | model | template(s) | graph |
 |---|---|---|
 | h3 | `video_minimax_h3_t2v.json`, `video_minimax_h3_i2v.json` (subgraph "Image to Video (MiniMax H3)") | UNETLoader → BasicScheduler(simple, steps) + BasicGuider; CLIPLoader(minimax) + VAELoader(video) → MiniMaxH3ImageToVideo(prompt, W, H, length[, first_frame ← LoadImage]); RandomNoise + KSamplerSelect(res_multistep) → SamplerCustomAdvanced → VAEDecode + VAEDecodeAudio(audio VAE) → CreateVideo(24) → SaveVideo |
+| h3ref | `video_minimax_h3_r2v.json` | UNETLoader(ref2va) → BasicScheduler(simple, steps) + BasicGuider; CLIPLoader(minimax) + VAELoader(video) + VAELoader(audio) + LoadImage ×N → MiniMaxH3ReferenceToVideo(prompt, W, H, length, ref_image_size "match", `ref_images.ref_image_0` … `ref_image_{N-1}`); RandomNoise + KSamplerSelect(res_multistep) → SamplerCustomAdvanced → VAEDecode + VAEDecodeAudio(audio VAE) → CreateVideo(24) → SaveVideo |
 | ltx25 | `video_ltx2_5_t2v.json`, `video_ltx2_5_i2v.json` | CLIPLoader(ltxv) → CLIPTextEncode ×2 → LTXVConditioning(fps). Stage 1 at W/2×H/2: EmptyLTXVLatentVideo [→ LTXVImgToVideoInplace 0.7] + LTXVEmptyLatentAudio → LTXVConcatAVLatent → SamplerCustomAdvanced(seed, LTXVDualCFGGuider, euler_ancestral, 8 manual sigmas) → LTXVSeparateAVLatent. Stage 2: LTXVLatentUpsampler(x2) [→ LTXVImgToVideoInplace 1.0] + stage-1 audio → Concat → SamplerCustomAdvanced(seed 42, 3 manual sigmas) → Separate → VAEDecodeTiled(512, 64, 64, 16) + LTXVAudioVAEDecode → CreateVideo(fps) → SaveVideo. i2v image: LoadImage → ResizeImageMaskNode(longer side 1536, lanczos) → LTXVPreprocess(18) |
 
-`fl2va` ("first/last frame → video + audio") is the only H3 diffusion model either template
-loads. With no keyframe it is text → video; with `first_frame` it is image → video. Both run
-on the same `MiniMaxH3ImageToVideo` node.
+`fl2va` ("first/last frame → video + audio") is the only H3 diffusion model the t2v and
+i2v templates load. With no keyframe it is text → video; with `first_frame` it is image →
+video. Both run on the same `MiniMaxH3ImageToVideo` node. `h3ref` loads the separate
+`ref2va` diffusion model (same text encoder and VAEs, which are downloaded once). The
+reference node's image slots are an Autogrow `TemplatePrefix` (`ref_image_`, max 9), whose
+API names are **0-based** (`comfy_api/latest/_io.py`: `prefix + str(i) for i in
+range(max)`); we cap them at `maxReferences` (4) for speed. Reference videos and audio,
+`ref_image_size "max"` and first-frame guides (`MiniMaxH3AddGuide`) are not used.
 
 Where the video graphs differ from the templates:
 
@@ -480,8 +501,9 @@ Where the video graphs differ from the templates:
 - The LTX duration head (`model_patches/`), temporal upscaler and conv VAE are on the
   volume, but no template uses them, so they are not in `videoModels`.
 
-The fixture `tests/fixtures/object_info_v0.39.0.json` had no video nodes. The 20 classes the
-video graphs use were transcribed from the ComfyUI v0.39.0 source (see its `_added`).
+The fixture `tests/fixtures/object_info_v0.39.0.json` had no video nodes. The 21 classes the
+video graphs use (20 for v5, plus `MiniMaxH3ReferenceToVideo` for `h3ref`) were transcribed
+from the ComfyUI v0.39.0 source (see its `_added`).
 `boot/check_comfy_nodes.py` also checks them against a real ComfyUI when the runtime image
 builds.
 
@@ -517,8 +539,8 @@ uv run pytest -q
 
 **What the tests cover:**
 
-- **Video graphs** (`tests/test_video_workflows.py`): both models × t2v/i2v × audio on/off, validated against the fixture, including DynamicCombo (`format.codec`) and MatchType inputs. Also covered: frame rules, sizes, seeds, steps and cfg, defaults and limits, rejections, stages, and that `videoModels` lists exactly the files the graphs load.
-- **`generate_video`** (`tests/test_video_handler.py`): a fake ComfyUI returns a real 9-frame H.264 + AAC MP4 (`tests/fixtures/tiny_h264_aac.mp4`, written with PyAV 19.0.1 / libx264) and a PNG poster. Covered: output and metadata, progress across two samplers, validation errors, `MODEL_NOT_INSTALLED`, the video timeout, cancel, `latent_upscale_models` status/download/delete, and a 40 MB output through the pod server.
+- **Video graphs** (`tests/test_video_workflows.py`): `h3`/`ltx25` × t2v/i2v × audio on/off and `h3ref` with 1, 2 and 4 references × audio on/off, validated against the fixture, including DynamicCombo (`format.codec`), Autogrow (`ref_images.ref_image_0`) and MatchType inputs. Also covered: frame rules, sizes, seeds, steps and cfg, defaults and limits, rejections, stages, and that `videoModels` lists exactly the files the graphs load.
+- **`generate_video`** (`tests/test_video_handler.py`): a fake ComfyUI returns a real 9-frame H.264 + AAC MP4 (`tests/fixtures/tiny_h264_aac.mp4`, written with PyAV 19.0.1 / libx264) and a PNG poster. Covered: output and metadata, progress across two samplers, validation errors, `h3ref` reference upload, wiring, cleanup and validation, the `h3ref` warm-up job, `MODEL_NOT_INSTALLED`, the video timeout, cancel, `latent_upscale_models` status/download/delete, and a 40 MB output through the pod server.
 - **Graphs:** every model with and without references and LoRAs. Node input names, link types and output indexes are checked against `tests/fixtures/object_info_v0.39.0.json`, a trimmed `GET /object_info` from ComfyUI v0.39.0.
 - **Path sanitising.**
 - **Download manager**, against a local HTTP server: resume, Range ignored, sha and size mismatch, total stall and trickle stall, retry cap and backoff, auth per host, auth dropped on a cross-host redirect, redirect loops.

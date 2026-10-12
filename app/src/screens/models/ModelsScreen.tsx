@@ -430,7 +430,7 @@ function ModelCard({ model: m, all, profile }: { model: ModelView; all: ModelVie
             {isVideo ? (
               <>
                 <li>
-                  <span className="meta-row__k">Modes</span> {(m.modes ?? []).map((x) => (x === "t2v" ? "text → video" : x === "i2v" ? "image → video" : x)).join(", ") || "—"}
+                  <span className="meta-row__k">Modes</span> {(m.modes ?? []).map((x) => (x === "t2v" ? "text → video" : x === "i2v" ? "image → video" : x === "r2v" ? "Character reference" : x)).join(", ") || "—"}
                 </li>
                 <li>
                   <span className="meta-row__k">Audio</span> {m.audio ? "yes" : "no"}
@@ -550,7 +550,7 @@ function ModelCard({ model: m, all, profile }: { model: ModelView; all: ModelVie
         </p>
       )}
 
-      {isVideo && m.id === "h3" && (
+      {isVideo && m.id.startsWith("h3") && (
         <p className="notice notice--warn">
           <Icon name="globe" /> Runs in Canada — license excludes EU/UK/KR/US. Commercial UIs must display “MiniMax H3”.
         </p>

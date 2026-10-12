@@ -615,7 +615,7 @@ def test_copy_stage_is_known():
 # ---------------------------------------------------------------------------
 # warm-up
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("mid", ["chroma", "zimage", "flux2", "qwen", "h3", "ltx25"])
+@pytest.mark.parametrize("mid", ["chroma", "zimage", "flux2", "qwen", "h3", "h3ref", "ltx25"])
 def test_warmup_input_is_the_cheapest_valid_job(mid, registry):
     inp = server.warmup_input(registry, mid)
     if inp["action"] == "generate":
@@ -629,7 +629,16 @@ def test_warmup_input_is_the_cheapest_valid_job(mid, registry):
         w, h = map(int, p["resolution"].split("x"))
         assert w * h == min(a * b for a, b in sizes)
         assert p["durationS"] == model["limits"]["minDurationS"] and p["steps"] == 1
-        handler.build_video_workflow(p, registry)
+        # r2v (h3ref) needs a reference: the warm-up brings one small grey PNG
+        if "r2v" in model["modes"]:
+            assert len(p["references"]) == 1
+            data, ext, mime = p["references"][0]
+            assert (ext, mime) == ("png", "image/png")
+            assert handler.image_size(data, ext) == (64, 64)
+        else:
+            assert "references" not in inp and p["references"] == []
+        handler.build_video_workflow(
+            {**p, "references": [f"ref{i}" for i in range(len(p["references"]))]}, registry)
     assert server.warmup_input(registry, "nope") is None
 
 

@@ -77,6 +77,7 @@ OUTPUT_TYPES: dict[str, list[str]] = {
     # v5 video (transcribed from the v0.39.0 source; see the fixture's "_added")
     "BasicGuider": ["GUIDER"],
     "MiniMaxH3ImageToVideo": ["CONDITIONING", "LATENT"],
+    "MiniMaxH3ReferenceToVideo": ["CONDITIONING", "LATENT"],
     "VAEDecodeAudio": ["AUDIO"],
     "VAEDecodeTiled": ["IMAGE"],
     "CreateVideo": ["VIDEO"],
@@ -385,7 +386,7 @@ def sampler_node_ids(graph: dict) -> set[str]:
 
 
 # --------------------------------------------------------------------------
-# v5 video: MiniMax H3 + LTX-2.5 (docs/spec.md "v5")
+# v5 video: MiniMax H3 (+ H3 reference-to-video) + LTX-2.5 (docs/spec.md "v5")
 #
 # `build_video_workflow(params, registry) -> (graph, info)`
 #
@@ -394,6 +395,8 @@ def sampler_node_ids(graph: dict) -> set[str]:
 #   h3     templates/video_minimax_h3_t2v.json, templates/video_minimax_h3_i2v.json
 #          ("Image to Video (MiniMax H3)" subgraph; t2v = the same graph with
 #          no keyframe images: fl2va covers text->video and first-frame->video)
+#   h3ref  templates/video_minimax_h3_r2v.json (ref2va: 1..maxReferences
+#          character reference images held through the whole clip)
 #   ltx25  templates/video_ltx2_5_t2v.json, templates/video_ltx2_5_i2v.json
 #          ("Text/Image to Video (LTX-2.5)" subgraphs, two-stage with the x2
 #          latent spatial upscaler)
@@ -407,6 +410,9 @@ def sampler_node_ids(graph: dict) -> set[str]:
 #   model, prompt, negativePrompt, durationS, fps, resolution ("WxH"), seed,
 #   steps, cfg, audio: bool,
 #   initImage: {name, width, height} | None   start image (i2v), uploaded
+#   references: [str]   reference images (r2v), ComfyUI input names, uploaded;
+#                       required (1..maxReferences) for models with mode "r2v",
+#                       rejected for the others
 # Missing durationS/fps/resolution/steps/cfg/negativePrompt fall back to the
 # registry defaults.
 #
@@ -415,6 +421,7 @@ def sampler_node_ids(graph: dict) -> set[str]:
 # Audio off: both models still sample the joint audio+video latent (that is
 # how they are trained); the audio stream is just not decoded or muxed.
 #
+# r2v size: the preset resolution (the reference images don't change it).
 # i2v size: the output keeps the start image's aspect ratio at the preset's
 # pixel count (like img2img), rounded to the model's size multiple, instead
 # of the template's stretch (H3) / centre crop (LTX) to a fixed canvas.
@@ -430,6 +437,11 @@ H3_MIN_FRAMES = 5
 H3_SAMPLER = "res_multistep"     # KSamplerSelect
 H3_SCHEDULER = "simple"          # BasicScheduler(simple, steps, denoise 1)
 H3_CLIP_TYPE = "minimax"
+# MiniMaxH3ReferenceToVideo (same file): "match" scales each reference down
+# (never up) to the generation's pixel area, the template's choice; "max"
+# (2048 px short edge) is several times slower.
+H3_REF_IMAGE_SIZE = "match"
+H3_REF_PREFIX = "ref_images.ref_image_"  # Autogrow TemplatePrefix: 0-based names
 
 # LTX-2.5 (templates above; README: frames % 8 == 1, sides divisible by 32;
 # stage 1 runs at half size, so final sides are multiples of 64).
@@ -518,6 +530,17 @@ def _video_resolved(params: dict, model: dict) -> dict:
     p["durationS"] = dur
     if p.get("initImage") and "i2v" not in model.get("modes", []):
         raise WorkflowError(f"I2V_NOT_SUPPORTED: {model['id']} does not accept a start image")
+    p["references"] = _ref_names(p.get("references") or [])
+    n_refs, max_refs = len(p["references"]), int(model.get("maxReferences", 0))
+    if "r2v" in model.get("modes", []):
+        if n_refs == 0:
+            raise WorkflowError(f"INVALID_INPUT: {model['id']} needs 1-{max_refs} reference "
+                                "images (references)")
+        if n_refs > max_refs:
+            raise WorkflowError(f"TOO_MANY_REFERENCES: {model['id']} accepts at most {max_refs}")
+    elif n_refs:
+        raise WorkflowError(f"REFERENCES_NOT_SUPPORTED: {model['id']} does not accept "
+                            "reference images")
     return p
 
 
@@ -664,7 +687,51 @@ def _ltx25(p: dict, model: dict) -> tuple[dict, dict]:
                                   [sca2, sigma_steps(LTX_SIGMAS_STAGE2)]]}
 
 
-_VIDEO_BUILDERS = {"h3": _h3, "ltx25": _ltx25}
+# --------------------------------------------------------------------------
+# MiniMax H3 reference-to-video (ref2va) — templates/video_minimax_h3_r2v.json
+# UNETLoader(ref2va) -> BasicScheduler(simple) + BasicGuider ; CLIPLoader
+# (minimax) + VAELoader(video) + VAELoader(audio) + LoadImage x N ->
+# MiniMaxH3ReferenceToVideo(prompt, W, H, length, ref_image_size "match",
+# "ref_images.ref_image_0".."ref_image_{N-1}") -> conditioning + AV latent ;
+# RandomNoise + KSamplerSelect(res_multistep) -> SamplerCustomAdvanced ->
+# VAEDecode / VAEDecodeAudio -> CreateVideo(24 fps) -> SaveVideo.
+# The prompt refers to the references as <Picture 1>, <Picture 2>... in order.
+# --------------------------------------------------------------------------
+def _h3ref(p: dict, model: dict) -> tuple[dict, dict]:
+    w, h = video_size(p["resolution"], H3_MULTIPLE)
+    frames = h3_frames(p["durationS"])
+    g = _Graph()
+    unet = g.add("UNETLoader", unet_name=model_file_by_role(model, "unet")["filename"],
+                 weight_dtype="default")
+    clip = g.add("CLIPLoader", clip_name=model_file_by_role(model, "clip")["filename"],
+                 type=H3_CLIP_TYPE, device="default")
+    vae = g.add("VAELoader", vae_name=model_file_by_role(model, "video_vae")["filename"])
+    avae = g.add("VAELoader", vae_name=model_file_by_role(model, "audio_vae")["filename"])
+    cond_inputs: dict[str, Any] = {"clip": _out(clip), "vae": _out(vae), "audio_vae": _out(avae),
+                                   "prompt": p["prompt"], "width": w, "height": h,
+                                   "length": frames, "ref_image_size": H3_REF_IMAGE_SIZE}
+    for i, name in enumerate(p["references"]):
+        img = g.add("LoadImage", f"Reference {i + 1}", image=name)
+        cond_inputs[f"{H3_REF_PREFIX}{i}"] = _out(img)
+    cond = g.add("MiniMaxH3ReferenceToVideo", **cond_inputs)
+    noise = g.add("RandomNoise", noise_seed=int(p["seed"]))
+    sampler = g.add("KSamplerSelect", sampler_name=H3_SAMPLER)
+    sched = g.add("BasicScheduler", model=_out(unet), scheduler=H3_SCHEDULER,
+                  steps=int(p["steps"]), denoise=1.0)
+    guider = g.add("BasicGuider", model=_out(unet), conditioning=_out(cond, 0))
+    sca = g.add("SamplerCustomAdvanced", noise=_out(noise), guider=_out(guider),
+                sampler=_out(sampler), sigmas=_out(sched), latent_image=_out(cond, 1))
+    dec = g.add("VAEDecode", samples=_out(sca, 0), vae=_out(vae))
+    audio = None
+    if p["audio"]:
+        audio = _out(g.add("VAEDecodeAudio", samples=_out(sca, 0), vae=_out(avae)))
+    save, poster = _save_video(g, _out(dec), H3_FPS, audio)
+    return g.nodes, {"videoNode": save, "posterNode": poster, "width": w, "height": h,
+                     "fps": H3_FPS, "frames": frames, "hasAudio": p["audio"],
+                     "samplers": [[sca, int(p["steps"])]]}
+
+
+_VIDEO_BUILDERS = {"h3": _h3, "h3ref": _h3ref, "ltx25": _ltx25}
 
 
 def build_video_workflow(params: dict, registry: dict) -> tuple[dict, dict]:
@@ -796,14 +863,16 @@ def init_image_node_ids(graph: dict) -> set[str]:
     return out
 
 
-# Video graphs (SaveVideo present). The start image chain is preparing_init_image;
-# the stage-2 LTX nodes between the two samplers (LTXVLatentUpsampler and the
+# Video graphs (SaveVideo present). The start image chain is preparing_init_image,
+# a LoadImage feeding MiniMaxH3ReferenceToVideo is preparing_references; the
+# stage-2 LTX nodes between the two samplers (LTXVLatentUpsampler and the
 # LTXVImgToVideoInplace on its output) stay in "sampling".
 _VIDEO_STAGE_OF_CLASS: dict[str, str] = {
     "CLIPLoader": "loading_text_encoder",
     "CLIPTextEncode": "encoding_prompt",
     "LTXVConditioning": "encoding_prompt",
     "MiniMaxH3ImageToVideo": "encoding_prompt",  # prompt encode (+ first-frame VAE encode)
+    "MiniMaxH3ReferenceToVideo": "encoding_prompt",  # prompt + reference VAE encodes
     "UNETLoader": "loading_model",
     "LatentUpscaleModelLoader": "loading_model",
     "LoadImage": "preparing_init_image",
@@ -824,10 +893,14 @@ _VIDEO_STAGE_OF_CLASS: dict[str, str] = {
 
 
 def _video_node_stages(graph: dict) -> dict[str, str]:
+    refs = {v[0] for n in graph.values() if n.get("class_type") == "MiniMaxH3ReferenceToVideo"
+            for v in n.get("inputs", {}).values() if isinstance(v, list)}
     out = {}
     for nid, node in graph.items():
         cls = node.get("class_type", "")
         stage = _VIDEO_STAGE_OF_CLASS.get(cls)
+        if cls == "LoadImage" and nid in refs:
+            stage = "preparing_references"
         if cls == "LTXVImgToVideoInplace":
             src = node.get("inputs", {}).get("latent")
             if isinstance(src, list) and graph.get(src[0], {}).get("class_type") == \

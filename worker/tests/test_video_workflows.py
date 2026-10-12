@@ -4,7 +4,8 @@ frame/size math and parameter substitution.
 Node inputs and outputs are checked against tests/fixtures/
 object_info_v0.39.0.json (the video nodes were transcribed from the ComfyUI
 v0.39.0 source; see the fixture's "_added"). DynamicCombo inputs use ComfyUI's
-dotted API names ("format.codec"); MatchType outputs take the linked type.
+dotted API names ("format.codec"), as do Autogrow inputs
+("ref_images.ref_image_0"); MatchType outputs take the linked type.
 """
 
 from __future__ import annotations
@@ -23,18 +24,22 @@ from workflows import (LTX_SIGMAS_STAGE1, LTX_SIGMAS_STAGE2, LTX_STAGE2_SEED, OU
                        build_video_workflow, graph_node_stages, graph_stages, h3_frames,
                        is_video_graph, ltx_frames, sampler_node_ids, video_size)
 
-MODELS = ["h3", "ltx25"]
+MODELS = ["h3", "ltx25"]          # t2v + i2v
+ALL_MODELS = ["h3", "h3ref", "ltx25"]
 MODES = ["t2v", "i2v"]
 INIT = {"name": "is_abc_init.png", "width": 1000, "height": 1500}
 
 DYN = "COMFY_DYNAMICCOMBO_V3"
 MATCH = "COMFY_MATCHTYPE_V3"
+GROW = "COMFY_AUTOGROW_V3"
+REF_NAMES = ["is_abc_ref1.png", "is_abc_ref2.jpg", "is_abc_ref3.webp", "is_abc_ref4.png"]
 
 
 def vparams(model, **kw):
     p = {"model": model, "prompt": "a fox runs through snow", "negativePrompt": None,
          "durationS": None, "fps": None, "resolution": None, "seed": 123456789,
-         "steps": None, "cfg": None, "audio": True, "initImage": None}
+         "steps": None, "cfg": None, "audio": True, "initImage": None,
+         "references": REF_NAMES[:1] if model == "h3ref" else []}
     p.update(kw)
     return p
 
@@ -56,8 +61,17 @@ def _sections(spec):
     return {**spec.get("required", {}), **spec.get("optional", {})}
 
 
+def _autogrow_names(template):
+    """Input names of an Autogrow template (comfy_api/latest/_io.py v0.39.0:
+    TemplateNames lists them; TemplatePrefix is prefix + i for i in range(max))."""
+    if "names" in template:
+        return template["names"]
+    return [f"{template['prefix']}{i}" for i in range(template["max"])]
+
+
 def _resolve(spec_inputs, node_inputs, name):
-    """Spec of input `name`, following DynamicCombo options for dotted names."""
+    """Spec of input `name`, following DynamicCombo options and Autogrow
+    templates for dotted names."""
     parts = name.split(".")
     level = spec_inputs
     for i, part in enumerate(parts):
@@ -66,6 +80,11 @@ def _resolve(spec_inputs, node_inputs, name):
             return None
         if i == len(parts) - 1:
             return s
+        if s["type"] == GROW:
+            if i + 2 != len(parts) or parts[-1] not in _autogrow_names(s["template"]):
+                return None
+            t = s["template"]["input"]
+            return {"type": next(iter(_sections(t).values()))[0]}
         if s["type"] != DYN:
             return None
         key = node_inputs.get(".".join(parts[:i + 1]))
@@ -81,6 +100,8 @@ def _required_names(spec_inputs, node_inputs, prefix=""):
     out = []
     for name, s in spec_inputs.get("required", {}).items():
         full = prefix + name
+        if s["type"] == GROW:  # only its template names ("ref_images.ref_image_0") are inputs
+            continue
         out.append(full)
         if s["type"] == DYN and full in node_inputs:
             opt = next((o for o in s["options"] if o["key"] == node_inputs[full]), None)
@@ -217,6 +238,103 @@ def test_h3_i2v_first_frame(registry):
     assert (cond["width"], cond["height"]) == (info["width"], info["height"]) == (512, 800)
 
 
+@pytest.mark.parametrize("n_refs", [1, 2, 4])
+@pytest.mark.parametrize("audio", [True, False])
+def test_h3ref_graph_valid(n_refs, audio, registry, object_info):
+    refs = REF_NAMES[:n_refs]
+    graph, info = build_video_workflow(vparams("h3ref", references=refs, audio=audio), registry)
+    assert_valid_video_graph(graph, info, object_info)
+    m = get_video_model(registry, "h3ref")
+    assert one(graph, "UNETLoader")[1]["inputs"]["unet_name"] == \
+        "minimax_h3_ref2va_pruned_fp8_scaled.safetensors"
+    _, clip = one(graph, "CLIPLoader")
+    assert clip["inputs"] == {"clip_name": model_file_by_role(m, "clip")["filename"],
+                              "type": "minimax", "device": "default"}
+    vaes = {n["inputs"]["vae_name"]: nid for nid, n in by_class(graph, "VAELoader")}
+    video_vae = vaes[model_file_by_role(m, "video_vae")["filename"]]
+    audio_vae = vaes[model_file_by_role(m, "audio_vae")["filename"]]
+    rid, ref = one(graph, "MiniMaxH3ReferenceToVideo")
+    cond = ref["inputs"]
+    assert cond["clip"] == [one(graph, "CLIPLoader")[0], 0]
+    assert cond["vae"] == [video_vae, 0] and cond["audio_vae"] == [audio_vae, 0]
+    assert cond["prompt"] == "a fox runs through snow"
+    assert cond["ref_image_size"] == "match"
+    # the preset size (no start image), 17k+5 frames
+    assert (cond["width"], cond["height"], cond["length"]) == (864, 480, 124)
+    assert (info["width"], info["height"], info["frames"], info["fps"]) == (864, 480, 124, 24)
+    # Autogrow TemplatePrefix names are 0-based: ref_image_0 .. ref_image_{N-1}, in order
+    ref_keys = sorted((k for k in cond if k.startswith("ref_images.")),
+                      key=lambda k: int(k.rsplit("_", 1)[1]))
+    assert ref_keys == [f"ref_images.ref_image_{i}" for i in range(n_refs)]
+    assert [graph[cond[k][0]]["inputs"]["image"] for k in ref_keys] == refs
+    assert all(graph[cond[k][0]]["class_type"] == "LoadImage" and cond[k][1] == 0
+               for k in ref_keys)
+    assert [n["inputs"]["image"] for _, n in by_class(graph, "LoadImage")] == refs
+    # no first-frame path, no other reference kinds
+    assert not by_class(graph, "MiniMaxH3ImageToVideo")
+    assert not any(k.startswith(("ref_videos", "ref_audios", "ref_video_audios")) for k in cond)
+    # sampling as in the h3 template
+    assert one(graph, "KSamplerSelect")[1]["inputs"]["sampler_name"] == "res_multistep"
+    sched = one(graph, "BasicScheduler")[1]["inputs"]
+    assert (sched["scheduler"], sched["steps"], sched["denoise"]) == ("simple", 20, 1.0)
+    _, guider = one(graph, "BasicGuider")
+    assert guider["inputs"]["conditioning"] == [rid, 0]
+    sca_id, sca = one(graph, "SamplerCustomAdvanced")
+    assert sca["inputs"]["latent_image"] == [rid, 1]
+    assert info["samplers"] == [[sca_id, 20]] and info["totalSteps"] == 20
+    # audio on/off: decoded with the same audio VAE the reference node gets
+    dec_audio = by_class(graph, "VAEDecodeAudio")
+    assert len(dec_audio) == (1 if audio else 0) and info["hasAudio"] is audio
+    if audio:
+        assert dec_audio[0][1]["inputs"] == {"samples": [sca_id, 0], "vae": [audio_vae, 0]}
+    assert ("audio" in one(graph, "CreateVideo")[1]["inputs"]) == audio
+    assert one(graph, "CreateVideo")[1]["inputs"]["fps"] == 24.0
+
+
+def test_h3ref_stages(registry):
+    graph, _ = build_video_workflow(vparams("h3ref", references=REF_NAMES[:3]), registry)
+    ns = graph_node_stages(graph)
+    for nid, n in graph.items():
+        if n["class_type"] == "LoadImage":
+            assert ns[nid] == "preparing_references"
+        if n["class_type"] == "MiniMaxH3ReferenceToVideo":
+            assert ns[nid] == "encoding_prompt"
+    assert graph_stages(graph) == ["loading_text_encoder", "encoding_prompt", "loading_model",
+                                   "preparing_references", "sampling", "video_decoding",
+                                   "audio_decoding", "encoding_video", "saving"]
+    graph, _ = build_video_workflow(vparams("h3ref", audio=False), registry)
+    assert "audio_decoding" not in graph_stages(graph)
+
+
+@pytest.mark.parametrize("res", ["480x864", "1344x768", "640x640"])
+def test_h3ref_size_is_the_preset(res, registry):
+    graph, info = build_video_workflow(vparams("h3ref", resolution=res), registry)
+    cond = one(graph, "MiniMaxH3ReferenceToVideo")[1]["inputs"]
+    assert f"{cond['width']}x{cond['height']}" == f"{info['width']}x{info['height']}" == res
+
+
+def test_h3ref_reference_dicts_accepted(registry):
+    """references may also be {name} dicts (like the image builders)."""
+    a, _ = build_video_workflow(vparams("h3ref", references=REF_NAMES[:2]), registry)
+    b, _ = build_video_workflow(
+        vparams("h3ref", references=[{"name": n} for n in REF_NAMES[:2]]), registry)
+    assert a == b
+
+
+@pytest.mark.parametrize("model,patch,code", [
+    ("h3ref", {"references": []}, "INVALID_INPUT: h3ref needs 1-4 reference images"),
+    ("h3ref", {"references": None}, "INVALID_INPUT: h3ref needs 1-4 reference images"),
+    ("h3ref", {"references": REF_NAMES + ["is_abc_ref5.png"]},
+     "TOO_MANY_REFERENCES: h3ref accepts at most 4"),
+    ("h3ref", {"initImage": INIT}, "I2V_NOT_SUPPORTED: h3ref"),
+    ("h3", {"references": REF_NAMES[:1]}, "REFERENCES_NOT_SUPPORTED: h3"),
+    ("ltx25", {"references": REF_NAMES[:1]}, "REFERENCES_NOT_SUPPORTED: ltx25"),
+])
+def test_reference_rules(model, patch, code, registry):
+    with pytest.raises(WorkflowError, match=code):
+        build_video_workflow(vparams(model, **patch), registry)
+
+
 def test_ltx_graph_matches_template(registry):
     graph, info = build_video_workflow(vparams("ltx25"), registry)
     m = get_video_model(registry, "ltx25")
@@ -310,13 +428,13 @@ def test_template_default_sizes_match_resolution_selector(registry):
     assert get_video_model(registry, "ltx25")["defaults"]["resolution"] == "1280x704"
 
 
-@pytest.mark.parametrize("model", MODELS)
+@pytest.mark.parametrize("model", ALL_MODELS)
 def test_every_offered_resolution_is_exact(model, registry):
     m = get_video_model(registry, model)
     for res in m["limits"]["resolutions"]:
         graph, info = build_video_workflow(vparams(model, resolution=res), registry)
         assert f"{info['width']}x{info['height']}" == res
-        multiple = 32 if model == "h3" else 64
+        multiple = 32 if model.startswith("h3") else 64
         assert info["width"] % multiple == 0 and info["height"] % multiple == 0
 
 
@@ -331,14 +449,14 @@ def test_i2v_size_follows_start_image(model, multiple, iw, ih, registry):
     assert abs(w * h - pw * ph) / (pw * ph) < 0.25
 
 
-@pytest.mark.parametrize("model", MODELS)
+@pytest.mark.parametrize("model", ALL_MODELS)
 def test_params_applied(model, registry):
     graph, info = build_video_workflow(
         vparams(model, seed=2**63 + 7, steps=12, cfg=2.5, durationS=10, negativePrompt="ugly"),
         registry)
     noise = sorted(n["inputs"]["noise_seed"] for _, n in by_class(graph, "RandomNoise"))
     assert info["seed"] == 2**63 + 7
-    if model == "h3":
+    if model.startswith("h3"):
         assert noise == [2**63 + 7]
         assert one(graph, "BasicScheduler")[1]["inputs"]["steps"] == 12
         assert info["totalSteps"] == 12 and info["frames"] == 243
@@ -364,7 +482,7 @@ def test_ltx_fps_25(registry):
     assert one(graph, "LTXVEmptyLatentAudio")[1]["inputs"]["frame_rate"] == 25
 
 
-@pytest.mark.parametrize("model", MODELS)
+@pytest.mark.parametrize("model", ALL_MODELS)
 def test_defaults_from_registry(model, registry):
     m = get_video_model(registry, model)
     graph, info = build_video_workflow(vparams(model), registry)
@@ -383,7 +501,7 @@ def test_defaults_from_registry(model, registry):
     ({"durationS": 60}, "INVALID_INPUT: durationS"),
     ({"durationS": 0.5}, "INVALID_INPUT: durationS"),
 ])
-@pytest.mark.parametrize("model", MODELS)
+@pytest.mark.parametrize("model", ALL_MODELS)
 def test_rejections(model, bad, code, registry):
     with pytest.raises(WorkflowError, match=code):
         build_video_workflow({**vparams(model), **bad}, registry)
@@ -398,28 +516,29 @@ def test_pure(registry):
 
 
 def test_samplers_and_stages(registry):
-    for model in MODELS:
-        for init in (None, INIT):
-            graph, info = build_video_workflow(vparams(model, initImage=init), registry)
-            assert sampler_node_ids(graph) == {s for s, _ in info["samplers"]}
-            stages = graph_stages(graph)
-            assert stages[-4:] == ["video_decoding", "audio_decoding", "encoding_video", "saving"]
-            assert ("preparing_init_image" in stages) == (init is not None)
-            assert stages == [s for s in STAGES if s in stages]
-            ns = graph_node_stages(graph)
-            for nid, n in graph.items():
-                if n["class_type"] in ("VAEDecode", "VAEDecodeTiled"):
-                    assert ns[nid] == "video_decoding"
-                if n["class_type"] in ("VAEDecodeAudio", "LTXVAudioVAEDecode"):
-                    assert ns[nid] == "audio_decoding"
-                if n["class_type"] in ("CreateVideo", "SaveVideo"):
-                    assert ns[nid] == "encoding_video"
-                if n["class_type"] == "LTXVLatentUpsampler":
-                    assert ns[nid] == "sampling"
-                if n["class_type"] == "LTXVImgToVideoInplace":
-                    src = graph[n["inputs"]["latent"][0]]["class_type"]
-                    assert ns[nid] == ("sampling" if src == "LTXVLatentUpsampler"
-                                       else "preparing_init_image")
+    cases = [(m, i) for m in MODELS for i in (None, INIT)] + [("h3ref", None)]
+    for model, init in cases:
+        graph, info = build_video_workflow(vparams(model, initImage=init), registry)
+        assert sampler_node_ids(graph) == {s for s, _ in info["samplers"]}
+        stages = graph_stages(graph)
+        assert stages[-4:] == ["video_decoding", "audio_decoding", "encoding_video", "saving"]
+        assert ("preparing_init_image" in stages) == (init is not None)
+        assert ("preparing_references" in stages) == (model == "h3ref")
+        assert stages == [s for s in STAGES if s in stages]
+        ns = graph_node_stages(graph)
+        for nid, n in graph.items():
+            if n["class_type"] in ("VAEDecode", "VAEDecodeTiled"):
+                assert ns[nid] == "video_decoding"
+            if n["class_type"] in ("VAEDecodeAudio", "LTXVAudioVAEDecode"):
+                assert ns[nid] == "audio_decoding"
+            if n["class_type"] in ("CreateVideo", "SaveVideo"):
+                assert ns[nid] == "encoding_video"
+            if n["class_type"] == "LTXVLatentUpsampler":
+                assert ns[nid] == "sampling"
+            if n["class_type"] == "LTXVImgToVideoInplace":
+                src = graph[n["inputs"]["latent"][0]]["class_type"]
+                assert ns[nid] == ("sampling" if src == "LTXVLatentUpsampler"
+                                   else "preparing_init_image")
     graph, _ = build_video_workflow(vparams("h3", audio=False), registry)
     assert "audio_decoding" not in graph_stages(graph)
     for s in ("video_decoding", "audio_decoding", "encoding_video"):
@@ -430,11 +549,14 @@ def test_samplers_and_stages(registry):
 # registry entries
 # ---------------------------------------------------------------------------
 def test_video_registry_entries(registry):
-    assert video_model_ids(registry) == ["h3", "ltx25"]
+    assert video_model_ids(registry) == ["h3", "h3ref", "ltx25"]
     image_ids = {m["id"] for m in registry["models"]}
     assert not image_ids & set(video_model_ids(registry))
     for m in registry["videoModels"]:
-        assert m["modes"] == ["t2v", "i2v"] and m["audio"] is True
+        assert m["modes"] == (["r2v"] if m["id"] == "h3ref" else ["t2v", "i2v"])
+        assert m["audio"] is True
+        # maxReferences only on (and required by) r2v models
+        assert ("maxReferences" in m) == ("r2v" in m["modes"])
         assert m["volume"] == "image-studio-video"
         assert set(m["defaults"]) >= {"durationS", "fps", "resolution", "steps", "cfg"}
         lim = m["limits"]
@@ -455,6 +577,18 @@ def test_video_registry_entries(registry):
     h3 = get_video_model(registry, "h3")
     assert {f["role"] for f in h3["files"]} == {"unet", "clip", "video_vae", "audio_vae"}
     assert not any(f["gated"] for f in h3["files"])
+    h3ref = get_video_model(registry, "h3ref")
+    assert h3ref["maxReferences"] == 4
+    assert {f["role"] for f in h3ref["files"]} == {"unet", "clip", "video_vae", "audio_vae"}
+    assert not any(f["gated"] for f in h3ref["files"])
+    assert model_file_by_role(h3ref, "unet")["filename"] == \
+        "minimax_h3_ref2va_pruned_fp8_scaled.safetensors"
+    # clip and both VAEs are the very same files as h3's (downloaded once)
+    for role in ("clip", "video_vae", "audio_vae"):
+        assert model_file_by_role(h3ref, role) == model_file_by_role(h3, role)
+    assert model_file_by_role(h3ref, "unet") != model_file_by_role(h3, "unet")
+    assert (h3ref["defaults"], h3ref["limits"], h3ref["volume"], h3ref["license"]) == \
+        (h3["defaults"], h3["limits"], h3["volume"], h3["license"])
     ltx = get_video_model(registry, "ltx25")
     assert {f["role"] for f in ltx["files"]} == {"unet", "clip", "video_vae", "audio_vae",
                                                  "spatial_upscaler"}
@@ -477,6 +611,15 @@ def test_every_registry_file_is_used(model, mode, registry):
     assert loaded == {f["filename"] for f in m["files"]}
 
 
+@pytest.mark.parametrize("audio", [True, False])
+def test_every_h3ref_registry_file_is_used(audio, registry):
+    m = get_video_model(registry, "h3ref")
+    graph, _ = build_video_workflow(vparams("h3ref", audio=audio), registry)
+    loaded = {n["inputs"][k] for n in graph.values()
+              for k in ("unet_name", "clip_name", "vae_name") if k in n["inputs"]}
+    assert loaded == {f["filename"] for f in m["files"]}
+
+
 def test_image_registry_unchanged_by_video(registry):
     """The image models keep their schema (no role/videoModels fields leak in)."""
     for m in registry["models"]:
@@ -496,4 +639,5 @@ def test_build_time_node_check_sees_only_node_classes(object_info):
     src = Path(__file__).resolve().parents[1] / "src" / "workflows.py"
     names = required_classes(src)
     assert set(names) <= set(object_info), set(names) - set(object_info)
-    assert {"SaveVideo", "MiniMaxH3ImageToVideo", "LTXVLatentUpsampler"} <= set(names)
+    assert {"SaveVideo", "MiniMaxH3ImageToVideo", "MiniMaxH3ReferenceToVideo",
+            "LTXVLatentUpsampler"} <= set(names)

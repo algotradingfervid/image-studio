@@ -27,11 +27,11 @@ pub const DEFAULT_GPU_TYPES: &[&str] = &[
     "NVIDIA RTX PRO 4000 Blackwell",
 ];
 /// Video profile (spec v5): its volume in CA-MTL-3 (Canada), and GPUs with
-/// at least 80 GB, in priority order.
+/// at least 80 GB, in priority order (owner, 2026-10-12: H200 whenever available).
 pub const DEFAULT_VIDEO_VOLUME_NAMES: &[&str] = &["image-studio-video"];
 pub const DEFAULT_VIDEO_GPU_TYPES: &[&str] = &[
-    "NVIDIA RTX PRO 6000 Blackwell Server Edition",
     "NVIDIA H200",
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition",
     "NVIDIA H100 80GB HBM3",
 ];
 /// Git ref the pod's boot script fetches worker code from (`WORKER_REF`): a

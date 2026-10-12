@@ -48,7 +48,7 @@ export interface ModelView {
   task: Task | null;
   // ----- video models only (kind === "video") -----
   /** "t2v" (text→video) and/or "i2v" (start image→video). */
-  modes?: ("t2v" | "i2v" | string)[];
+  modes?: ("t2v" | "i2v" | "r2v" | string)[];
   /** Generates an audio track. */
   audio?: boolean;
   /** Network volume holding the files, e.g. "image-studio-video". */
@@ -290,6 +290,11 @@ export interface GenerateVideoInput {
   initImageGalleryId?: string;
   /** i2v start image that is a vault item (spec v6; needs the vault unlocked). */
   initImageVaultId?: string;
+  /**
+   * r2v character references (models whose `modes` include "r2v"): ids from
+   * `import_reference(_bytes)`, 1..maxReferences. Exclusive with a start image.
+   */
+  referenceIds?: string[];
   durationS: number;
   fps: number;
   /** A resolution id from the model's `limits.resolutions` (see `resolutionId`). */

@@ -437,6 +437,84 @@ export function ModeSwitch({ value, onChange }: { value: CreateMode; onChange: (
 
 // ---------------- References ----------------
 
+/**
+ * How a model's text encoder names the reference images, keyed by model id. The prompt has to use
+ * these tags to relate the references (e.g. that two photos show the same person). Models not listed
+ * (flux2) don't show their references to the text encoder, so they get no tags.
+ */
+export const REF_TAGS: Record<string, { format: string; noun: string }> = {
+  qwen: { format: "<image{n}>", noun: "person" },
+  h3ref: { format: "<Picture {n}>", noun: "character" },
+};
+
+/** The tag of reference `n` (1-based): "<image1>", "<Picture 2>". */
+export const refTag = (format: string, n: number) => format.replace("{n}", String(n));
+
+/** "<image1> and <image2> show the same person. " (n ≥ 2; three or more: "a, b and c"). */
+export function sameSubjectSentence(format: string, n: number, noun: string): string {
+  const tags = Array.from({ length: n }, (_, i) => refTag(format, i + 1));
+  const list = tags.length > 1 ? `${tags.slice(0, -1).join(", ")} and ${tags[tags.length - 1]}` : tags[0];
+  return `${list} show the same ${noun}. `;
+}
+
+/**
+ * `text` put into `prompt` at the textarea's caret (at the end when it isn't focused), with a space on
+ * either side where needed. Returns the new prompt and the caret position after the insert.
+ */
+export function insertAtCaret(el: HTMLTextAreaElement | null, prompt: string, text: string): { next: string; caret: number } {
+  const focused = !!el && document.activeElement === el;
+  const start = focused ? el.selectionStart : prompt.length;
+  const end = focused ? el.selectionEnd : prompt.length;
+  const before = prompt.slice(0, start);
+  const after = prompt.slice(end);
+  const pre = before && !/\s$/.test(before) ? " " : "";
+  const post = after && !/^[\s,.;:!?]/.test(after) ? " " : "";
+  return { next: before + pre + text + post + after, caret: (before + pre + text).length };
+}
+
+/** Prompt tags for the references (see `REF_TAGS`): click a tag to insert it, "Same person" to relate them. */
+export interface RefTagging {
+  format: string;
+  noun: string;
+  /** Insert a tag at the prompt caret. */
+  onInsert: (tag: string) => void;
+  /** Put the "… show the same person." sentence at the start of the prompt. */
+  onSameSubject: (sentence: string) => void;
+}
+
+/**
+ * `RefTagging` for a model's References (undefined when its encoder has no tags): inserts at the caret
+ * of the prompt textarea and leaves the caret after the insert.
+ */
+export function refTagging(
+  modelId: string | undefined,
+  promptRef: RefObject<HTMLTextAreaElement | null>,
+  prompt: string,
+  setPrompt: (p: string) => void,
+): RefTagging | undefined {
+  const t = modelId ? REF_TAGS[modelId] : undefined;
+  if (!t) return undefined;
+  const focusAt = (caret: number) =>
+    requestAnimationFrame(() => {
+      promptRef.current?.focus();
+      promptRef.current?.setSelectionRange(caret, caret);
+    });
+  return {
+    ...t,
+    onInsert: (tag) => {
+      const { next, caret } = insertAtCaret(promptRef.current, prompt, tag);
+      setPrompt(next);
+      focusAt(caret);
+    },
+    onSameSubject: (sentence) => {
+      // Already there (e.g. clicked twice): just move to it.
+      if (prompt.startsWith(sentence.trim())) return focusAt(sentence.trim().length);
+      setPrompt(sentence + prompt.trimStart());
+      focusAt(sentence.length);
+    },
+  };
+}
+
 export function References({
   max,
   refs,
@@ -446,6 +524,7 @@ export function References({
   onFiles,
   onPick,
   onPickGallery,
+  tags,
 }: {
   max: number;
   refs: RefItem[];
@@ -456,6 +535,8 @@ export function References({
   onPick: () => void;
   /** "From gallery": pick one of your images as a reference. */
   onPickGallery?: () => void;
+  /** The model's prompt tags for references (shown on each thumbnail, insertable). */
+  tags?: RefTagging;
 }) {
   const [over, setOver] = useState(false);
   const full = refs.length >= max;
@@ -466,7 +547,7 @@ export function References({
     if (files.length) onFiles(files);
   };
   return (
-    <div className="refs">
+    <div className={`refs ${tags ? "refs--tagged" : ""}`}>
       <div
         className={`dropzone ${over || dragActive ? "is-over" : ""} ${full ? "is-full" : ""}`}
         onDragOver={(e) => {
@@ -482,7 +563,23 @@ export function References({
             <button type="button" className="ref-thumb__remove" aria-label={`Remove reference ${i + 1}`} onClick={() => onRemove(r.refId)}>
               <Icon name="x" size={12} />
             </button>
-            <figcaption className="ref-thumb__n">{i + 1}</figcaption>
+            {tags ? (
+              <figcaption>
+                <button
+                  type="button"
+                  className="ref-thumb__n ref-thumb__tag"
+                  title={`Insert ${refTag(tags.format, i + 1)} into the prompt`}
+                  aria-label={`Insert ${refTag(tags.format, i + 1)} into the prompt`}
+                  // Keep the prompt's focus (and caret) on mouse clicks, so the tag lands where you were typing.
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => tags.onInsert(refTag(tags.format, i + 1))}
+                >
+                  {refTag(tags.format, i + 1)}
+                </button>
+              </figcaption>
+            ) : (
+              <figcaption className="ref-thumb__n">{i + 1}</figcaption>
+            )}
           </figure>
         ))}
         {!full && !onPickGallery && (
@@ -503,6 +600,27 @@ export function References({
           </div>
         )}
       </div>
+      {tags && (
+        <div className="refs__tags">
+          <p className="hint">
+            In the prompt the references are <span className="refs__tag-name">{refTag(tags.format, 1)}</span>,{" "}
+            <span className="refs__tag-name">{refTag(tags.format, 2)}</span>… in this order
+            {refs.length ? " — click a tag to insert it." : "."}
+          </p>
+          {refs.length >= 2 && (
+            <button
+              type="button"
+              className="chip chip--word"
+              aria-label={`Same ${tags.noun}: insert “${sameSubjectSentence(tags.format, refs.length, tags.noun).trim()}” at the start of the prompt`}
+              title={sameSubjectSentence(tags.format, refs.length, tags.noun).trim()}
+              onClick={() => tags.onSameSubject(sameSubjectSentence(tags.format, refs.length, tags.noun))}
+            >
+              <Icon name="plus" size={11} />
+              Same {tags.noun}
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

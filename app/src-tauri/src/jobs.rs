@@ -258,6 +258,10 @@ pub struct VideoRequest {
     /// i2v start image that is a vault item (needs the unlocked vault).
     #[serde(default)]
     pub init_image_vault_id: Option<String>,
+    /// r2v character references: ids from `import_reference(_bytes)` (or
+    /// `vault:` ids for a vault job), 1..=`maxReferences` for r2v models.
+    #[serde(default)]
+    pub reference_ids: Vec<String>,
     pub duration_s: f64,
     pub fps: f64,
     pub resolution: String,
@@ -425,13 +429,40 @@ fn build_video_plan(core: &Core, req: &VideoRequest) -> Result<Plan, String> {
     let has_init = req.init_image_id.is_some()
         || req.init_image_gallery_id.is_some()
         || req.init_image_vault_id.is_some();
-    let mode = if has_init { "i2v" } else { "t2v" };
-    if !model.has_mode(mode) {
-        return Err(if mode == "i2v" {
-            format!("{} does not take a start image", model.name)
-        } else {
-            format!("{} needs a start image", model.name)
-        });
+    let mode = if model.has_mode("r2v") {
+        "r2v"
+    } else if has_init {
+        "i2v"
+    } else {
+        "t2v"
+    };
+    if mode == "r2v" {
+        if has_init {
+            return Err(format!(
+                "{} does not take a start image; add character references instead",
+                model.name
+            ));
+        }
+        if req.reference_ids.is_empty() {
+            return Err("Add at least one character reference image".into());
+        }
+        if req.reference_ids.len() > model.max_references as usize {
+            return Err(format!(
+                "{} takes at most {} character reference images",
+                model.name, model.max_references
+            ));
+        }
+    } else {
+        if !req.reference_ids.is_empty() {
+            return Err(format!("{} does not take character reference images", model.name));
+        }
+        if !model.has_mode(mode) {
+            return Err(if mode == "i2v" {
+                format!("{} does not take a start image", model.name)
+            } else {
+                format!("{} needs a start image", model.name)
+            });
+        }
     }
     let limits = model.limits.clone();
     if !(req.duration_s.is_finite() && req.duration_s > 0.0) {
@@ -513,6 +544,14 @@ fn build_video_plan(core: &Core, req: &VideoRequest) -> Result<Plan, String> {
         }
     }
 
+    let mut refs_payload = Vec::new();
+    let mut ref_paths = Vec::new();
+    for rid in &req.reference_ids {
+        let (payload, path) = load_reference(core, rid, req.destination, "reference image")?;
+        refs_payload.push(payload);
+        ref_paths.push(path);
+    }
+
     let init = load_start_image(
         core,
         req.init_image_id.as_deref(),
@@ -544,6 +583,9 @@ fn build_video_plan(core: &Core, req: &VideoRequest) -> Result<Plan, String> {
     if let Some((payload, _)) = &init {
         template["initImage"] = payload.clone();
     }
+    if !refs_payload.is_empty() {
+        template["references"] = json!(refs_payload);
+    }
     let (width, height) = parse_wh(&resolution).unwrap_or((0, 0));
     let record = ImageRecord {
         id: String::new(),
@@ -557,7 +599,7 @@ fn build_video_plan(core: &Core, req: &VideoRequest) -> Result<Plan, String> {
         seed: 0,
         steps: steps.unwrap_or(0),
         cfg: cfg.unwrap_or(0.0),
-        references: vec![],
+        references: ref_paths,
         loras: vec![],
         created_at: String::new(),
         duration_ms: None,

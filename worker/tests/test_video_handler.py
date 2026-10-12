@@ -23,6 +23,12 @@ from workflows import POSTER_PREFIX, VIDEO_PREFIX
 
 MP4 = (Path(__file__).parent / "fixtures" / "tiny_h264_aac.mp4").read_bytes()
 PNG_INIT = make_png(30, 20)
+PNG_REF = make_png(24, 40)
+JPEG_REF = b"\xff\xd8\xff\xe0" + b"\x00" * 32
+
+
+def ref(data=PNG_REF, name="ref.png"):
+    return {"name": name, "base64": base64.b64encode(data).decode()}
 
 
 def _ids(graph, *classes):
@@ -57,7 +63,8 @@ class FakeVideoComfy(FakeComfy):
         m = [{"type": "execution_start", "data": {"prompt_id": pid}},
              {"type": "execution_cached", "data": {"nodes": [], "prompt_id": pid}}]
         order = (_ids(graph, "CLIPLoader") + _ids(graph, "CLIPTextEncode", "LTXVConditioning",
-                                                  "MiniMaxH3ImageToVideo")
+                                                  "MiniMaxH3ImageToVideo",
+                                                  "MiniMaxH3ReferenceToVideo")
                  + _ids(graph, "UNETLoader", "LatentUpscaleModelLoader")
                  + _ids(graph, "LoadImage", "ResizeImageMaskNode", "LTXVPreprocess"))
         for nid in order:
@@ -326,6 +333,119 @@ def test_cancel_before_queue(venv):
     job["_progress"] = lambda p: None
     out = handler.handler(job)
     assert out["error"].startswith("CANCELLED") and fake.prompts == []
+
+
+# ---------------------------------------------------------------------------
+# h3ref: reference-to-video (references)
+# ---------------------------------------------------------------------------
+def _keep_uploads(venv, fake):
+    """Write each upload into ComfyUI's input folder like the real server, so
+    the cleanup can be checked."""
+    orig = fake.post
+
+    def post(url, json=None, files=None, data=None, timeout=None):
+        if url.endswith("/upload/image"):
+            (venv.comfy / "input" / files["image"][0]).write_bytes(files["image"][1])
+        return orig(url, json=json, files=files, data=data, timeout=timeout)
+    fake.post = post
+
+
+def test_generate_video_h3ref_uploads_references(venv):
+    venv.install("h3ref")
+    fake = venv.fake(steps=20)
+    _keep_uploads(venv, fake)
+    out = handler.handler(vid_input(
+        model="h3ref", steps=20, audio=False,
+        references=[ref(), {"name": "b.jpg", "base64": "data:image/jpeg;base64,"
+                            + base64.b64encode(JPEG_REF).decode()}]))
+    assert "error" not in out, out
+    # uploaded in order, named like image references, removed afterwards
+    names = [u[0] for u in fake.uploads]
+    assert [u[1:] for u in fake.uploads] == [(PNG_REF, "image/png"), (JPEG_REF, "image/jpeg")]
+    assert names[0].startswith("is_") and names[0].endswith("_ref1.png")
+    assert names[1].endswith("_ref2.jpg") and names[0][:-9] == names[1][:-9]
+    assert list((venv.comfy / "input").iterdir()) == []
+    # wired into the reference node as ref_image_0, ref_image_1 (0-based Autogrow)
+    graph = fake.prompts[0]["prompt"]
+    cond = next(n for n in graph.values()
+                if n["class_type"] == "MiniMaxH3ReferenceToVideo")["inputs"]
+    assert [graph[cond[f"ref_images.ref_image_{i}"][0]]["inputs"]["image"]
+            for i in range(2)] == names
+    assert "ref_images.ref_image_2" not in cond
+    assert (cond["width"], cond["height"], cond["length"]) == (864, 480, 124)
+    assert not any(n["class_type"] == "VAEDecodeAudio" for n in graph.values())
+    # progress: the reference stage is listed from the first update and runs
+    stages = ["loading_text_encoder", "encoding_prompt", "loading_model", "preparing_references",
+              "sampling", "video_decoding", "encoding_video", "saving"]
+    assert venv.sent[0]["stages"] == stages
+    assert transitions(venv.sent) == stages
+
+
+def test_generate_video_h3ref_four_references(venv):
+    venv.install("h3ref")
+    fake = venv.fake()
+    out = handler.handler(vid_input(model="h3ref", references=[ref()] * 4))
+    assert "error" not in out, out
+    assert len(fake.uploads) == 4
+    assert [u[0][-9:] for u in fake.uploads] == [f"_ref{i}.png" for i in range(1, 5)]
+    graph = fake.prompts[0]["prompt"]
+    cond = next(n for n in graph.values()
+                if n["class_type"] == "MiniMaxH3ReferenceToVideo")["inputs"]
+    assert sorted(k for k in cond if k.startswith("ref_images.")) == \
+        [f"ref_images.ref_image_{i}" for i in range(4)]
+
+
+def test_h3ref_needs_its_own_unet(venv):
+    venv.install("h3")  # shared clip + VAEs present, the ref2va weights are not
+    fake = venv.fake()
+    out = handler.handler(vid_input(model="h3ref", references=[ref()]))
+    assert out == {"error": "MODEL_NOT_INSTALLED: "
+                            "unet/minimax_h3_ref2va_pruned_fp8_scaled.safetensors"}
+    assert fake.uploads == [] and fake.prompts == []
+
+
+@pytest.mark.parametrize("model,patch,code", [
+    ("h3ref", {}, "INVALID_INPUT: h3ref needs 1-4 reference images"),
+    ("h3ref", {"references": []}, "INVALID_INPUT: h3ref needs 1-4 reference images"),
+    ("h3ref", {"references": None}, "INVALID_INPUT: h3ref needs 1-4 reference images"),
+    ("h3ref", {"references": "x"}, "INVALID_INPUT: references must be a list"),
+    ("h3ref", {"references": [ref()] * 5}, "TOO_MANY_REFERENCES: h3ref accepts at most 4"),
+    ("h3ref", {"references": [{"name": "a.png", "base64": "!!!"}]}, "INVALID_REFERENCE"),
+    ("h3ref", {"references": [ref(b"GIF89a....", "a.gif")]}, "INVALID_REFERENCE"),
+    ("h3ref", {"references": ["x"]}, "INVALID_REFERENCE"),
+    ("h3ref", {"references": [ref()], "initImage": ref(PNG_INIT, "start.png")},
+     "I2V_NOT_SUPPORTED: h3ref"),
+    ("h3", {"references": [ref()]}, "REFERENCES_NOT_SUPPORTED: h3"),
+    ("ltx25", {"references": [ref()]}, "REFERENCES_NOT_SUPPORTED: ltx25"),
+])
+def test_reference_validation(venv, model, patch, code):
+    venv.install(model)
+    fake = venv.fake()
+    out = handler.handler(vid_input(model=model, resolution=None, **patch))
+    assert out["error"].startswith(code), out
+    assert fake.prompts == [] and fake.uploads == []
+
+
+def test_h3ref_warmup_job_runs(venv, registry):
+    """The pod warm-up job of h3ref (server.warmup_input) passes validation
+    and runs with its one generated reference image."""
+    venv.install("h3ref")
+    fake = venv.fake(steps=1)
+    out = handler.handler({"id": "warmup-1", "input": server.warmup_input(registry, "h3ref")})
+    assert "error" not in out, out
+    assert len(fake.uploads) == 1 and fake.uploads[0][0].endswith("_ref1.png")
+    graph = fake.prompts[0]["prompt"]
+    cond = next(n for n in graph.values()
+                if n["class_type"] == "MiniMaxH3ReferenceToVideo")["inputs"]
+    assert "ref_images.ref_image_0" in cond and (cond["width"], cond["height"]) == (640, 640)
+
+
+def test_empty_references_still_fine_for_h3(venv):
+    venv.install("h3")
+    fake = venv.fake()
+    out = handler.handler(vid_input(references=[]))
+    assert "error" not in out, out
+    assert fake.uploads == []
 
 
 # ---------------------------------------------------------------------------

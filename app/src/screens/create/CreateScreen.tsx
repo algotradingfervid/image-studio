@@ -44,6 +44,7 @@ import {
   writeDraft,
   realImageFiles,
   References,
+  refTagging,
   removeWordFromPrompt,
   StartImage,
   usePanelNotice,
@@ -1308,6 +1309,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
               </div>
               <References
                 max={maxRefs}
+                tags={refTagging(model?.id, promptRef, prompt, setPrompt)}
                 refs={refs}
                 busy={refBusy}
                 dragActive={dragActive}

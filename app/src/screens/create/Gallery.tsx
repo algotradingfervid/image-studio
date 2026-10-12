@@ -366,7 +366,8 @@ function VideoTile({ im, modelName, isNew, onOpen }: { im: ImageRecord; modelNam
   const [failed, setFailed] = useState(() => unplayable(im.path));
   const poster = im.posterPath ? fileSrc(im.posterPath) : "";
   const length = formatClipLength(im.durationS);
-  const label = `Open ${isNew ? "new " : ""}video${im.initImage ? " (from a start image)" : ""}${length ? `, ${length}` : ""}${im.hasAudio ? ", with sound" : ""}: ${im.prompt}`;
+  const refs = im.references?.length ?? 0;
+  const label = `Open ${isNew ? "new " : ""}video${im.initImage ? " (from a start image)" : refs ? ` (from ${refs} character reference${refs === 1 ? "" : "s"})` : ""}${length ? `, ${length}` : ""}${im.hasAudio ? ", with sound" : ""}: ${im.prompt}`;
   return (
     <button
       type="button"
@@ -389,7 +390,11 @@ function VideoTile({ im, modelName, isNew, onOpen }: { im: ImageRecord; modelNam
         <video className="tile__video" src={fileSrc(im.path)} poster={poster || undefined} muted loop playsInline autoPlay preload="none" onError={() => setFailed(true)} />
       )}
       {hover && failed && <span className="tile__unavailable">{PREVIEW_UNAVAILABLE}</span>}
-      <TileBadges isNew={isNew} type={im.initImage ? "i2v" : null} typeTitle="From a start image">
+      <TileBadges
+        isNew={isNew}
+        type={im.initImage ? "i2v" : refs ? "ref" : null}
+        typeTitle={im.initImage ? "From a start image" : `Keeps the ${refs === 1 ? "character" : "characters"} of ${refs} reference image${refs === 1 ? "" : "s"}`}
+      >
         <span className="tile__video-badge">
           <Icon name="play" size={11} />
           {length && <span className="mono">{length}</span>}
