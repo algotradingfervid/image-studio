@@ -184,6 +184,18 @@ function VaultSettings() {
     if (st) setMinutes(String(st.autoLockMinutes));
   }, [st?.autoLockMinutes, st?.unlocked]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Typed passwords don't outlive the unlock: cleared when the vault locks (or is erased).
+  const unlockedNow = !!st?.unlocked;
+  useEffect(() => {
+    if (unlockedNow) return;
+    setOldPw("");
+    setNewPw("");
+    setConfirmPw("");
+    setOldPwError(null);
+    setNewPwError(null);
+    setPwError(null);
+  }, [unlockedNow]);
+
   const locked = !!st && !st.unlocked;
   const minN = parseAutoLock(minutes);
   const minDirty = !!st && minN !== st.autoLockMinutes;
@@ -538,7 +550,7 @@ export function SettingsScreen() {
   const [apiKey, setApiKey] = useState("");
   const [civitaiKey, setCivitaiKey] = useState("");
   const [idle, setIdle] = useState("30");
-  /** The idle field was left, or typing paused: only then is a bad value flagged (UI-045). */
+  /** The idle field was left since the last edit: only then is a bad value flagged (UI-045). */
   const [idleSettled, setIdleSettled] = useState(true);
   const [passKey, setPassKey] = useState(true);
   /** "checking": a typed key is being checked before the save; "saving": writing. */
@@ -576,13 +588,6 @@ export function SettingsScreen() {
     setIdle(String(s.idleMinutes));
     setPassKey(s.passApiKeyToPod);
   }, [s]);
-
-  // A bad auto-stop value is flagged after a pause in typing or on leaving the field (UI-045).
-  useEffect(() => {
-    if (idleSettled) return;
-    const t = window.setTimeout(() => setIdleSettled(true), 900);
-    return () => window.clearTimeout(t);
-  }, [idle, idleSettled]);
 
   const idleN = parseIdle(idle);
   const idleInvalid = idleN == null;
@@ -764,7 +769,7 @@ export function SettingsScreen() {
           : { text: "Unsaved changes", tone: null };
 
   return (
-    <div className="page">
+    <div className="page settings-page">
       <div className="page__inner page__inner--narrow">
         <header className="page__head">
           <div>
@@ -998,8 +1003,8 @@ export function SettingsScreen() {
         </section>
 
         {dirty && (
-          <div className={`settings-bar ${barState.tone ? `settings-bar--${barState.tone}` : ""}`} role="region" aria-label="Unsaved settings">
-            <span className="settings-bar__status">
+          <div className={`settings-bar ${barState.tone ? `settings-bar--${barState.tone}` : ""}`} role="region" aria-label="Unsaved settings" data-sticky-bar>
+            <span className="settings-bar__status" id="settings-bar-status">
               <span className="settings-bar__dot" aria-hidden /> {barState.text}
             </span>
             <span className="settings-bar__actions">
@@ -1007,11 +1012,23 @@ export function SettingsScreen() {
                 Discard
               </button>
               {saveAnyway ? (
-                <button type="button" className="btn btn--sm btn--primary" onClick={() => void doSave(saveAnyway.keys)} disabled={!!saving}>
+                <button
+                  type="button"
+                  className="btn btn--sm btn--primary"
+                  onClick={() => void doSave(saveAnyway.keys)}
+                  disabled={!!saving}
+                  aria-describedby="settings-bar-status"
+                >
                   Save anyway
                 </button>
               ) : (
-                <button type="button" className="btn btn--sm btn--primary" onClick={() => void save()} disabled={!!saveReason || !!saving}>
+                <button
+                  type="button"
+                  className="btn btn--sm btn--primary"
+                  onClick={() => void save()}
+                  disabled={!!saveReason || !!saving}
+                  aria-describedby="settings-bar-status"
+                >
                   {saving === "checking" ? "Checking…" : saving ? "Saving…" : "Save changes"}
                 </button>
               )}

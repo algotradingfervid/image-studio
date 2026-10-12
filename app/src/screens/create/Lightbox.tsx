@@ -55,6 +55,21 @@ function SwapLabel({ icon, label, done, doneIcon = "check", doneLabel }: { icon:
   );
 }
 
+/**
+ * Inline confirm (UI-026): the trigger's place holds the safe choice ("Keep", focused), and the
+ * message with the confirming button floats above it. No other button moves, and the confirming
+ * button never lands where the trigger was, so a double tap can't confirm (it also ignores clicks
+ * for 400 ms, UX-006).
+ */
+function ConfirmPop({ id, label, warn, message, children }: { id: string; label: string; warn?: boolean; message: React.ReactNode; children: React.ReactNode }) {
+  return (
+    <div className={`confirm confirm-pop ${warn ? "confirm--note" : ""}`} role="group" aria-label={label}>
+      <span id={id}>{message}</span>
+      <div className="btn-row confirm-pop__row">{children}</div>
+    </div>
+  );
+}
+
 export function Lightbox({
   items,
   index,
@@ -140,6 +155,7 @@ export function Lightbox({
   const promptRef = useRef<HTMLParagraphElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
   const moveBtnRef = useRef<HTMLButtonElement>(null);
+  const detailsRef = useRef<HTMLDivElement>(null);
   const startBtnRef = useRef<HTMLButtonElement>(null);
   const labelId = useId();
   /** The tile to focus once the viewer has closed (UI-028): the item on show, or a deleted item's neighbour. */
@@ -230,6 +246,24 @@ export function Lightbox({
     focusAfterClose.current = null;
   }, [open]);
 
+  // Scroll hint: mark the details while more of them is below the fold (CSS fades the bottom edge).
+  useEffect(() => {
+    const el = detailsRef.current;
+    if (!el) return;
+    const mark = () => {
+      el.dataset.more = String(el.scrollTop + el.clientHeight < el.scrollHeight - 1);
+    };
+    mark();
+    el.addEventListener("scroll", mark, { passive: true });
+    const ro = new ResizeObserver(mark);
+    ro.observe(el);
+    for (const c of el.children) ro.observe(c);
+    return () => {
+      el.removeEventListener("scroll", mark);
+      ro.disconnect();
+    };
+  }, [open, im?.id]);
+
   /** Back from the start-image preview: focus goes back to the thumbnail that opened it (UI-006). */
   const closeStartPreview = () => {
     setStartPreview(false);
@@ -298,7 +332,9 @@ export function Lightbox({
     const id = im.id;
     setBusy(true);
     try {
-      await api.moveToVault(id);
+      const moved = await api.moveToVault(id);
+      // The vault list (and counts like "n items are in the vault") gain it now, not after the reload.
+      vault.addLocal([moved]);
       // The parent shows the neighbour; the toast and the live line say what happened (UI-063).
       onMovedToVault?.(afterMove(id));
       toast.notify({
@@ -488,7 +524,7 @@ export function Lightbox({
           </div>
 
           <aside className="lightbox__side" aria-label={`${Noun} settings`}>
-            <div className="lightbox__details">
+            <div className="lightbox__details" ref={detailsRef}>
               <header className="lightbox__head">
                 <span className="eyebrow">
                   {inVault && (
@@ -648,23 +684,14 @@ export function Lightbox({
               <button type="button" className="btn btn--primary" onClick={() => onUseSettings(im)}>
                 <Icon name="restore" /> Use these settings
               </button>
-              {confirming === "export" ? (
-                <div className="confirm confirm--note" role="group" aria-label="Export from the vault">
-                  <span>
-                    <Icon name="alert" size={13} /> The exported copy is <strong>not encrypted</strong> — anyone with access to where you save it can open it.
-                  </span>
-                  <div className="btn-row">
-                    <button type="button" className="btn btn--sm" onClick={() => setConfirming(false)} autoFocus>
-                      Cancel
+              {/* The row is the positioning box for the export confirm, which floats above it. */}
+              <div className="btn-row confirm-slot">
+                  {inVault && confirming === "export" ? (
+                    <button type="button" className="btn" onClick={() => setConfirming(false)} aria-describedby={`${labelId}-export`} autoFocus>
+                      {/* Keeps the width of "Export…" so Copy prompt stays put. */}
+                      <SwapLabel icon="download" label="Export…" done doneIcon="x" doneLabel="Cancel" />
                     </button>
-                    <button type="button" className="btn btn--warn-outline btn--sm" onClick={guard(download)} aria-disabled={!armed || undefined}>
-                      <Icon name="download" size={13} /> Choose where to save…
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <div className="btn-row">
-                  {inVault ? (
+                  ) : inVault ? (
                     <button
                       type="button"
                       className={`btn ${flash === "download" ? "btn--done" : ""}`}
@@ -688,8 +715,23 @@ export function Lightbox({
                   <button type="button" className={`btn ${flash === "copy" ? "btn--done" : ""}`} onClick={copyPrompt}>
                     <SwapLabel icon="copy" label="Copy prompt" done={flash === "copy"} doneLabel="Copied" />
                   </button>
+                  {inVault && confirming === "export" && (
+                    <ConfirmPop
+                      id={`${labelId}-export`}
+                      label="Export from the vault"
+                      warn
+                      message={
+                        <>
+                          <Icon name="alert" size={13} /> The exported copy is <strong>not encrypted</strong> — anyone with access to where you save it can open it.
+                        </>
+                      }
+                    >
+                      <button type="button" className="btn btn--warn-outline btn--sm" onClick={guard(download)} aria-disabled={!armed || undefined}>
+                        <Icon name="download" size={13} /> Choose where to save…
+                      </button>
+                    </ConfirmPop>
+                  )}
                 </div>
-              )}
               {!inVault && vaultExists && (
                 <button
                   type="button"
@@ -709,16 +751,20 @@ export function Lightbox({
               )}
               {inVault &&
                 (confirming === "general" ? (
-                  <div className="confirm confirm--note" role="group" aria-label="Confirm move to General">
-                    <span>Move this {noun} out of the vault? It's decrypted and saved unencrypted in General, visible without a password.</span>
-                    <div className="btn-row">
-                      <button type="button" className="btn btn--sm" onClick={() => setConfirming(false)} autoFocus>
-                        Keep in vault
-                      </button>
+                  <div className="confirm-slot">
+                    <button type="button" className="btn" onClick={() => setConfirming(false)} aria-describedby={`${labelId}-general`} autoFocus>
+                      <Icon name="lock" /> Keep in vault
+                    </button>
+                    <ConfirmPop
+                      id={`${labelId}-general`}
+                      label="Confirm move to General"
+                      warn
+                      message={`Move this ${noun} out of the vault? It's decrypted and saved unencrypted in General, visible without a password.`}
+                    >
                       <button type="button" className="btn btn--warn-outline btn--sm" onClick={guard(moveToGeneral)} disabled={busy} aria-disabled={!armed || undefined}>
                         {busy ? "Moving…" : "Decrypt and move"}
                       </button>
-                    </div>
+                    </ConfirmPop>
                   </div>
                 ) : (
                   <button
@@ -731,16 +777,19 @@ export function Lightbox({
                   </button>
                 ))}
               {confirming === "delete" ? (
-                <div className="confirm" role="group" aria-label="Confirm delete">
-                  <span>{inVault ? `Delete this ${noun} from the vault? It can't be recovered.` : `Delete this ${noun} permanently? It can't be recovered.`}</span>
-                  <div className="btn-row">
-                    <button type="button" className="btn btn--sm" onClick={() => setConfirming(false)} autoFocus>
-                      {inVault ? "Keep in vault" : "Keep"}
-                    </button>
+                <div className="confirm-slot">
+                  <button type="button" className="btn" onClick={() => setConfirming(false)} aria-describedby={`${labelId}-delete`} autoFocus>
+                    {inVault ? "Keep in vault" : "Keep"}
+                  </button>
+                  <ConfirmPop
+                    id={`${labelId}-delete`}
+                    label="Confirm delete"
+                    message={inVault ? `Delete this ${noun} from the vault? It can't be recovered.` : `Delete this ${noun} permanently? It can't be recovered.`}
+                  >
                     <button type="button" className="btn btn--danger btn--sm" onClick={guard(del)} disabled={busy} aria-disabled={!armed || undefined}>
                       {busy ? "Deleting…" : `Delete ${noun}`}
                     </button>
-                  </div>
+                  </ConfirmPop>
                 </div>
               ) : (
                 <button

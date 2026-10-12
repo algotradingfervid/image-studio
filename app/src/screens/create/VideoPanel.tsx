@@ -385,8 +385,8 @@ export const VideoPanel = forwardRef<
         setTainted(false);
         showNotice(
           submitted
-            ? { tone: "info", title: "Sent to the vault — prompt cleared", detail: "The vault is locked, so nothing from this job stays on screen. Unlock to get the prompt back.", sticky: true }
-            : { tone: "info", title: "Vault locked — vault start image and prompt cleared", detail: "Unlock the vault to restore them.", sticky: true },
+            ? { tone: "info", title: "Sent to the vault — prompt cleared", detail: "The vault is locked, so nothing from this job stays on screen. Unlock to get the prompt back.", sticky: true, vault: true }
+            : { tone: "info", title: "Vault locked — vault start image and prompt cleared", detail: "Unlock the vault to restore them.", sticky: true, vault: true },
         );
       }
       return stash;
@@ -414,6 +414,10 @@ export const VideoPanel = forwardRef<
         detail: typedMeanwhile ? "Kept the prompt you typed while it was locked." : undefined,
         vault: true,
       });
+    },
+    // Erased vault: drop the "unlock to restore" notice (nothing can come back).
+    () => {
+      if (notice?.vault) clearNotice();
     },
   );
 
@@ -593,7 +597,6 @@ export const VideoPanel = forwardRef<
       setSourcePrompt(null);
       scrollRef.current?.scrollTo({ top: 0 });
       let startFailed = false;
-      let keptStart = false;
       let next: VideoStart | null = null;
       if (rec.initImage && m.modes?.includes("i2v") && galleryStart && galleryStart.kind !== "video") {
         // The start frame was a gallery image: re-select it in place.
@@ -608,11 +611,8 @@ export const VideoPanel = forwardRef<
         } finally {
           setStartBusy(false);
         }
-      } else if (startImage && m.modes?.includes("i2v") && !rec.initImage) {
-        // The source has no start frame: keep the one in the form.
-        next = startImage;
-        keptStart = true;
       }
+      // The source has no start frame: the form's start image goes too, so the form matches the source.
       // The restored resolution wins over auto-matching.
       autoMatchedFor.current = next ? `${startKey(next)}:${m.id}` : "";
       setStartImage(next);
@@ -620,7 +620,7 @@ export const VideoPanel = forwardRef<
       const parts = [
         opts?.undoMode ? "Switched to Video" : "",
         snap.prompt.trim() && snap.prompt !== rec.prompt ? "Replaced your prompt" : "",
-        keptStart ? "Kept your start image" : snap.startImage && !next ? "Removed your start image" : "",
+        snap.startImage && !next && !startFailed ? (rec.initImage ? `Removed your start image (${m.name} doesn't take one)` : "Removed your start image (the restored video had none)") : "",
         !m.installed ? `${m.name} isn't installed — install it in Models to generate` : "",
         resNote,
         startFailed ? "The start image couldn't be restored" : "",
@@ -1068,8 +1068,10 @@ export const VideoPanel = forwardRef<
       <div className="panel__foot">
         <PanelNoticeView notice={notice} onDismiss={clearNotice} onHold={holdNotice} />
         {saveToSwitch}
-        <button type="submit" className="btn btn--generate" disabled={submitting} aria-disabled={!!blocker || undefined} aria-describedby="video-gen-hint">
-          <Icon name="video" size={18} />
+        {/* Never `disabled` (also not while queuing): after the GPU confirmation focus comes back here (UI-006). */}
+        <button type="submit" className={`btn btn--generate ${vault.setupActive ? "is-quiet" : ""}`} aria-disabled={!!blocker || submitting || undefined} aria-describedby="video-gen-hint">
+          {/* Blocked: a plain "!" mark instead of the action icon. */}
+          <Icon name={blocker ? "alert" : "video"} size={18} />
           <span>{submitting ? "Queuing…" : startsGpu ? "Start GPU & Generate video" : "Generate video"}</span>
           <span className="kbd-group" aria-hidden>
             <kbd>⌘</kbd>

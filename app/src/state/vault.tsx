@@ -61,6 +61,13 @@ interface Vault {
   requestErase(): void;
   /** Bumped by every erase (Save to goes back to General). */
   eraseEpoch: number;
+  /**
+   * The "Create your vault" form is on screen: its button is then the one filled primary, so the
+   * Create panel's Generate button should use its secondary look meanwhile (UI-074).
+   */
+  setupActive: boolean;
+  /** Called by the set-up form on mount; returns the cleanup for unmount. */
+  registerSetup(): () => void;
   reloadItems(): Promise<void>;
   /** Drop an item locally (deleted / moved to General) before the event's refetch lands. */
   removeLocal(id: string): void;
@@ -96,6 +103,11 @@ export function VaultProvider({ children }: { children: ReactNode }) {
   const [unlockAsk, setUnlockAsk] = useState(false);
   const [eraseAsk, setEraseAsk] = useState(false);
   const [eraseEpoch, setEraseEpoch] = useState(0);
+  const [setupCount, setSetupCount] = useState(0);
+  const registerSetup = useCallback(() => {
+    setSetupCount((n) => n + 1);
+    return () => setSetupCount((n) => n - 1);
+  }, []);
   const unlockedRef = useRef(false);
   const statusRef = useRef<VaultStatus | null>(null);
   /** When the backend's inactivity timer was last reset (unlock / vault_touch). */
@@ -368,6 +380,8 @@ export function VaultProvider({ children }: { children: ReactNode }) {
       erase,
       requestErase,
       eraseEpoch,
+      setupActive: setupCount > 0,
+      registerSetup,
       reloadItems,
       removeLocal,
       addLocal,
@@ -375,7 +389,7 @@ export function VaultProvider({ children }: { children: ReactNode }) {
       requestUnlock,
       bumpGeneral,
     }),
-    [status, unlocked, items, loading, migration, dismissMigration, lockEpoch, generalEpoch, create, unlock, lock, changePassword, setAutoLock, erase, requestErase, eraseEpoch, reloadItems, removeLocal, addLocal, lockReason, requestUnlock, bumpGeneral],
+    [status, unlocked, items, loading, migration, dismissMigration, lockEpoch, generalEpoch, create, unlock, lock, changePassword, setAutoLock, erase, requestErase, eraseEpoch, setupCount, registerSetup, reloadItems, removeLocal, addLocal, lockReason, requestUnlock, bumpGeneral],
   );
   return (
     <Ctx.Provider value={value}>

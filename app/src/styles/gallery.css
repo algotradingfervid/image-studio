@@ -60,6 +60,10 @@
 .tile__badges > .tile__video-badge {
   position: static;
 }
+/* Chips never break inside ("6 / s"). */
+.tile__badges > * {
+  white-space: nowrap;
+}
 /* The length stays top-right, also when it wraps onto its own line. */
 .tile__badges > .tile__video-badge {
   margin-left: auto;

@@ -33,8 +33,12 @@
 .models-page .section-nav--models {
   background: var(--bg);
   backdrop-filter: none;
-  border-color: var(--line-3);
-  box-shadow: 0 6px 0 var(--bg), 0 7px 0 var(--line-2);
+  /* Square, borderless sides: a rounded bar showed the card behind it in its corners (fix-check). */
+  border-radius: 0;
+  border: 0;
+  border-bottom: 1px solid var(--line-3);
+  /* Covers the gap above the stuck bar (cards are the bar's width, so nothing shows at its sides). */
+  box-shadow: 0 -8px 0 var(--bg);
 }
 
 .models-page .section-nav__link.is-current {

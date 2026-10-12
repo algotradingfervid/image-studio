@@ -8,6 +8,7 @@ import { ASPECTS } from "../../lib/aspect";
 import { formatBytes, pct } from "../../lib/format";
 import { useGpu } from "../../state/gpu";
 import { useLibrary } from "../../state/library";
+import { useToast } from "../../state/toast";
 import { useVault } from "../../state/vault";
 import "../../styles/create.css";
 
@@ -211,13 +212,30 @@ export function PanelNoticeView({
   /** Pause (true) / resume (false) the notice's countdown while the pointer or focus is on it (UI-022). */
   onHold?: (held: boolean) => void;
 }) {
+  // The notice sits in the footer's flow above Save to, so it never lies over the form; the scroll area
+  // gets shorter instead (UI-022). When that happens, what the user was looking at stays in view: the
+  // end of the form if they were there, and the focused control.
+  const slotRef = useRef<HTMLDivElement>(null);
+  const wasShown = useRef(false);
+  useLayoutEffect(() => {
+    const appeared = !!notice && !wasShown.current;
+    wasShown.current = !!notice;
+    const box = slotRef.current?.firstElementChild;
+    const scroller = slotRef.current?.closest(".panel")?.querySelector<HTMLElement>(":scope > .panel__scroll");
+    if (!appeared || !box || !scroller) return;
+    const grew = box.getBoundingClientRect().height + parseFloat(getComputedStyle(box).marginBottom || "0");
+    if (scroller.scrollTop + scroller.clientHeight + grew >= scroller.scrollHeight - 4) scroller.scrollTop += grew;
+    const at = document.activeElement;
+    if (at instanceof HTMLElement && scroller.contains(at) && at.getBoundingClientRect().bottom > scroller.getBoundingClientRect().bottom) at.scrollIntoView({ block: "nearest" });
+  }, [notice]);
   return (
-    // In the footer's flow above Save to, so it pushes the form up instead of covering it (UI-022).
-    <div className="panel-notice-slot" role="status" aria-live="polite">
+    <div ref={slotRef} className="panel-notice-slot" role="status" aria-live="polite">
       {notice && (
         <div
           className={`panel-notice panel-notice--${notice.tone}`}
           onMouseEnter={() => onHold?.(true)}
+          // Also on move: a notice that appears under a resting pointer gets no mouseenter.
+          onMouseMove={() => onHold?.(true)}
           onMouseLeave={(e) => {
             if (!e.currentTarget.contains(document.activeElement)) onHold?.(false);
           }}
@@ -267,10 +285,10 @@ export function PanelNoticeView({
  * never persisted); `onUnlock` gets it back on the next unlock in this app session.
  * `stashNow` runs the same clearing outside a lock (`submitted`: a vault job was sent while locked).
  */
-export function useVaultLockCycle<T>(onLock: (submitted: boolean) => T | null, onUnlock: (stash: T) => void) {
+export function useVaultLockCycle<T>(onLock: (submitted: boolean) => T | null, onUnlock: (stash: T) => void, onErase?: () => void) {
   const vault = useVault();
-  const fns = useRef({ onLock, onUnlock });
-  fns.current = { onLock, onUnlock };
+  const fns = useRef({ onLock, onUnlock, onErase });
+  fns.current = { onLock, onUnlock, onErase };
   const stash = useRef<T | null>(null);
   const epoch = useRef(vault.lockEpoch);
   useEffect(() => {
@@ -289,6 +307,15 @@ export function useVaultLockCycle<T>(onLock: (submitted: boolean) => T | null, o
       fns.current.onUnlock(s);
     }
   }, [vault.unlocked]);
+  // The vault was erased: what was set aside can never come back, and "unlock to restore" notices are
+  // wrong now (`onErase` clears them). Runs after the lock effect above when both change at once.
+  const eraseEpoch = useRef(vault.eraseEpoch);
+  useEffect(() => {
+    if (eraseEpoch.current === vault.eraseEpoch) return;
+    eraseEpoch.current = vault.eraseEpoch;
+    stash.current = null;
+    fns.current.onErase?.();
+  }, [vault.eraseEpoch]);
   return {
     stashNow: () => {
       const s = fns.current.onLock(true);
@@ -935,6 +962,32 @@ export function loraLinkProblem(raw: string): string | null {
 
 const LORA_NAME_MAX = 60;
 
+/** A resolved link that is already in the library (UI-018: one rule for Create and the LoRA library). */
+export interface LoraDuplicate {
+  lora: Lora;
+  /** Same model and the same file or link: adding it again is refused. Otherwise it's only a note. */
+  blocking: boolean;
+}
+
+/**
+ * Finds `link` / `filename` in the library: the same model first (blocking), else any other model
+ * (a note: the same LoRA can be added for a second model). Links compare trimmed, files by name.
+ */
+export function findLoraDuplicate(loras: Lora[], link: string, filename: string, modelId: string): LoraDuplicate | null {
+  const same = (l: Lora) => l.sourceUrl.trim() === link.trim() || (!!filename && l.filename === filename);
+  const mine = loras.find((l) => l.modelId === modelId && same(l));
+  if (mine) return { lora: mine, blocking: true };
+  const other = loras.find((l) => same(l));
+  return other ? { lora: other, blocking: false } : null;
+}
+
+/** The one wording for a duplicate, in both flows. */
+export function loraDuplicateText(d: LoraDuplicate, modelName: (id: string) => string): string {
+  return d.blocking
+    ? `Already in your library as “${d.lora.name}” for ${modelName(d.lora.modelId)}. Choose another model, or use the one you have.`
+    : `This LoRA is already in your library as “${d.lora.name}” for ${modelName(d.lora.modelId)}. Adding it here keeps a second copy for this model.`;
+}
+
 /**
  * "Add LoRA from link" inside the Create screen (owner decision): resolve a Hugging Face / Civitai
  * link, confirm the name, model and trigger words, then add it (the download needs the image GPU,
@@ -957,6 +1010,7 @@ export function AddLoraLinkDialog({
 }) {
   const lib = useLibrary();
   const gpu = useGpu();
+  const toast = useToast();
   const [url, setUrl] = useState("");
   const [resolving, setResolving] = useState(false);
   /** The link field's own problem (malformed / unsupported / couldn't resolve): shown on the field. */
@@ -1028,8 +1082,8 @@ export function AddLoraLinkDialog({
   // Made for another of your models (UI-010): the form's model stays the default, the primary says "Add anyway".
   const wrongBase = !!suggested && !!modelId && suggested.id !== modelId;
   const baseMismatch = !!preview?.data.baseModel && !suggested;
-  const duplicate = preview ? lib.loras.find((l) => l.modelId === modelId && l.filename === preview.data.filename) : undefined;
-  const sameSource = preview ? lib.loras.find((l) => l.sourceUrl.trim() === preview.link && l.modelId !== modelId) : undefined;
+  const dup = preview ? findLoraDuplicate(lib.loras, preview.link, preview.data.filename, modelId) : null;
+  const duplicate = dup?.blocking ? dup.lora : undefined;
   const addBlocked = !preview
     ? "Check the link first."
     : !modelId
@@ -1050,16 +1104,27 @@ export function AddLoraLinkDialog({
     const details = [
       `Downloads ${formatBytes(size)} to ${lib.settings?.volumeNames?.[0] ?? "the image volume"}${vol ? ` · about ${formatBytes(Math.max(0, vol.freeBytes - size))} free afterwards` : ""}.`,
     ];
+    const input = { url: preview.link, modelId, name: name.trim(), triggerWords: [...words, ...wordDraft.split(",").map((w) => w.trim()).filter(Boolean)] };
+    // The GPU must start: one dialog at a time (UI-010 follow-up). This dialog closes first (focus goes
+    // back to "Add LoRA"), then the start confirmation opens from there; Cancel adds nothing and Esc
+    // returns to "Add LoRA".
+    const handOver = gpu.profiles.image.needsStart;
+    if (handOver) {
+      onClose();
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    }
     // Owner's rule: confirm before anything that starts a billed GPU. Cancel adds nothing.
-    if (!(await gpu.confirmStart(`download ${name.trim()}`, "image", { details, confirmLabel: `Start GPU & download ${formatBytes(size)}` }))) return;
+    if (!(await gpu.confirmStart(`download ${input.name}`, "image", { details, confirmLabel: `Start GPU & download ${formatBytes(size)}` }))) return;
     setAdding(true);
     setError(null);
     try {
-      const l = await api.addLora({ url: preview.link, modelId, name: name.trim(), triggerWords: [...words, ...wordDraft.split(",").map((w) => w.trim()).filter(Boolean)] });
+      const l = await api.addLora(input);
       await lib.reloadLoras();
       onAdded(l);
     } catch (err) {
-      setError(api.errorMessage(err));
+      // With the dialog already closed the error goes to a toast; otherwise it shows in the dialog.
+      if (handOver) toast.error("Couldn't add the LoRA", err);
+      else setError(api.errorMessage(err));
     } finally {
       setAdding(false);
     }
@@ -1207,14 +1272,9 @@ export function AddLoraLinkDialog({
               <Icon name="alert" /> Base model “{preview.data.baseModel}” doesn't match any of your models. It may not work.
             </p>
           )}
-          {duplicate && (
-            <p className="notice notice--warn" role="alert">
-              <Icon name="alert" /> Already in your library as “{duplicate.name}” ({modelName(duplicate.modelId)}) — the same file.
-            </p>
-          )}
-          {!duplicate && sameSource && (
-            <p className="hint">
-              <Icon name="info" size={12} /> This link is already in your library as “{sameSource.name}” for {modelName(sameSource.modelId)}.
+          {dup && (
+            <p className={`notice ${dup.blocking ? "notice--warn" : ""}`} role={dup.blocking ? "alert" : undefined}>
+              <Icon name={dup.blocking ? "alert" : "info"} /> {loraDuplicateText(dup, modelName)}
             </p>
           )}
           <div className="field">
@@ -1420,13 +1480,15 @@ export function Advanced({
   const dCfg = model?.defaults.cfg ? String(model.defaults.cfg) : "";
   const randomEffective = values.randomSeed || values.seed.trim() === "";
   // Collapsed summary: a value that blocks Generate shows in the error colour with its allowed range (UI-034).
-  const summary: { text: string; bad?: boolean }[] = [
+  const allSegs: { text: string; bad?: boolean }[] = [
     randomEffective ? { text: "random seed" } : { text: issues.seed ? `seed ${values.seed.trim()} (0–${SEED_MAX})` : `seed ${values.seed}`, bad: !!issues.seed },
     { text: issues.steps ? `${values.steps.trim()} steps (1–${STEPS_MAX})` : `${values.steps.trim() || dSteps || "default"} steps`, bad: !!issues.steps },
     { text: issues.cfg ? `CFG ${values.cfg.trim()} (0–${CFG_MAX})` : `CFG ${values.cfg.trim() || dCfg || "default"}`, bad: !!issues.cfg },
     ...(customNeg ? [{ text: "custom negative" }] : []),
   ];
   const badCount = [issues.seed, issues.steps, issues.cfg].filter(Boolean).length;
+  // While something blocks Generate, only the values to fix are listed, so the line stays short.
+  const summary = badCount ? allSegs.filter((p) => p.bad) : allSegs;
   const stepsRef = useRef<HTMLInputElement>(null);
 
   // Opening the drawer brings it into view above the sticky footer (UX-022).
@@ -1457,7 +1519,7 @@ export function Advanced({
         ) : (
           !isDefault && <span className="dot" aria-label="(modified)" />
         )}
-        <span className="advanced__summary">
+        <span className="advanced__summary" title={summary.map((p) => p.text).join(" · ")}>
           {summary.map((p, i) => (
             <span key={i} className={`advanced__seg ${p.bad ? "is-bad" : ""}`}>
               {p.text}

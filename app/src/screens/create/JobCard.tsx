@@ -4,6 +4,7 @@ import { ProgressBar } from "../../components/Dialog";
 import { Icon } from "../../components/Icon";
 import { formatDuration, pct } from "../../lib/format";
 import { useGpu } from "../../state/gpu";
+import { useToast } from "../../state/toast";
 import { showVaultTab, useVault } from "../../state/vault";
 
 export interface JobView extends Job {
@@ -58,8 +59,11 @@ const STATE_WORD: Record<string, string> = {
   failed: "failed",
 };
 
-/** Clicks this soon after a card finished, or the list moved, are ignored (UI-056: Cancel turns into Dismiss). */
-const CLICK_GUARD_MS = 600;
+/**
+ * Clicks this soon after a card finished, or the list moved, are ignored (UI-056: Cancel turns
+ * into Collapse / Dismiss under the pointer). Long enough for a late tap aimed at Cancel.
+ */
+const CLICK_GUARD_MS = 1000;
 
 const clip = (s: string, n = 60) => (s.length > n ? `${s.slice(0, n - 1).trimEnd()}…` : s);
 
@@ -335,10 +339,13 @@ export function JobCard({
     : `${num != null ? `Job ${num}, ` : ""}${job.modelName || (video ? "Video" : "Generation")}, ${stateWord}`;
   const valueText = caption ? caption.left : bar?.indeterminate ? title : undefined;
   const toVault = job.destination === "vault";
+  // The vault was erased after this job: its outputs are gone, there is nothing to unlock (UI-059).
+  const erased = toVault && vault.status != null && !vault.exists;
   // A click that lands just after the card or the list changed under the pointer is ignored (UI-056).
+  // The card's own finish counts too: that is when Cancel turns into Collapse / Dismiss.
+  const guardUntilAt = Math.max(guardUntil, finishedAt.current != null ? finishedAt.current + CLICK_GUARD_MS : 0);
   const guarded = (fn?: () => void) => () => {
-    const t = Date.now();
-    if (t < guardUntil || (finishedAt.current != null && t - finishedAt.current < CLICK_GUARD_MS)) return;
+    if (Date.now() < guardUntilAt) return;
     fn?.();
   };
   // Expanding swaps the summary row for the full card (and back): focus follows to its counterpart.
@@ -363,7 +370,12 @@ export function JobCard({
   // UI-012: a finished card as one summary row; the button expands it in place.
   if (collapsed && !active) {
     return (
-      <article ref={cardRef} className={`job-card job-card--collapsed job-card--${job.status} ${sealed ? "job-card--sealed" : ""}`} aria-label={cardName}>
+      <article
+        ref={cardRef}
+        className={`job-card job-card--collapsed job-card--${job.status} ${sealed ? "job-card--sealed" : ""}`}
+        aria-label={cardName}
+        data-click-guard-until={guardUntilAt || undefined}
+      >
         <button type="button" className="job-card__row" aria-expanded={false} onClick={guarded(toggle)}>
           <span className="job-card__status">
             {statusIcon}
@@ -379,7 +391,12 @@ export function JobCard({
   }
 
   return (
-    <article ref={cardRef} className={`job-card job-card--${job.status} ${sealed ? "job-card--sealed" : ""}`} aria-label={cardName}>
+    <article
+      ref={cardRef}
+      className={`job-card job-card--${job.status} ${sealed ? "job-card--sealed" : ""}`}
+      aria-label={cardName}
+      data-click-guard-until={guardUntilAt || undefined}
+    >
       <div className="job-card__head">
         <div className="job-card__status">
           {statusIcon}
@@ -466,9 +483,11 @@ export function JobCard({
               {active
                 ? "Will be sealed in the vault when done"
                 : job.completed > 0
-                  ? `${job.completed} ${noun}${job.completed === 1 ? "" : "s"} sealed in the vault`
+                  ? erased
+                    ? `${job.completed === 1 ? `The ${noun}` : `${job.completed} ${noun}s`} went with the erased vault`
+                    : `${job.completed} ${noun}${job.completed === 1 ? "" : "s"} sealed in the vault`
                   : "Nothing was saved"}
-              {!active && job.completed > 0 && (
+              {!active && job.completed > 0 && !erased && (
                 <>
                   {" · "}
                   <button type="button" className="link-btn" onClick={vault.requestUnlock}>
@@ -553,10 +572,14 @@ export function JobList({
   const doneAt = useRef(new Map<string, number>());
   for (const j of jobs) if (!isJobActive(j) && !doneAt.current.has(j.jobId)) doneAt.current.set(j.jobId, Date.now());
 
-  const active = jobs.filter(isJobActive);
+  /** Cleared but still undoable: hidden here, removed for good when the Undo toast goes. */
+  const [hidden, setHidden] = useState<ReadonlySet<string>>(() => new Set());
+  const toast = useToast();
+  const shownJobs = hidden.size ? jobs.filter((j) => !hidden.has(j.jobId)) : jobs;
+  const active = shownJobs.filter(isJobActive);
   // Newest first: by when each finished, then (same moment, e.g. restored cards) the later submission first.
   const order = new Map(jobs.map((j, i) => [j.jobId, i]));
-  const finished = jobs
+  const finished = shownJobs
     .filter((j) => !isJobActive(j))
     .sort((a, b) => (doneAt.current.get(b.jobId) ?? 0) - (doneAt.current.get(a.jobId) ?? 0) || order.get(b.jobId)! - order.get(a.jobId)!);
 
@@ -585,7 +608,29 @@ export function JobList({
     });
   };
 
-  if (!jobs.length) return null;
+  // Clear finished hides them at once and offers Undo; they go for good when the toast does.
+  const clearFinished = () => {
+    const ids = finished.map((j) => j.jobId);
+    const unhide = () =>
+      setHidden((h) => {
+        const n = new Set(h);
+        ids.forEach((id) => n.delete(id));
+        return n;
+      });
+    setHidden((h) => new Set([...h, ...ids]));
+    requestAnimationFrame(() => (rootRef.current?.querySelector<HTMLElement>(".job-card .btn") ?? galleryTab())?.focus());
+    toast.notify({
+      kind: "info",
+      title: `Cleared ${ids.length} finished job${ids.length === 1 ? "" : "s"}`,
+      actions: [{ label: "Undo", onClick: unhide }],
+      onClose: () => {
+        onDismiss(ids);
+        unhide();
+      },
+    });
+  };
+
+  if (!shownJobs.length) return null;
 
   const card = (j: JobView, i: number, list: JobView[]) => {
     const fin = !isJobActive(j);
@@ -595,7 +640,7 @@ export function JobList({
         <JobCard
           job={j}
           number={numbers.current.get(j.jobId)}
-          count={jobs.length}
+          count={shownJobs.length}
           queuedAfter={prev}
           sealed={j.destination === "vault" && !vaultUnlocked}
           podMode={podMode}
@@ -613,17 +658,27 @@ export function JobList({
 
   return (
     <section className="jobs" aria-label="Jobs" ref={rootRef}>
+      {/* The summary row is there whenever any card is, so "Clear finished" appears in a row of
+          its own above the cards, never in the spot a card's Cancel just left (UI-012 / UI-056). */}
+      <div className="jobs__head">
+        <span className="hint">
+          {[active.length ? `${active.length} running or queued` : null, finished.length ? `${finished.length} finished` : null].filter(Boolean).join(" · ")}
+        </span>
+        {finished.length >= 2 && (
+          <button
+            type="button"
+            className="btn btn--ghost btn--sm"
+            onClick={() => {
+              if (Date.now() >= guardUntil) clearFinished();
+            }}
+          >
+            <Icon name="x" size={13} /> Clear finished
+          </button>
+        )}
+      </div>
       {active.map((j, i) => card(j, i, active))}
       {finished.length > 0 && (
         <div className="jobs__finished" role="group" aria-label="Finished jobs">
-          {finished.length >= 2 && (
-            <div className="jobs__finished-head">
-              <span className="hint">{finished.length} finished</span>
-              <button type="button" className="btn btn--ghost btn--sm" onClick={() => dismiss(finished.map((j) => j.jobId))}>
-                <Icon name="x" size={13} /> Clear finished
-              </button>
-            </div>
-          )}
           <div className="jobs__finished-list">{finished.map((j, i) => card(j, i, finished))}</div>
         </div>
       )}

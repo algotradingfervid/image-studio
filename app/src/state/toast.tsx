@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { logUi } from "../api";
 import { Icon } from "../components/Icon";
@@ -33,6 +33,8 @@ export interface NotifyOptions {
   durationMs?: number;
   /** A toast with the same key is replaced instead of stacked. */
   key?: string;
+  /** Runs once when the toast goes away without one of its actions (timeout, ✕, pushed out). */
+  onClose?: () => void;
 }
 
 interface ToastApi {
@@ -106,6 +108,59 @@ function useTopModal(): HTMLElement | null {
   return host;
 }
 
+/** Sticky action bars toasts must never cover (Settings' Save bar, any `[data-sticky-bar]`). */
+const STICKY_BARS = "[data-sticky-bar], .settings-bar";
+
+/**
+ * Keeps the toast stack clear of sticky action bars (it sits above the highest one it would
+ * overlap), and publishes the space it takes as `--toast-reserve` on <html> so scrolling pages
+ * can pad their end by it: the last rows then scroll up out from under the toasts.
+ */
+function useClearOfStickyBars(layerRef: RefObject<HTMLDivElement | null>, count: number) {
+  useLayoutEffect(() => {
+    const root = document.documentElement;
+    let frame = 0;
+    const place = () => {
+      frame = 0;
+      const layer = layerRef.current;
+      if (!layer) return;
+      const vh = window.innerHeight;
+      let bottom = BASE_BOTTOM;
+      const box = layer.getBoundingClientRect();
+      for (const bar of document.querySelectorAll<HTMLElement>(STICKY_BARS)) {
+        const r = bar.getBoundingClientRect();
+        if (!r.width || !r.height || r.bottom <= 0 || r.top >= vh) continue;
+        // Only bars under the stack's column.
+        if (r.right < box.left || r.left > box.right) continue;
+        bottom = Math.max(bottom, vh - r.top + 10);
+      }
+      layer.style.bottom = `${bottom}px`;
+      const h = count ? layer.offsetHeight + bottom : 0;
+      root.style.setProperty("--toast-reserve", `${Math.round(h)}px`);
+    };
+    const schedule = () => {
+      if (!frame) frame = requestAnimationFrame(place);
+    };
+    place();
+    window.addEventListener("resize", schedule);
+    window.addEventListener("scroll", schedule, true);
+    const mo = new MutationObserver(schedule);
+    mo.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ["class", "hidden", "open"] });
+    const ro = new ResizeObserver(schedule);
+    if (layerRef.current) ro.observe(layerRef.current);
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      window.removeEventListener("resize", schedule);
+      window.removeEventListener("scroll", schedule, true);
+      mo.disconnect();
+      ro.disconnect();
+    };
+  }, [layerRef, count]);
+}
+
+/** The stack's distance from the window's bottom edge with nothing to avoid. */
+const BASE_BOTTOM = 18;
+
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const next = useRef(1);
@@ -114,10 +169,18 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   /** Toasts under the pointer or holding focus: their timers wait (UI-022). */
   const held = useRef(new Set<number>());
   const keys = useRef(new Map<string, number>());
+  const closers = useRef(new Map<number, () => void>());
+  const shown = useRef<Toast[]>([]);
+  shown.current = toasts;
   const host = useTopModal();
+  const layerRef = useRef<HTMLDivElement>(null);
+  useClearOfStickyBars(layerRef, toasts.length);
 
   const dismiss = useCallback((id: number) => {
     setToasts((t) => t.filter((x) => x.id !== id));
+    const close = closers.current.get(id);
+    closers.current.delete(id);
+    close?.();
     const h = timers.current.get(id);
     if (h?.handle) window.clearTimeout(h.handle);
     timers.current.delete(id);
@@ -138,6 +201,11 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       const id = old ?? next.current++;
       if (o.key) keys.current.set(o.key, id);
       const t: Toast = { id, kind, title: o.title, message: o.message, actions: o.actions, key: o.key };
+      if (o.onClose) closers.current.set(id, o.onClose);
+      else closers.current.delete(id);
+      const isNew = !shown.current.some((x) => x.id === id);
+      // Pushed out by a newer toast: dismissed properly (timer cleared, onClose run).
+      if (isNew) shown.current.slice(0, Math.max(0, shown.current.length - (MAX_SHOWN - 1))).forEach((x) => dismiss(x.id));
       setToasts((list) => (list.some((x) => x.id === id) ? list.map((x) => (x.id === id ? t : x)) : [...list.slice(-(MAX_SHOWN - 1)), t]));
       if (!o.sticky) {
         const ms = Math.max(o.durationMs ?? 0, lifetime(t));
@@ -194,7 +262,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   );
 
   const layer = (
-    <div className="toasts" aria-live="polite" aria-relevant="additions">
+    <div className="toasts" ref={layerRef} aria-live="polite" aria-relevant="additions">
       {toasts.map((t) => (
         <div
           key={t.id}
@@ -217,7 +285,11 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                     type="button"
                     className="btn btn--sm toast__action"
                     onClick={() => {
-                      if (a.dismiss !== false) dismiss(t.id);
+                      // An action is not a close: onClose (e.g. "finalise unless undone") doesn't run.
+                      if (a.dismiss !== false) {
+                        closers.current.delete(t.id);
+                        dismiss(t.id);
+                      }
                       a.onClick();
                     }}
                   >

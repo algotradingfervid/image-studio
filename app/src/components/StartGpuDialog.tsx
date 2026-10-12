@@ -33,6 +33,7 @@ export function StartGpuDialog({
   selfStopOff,
   danger,
   licence,
+  warnings,
   onAnswer,
 }: {
   open: boolean;
@@ -49,6 +50,8 @@ export function StartGpuDialog({
   danger?: boolean;
   /** A licence / region restriction of what will run, shown as its own row (UI-054). */
   licence?: string;
+  /** Amber notices before the price is committed (e.g. a gated model's download may fail). */
+  warnings?: string[];
   onAnswer: (ok: boolean) => void;
 }) {
   // Opens on Cancel, as every paid or destructive confirm does: a habitual Enter must not start a
@@ -123,6 +126,11 @@ export function StartGpuDialog({
               ))}
             </ul>
           )}
+          {warnings?.map((w) => (
+            <p key={w} className="notice notice--warn" role="alert">
+              <Icon name="alert" /> {w}
+            </p>
+          ))}
           {selfStopOff && (
             <p className="notice notice--warn">
               <Icon name="alert" /> “Let the pod stop itself when idle” is off: if this app quits or crashes, the pod keeps billing until you stop it.

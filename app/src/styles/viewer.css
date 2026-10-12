@@ -16,12 +16,24 @@
 }
 
 /* ---- side panel ---- */
-/* Desktop: the details are part of the side panel's column. */
-.lightbox__details {
-  display: contents;
+/* The details scroll on their own above a fixed action footer, so the actions never cover them. */
+.lightbox .lightbox__side {
+  overflow: hidden;
 }
-/* Nothing in the column shrinks: the panel scrolls instead of clipping the specs (UI-026). */
-.lightbox__side > *,
+.lightbox__details {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+/* More details below the fold: fade their bottom edge as a scroll hint (set from Lightbox.tsx). */
+.lightbox__details[data-more="true"] {
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 32px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 32px), transparent);
+}
+/* Nothing in the column shrinks: the details scroll instead of clipping the specs (UI-026). */
 .lightbox__details > * {
   flex-shrink: 0;
 }
@@ -45,19 +57,35 @@
   color: var(--text-2);
 }
 
-/* In a short window the details scroll under the actions, which stay in view at the bottom. */
 .lightbox__actions {
-  position: sticky;
-  bottom: -18px;
-  z-index: 1;
-  margin-bottom: -18px;
-  padding: 10px 0 18px;
-  background: var(--panel);
+  flex: none;
 }
 
-/* Inline confirms replace their trigger in place (UI-026); the panel scrolls if one is tall. */
-.lightbox__actions > .confirm {
-  margin: 0;
+/*
+ * Inline confirms (UI-026): the trigger's slot holds "Keep"; the message and the confirming button
+ * float above the slot (over the buttons above it), so no button moves.
+ */
+.confirm-slot {
+  position: relative;
+  display: grid;
+}
+.lightbox__actions .btn-row.confirm-slot {
+  display: flex;
+}
+.confirm-slot > .confirm-pop {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 2;
+  background: linear-gradient(var(--danger-soft), var(--danger-soft)), var(--panel-2);
+  box-shadow: var(--shadow-pop);
+}
+.confirm-slot > .confirm-pop.confirm--note {
+  background: linear-gradient(var(--warn-soft), var(--warn-soft)), var(--panel-2);
+}
+.confirm-pop__row {
+  justify-content: flex-end;
 }
 
 /*
@@ -84,29 +112,22 @@
   .lightbox__side {
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(220px, 260px);
+    grid-template-rows: minmax(0, 1fr);
     gap: 18px;
     padding: 16px 18px;
     border-left: 0;
     border-top: 1px solid var(--line);
     overflow: hidden;
   }
-  .lightbox__details {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
+  .lightbox__side > * {
     min-height: 0;
-    overflow-y: auto;
   }
   .lightbox .lightbox__prompt {
     max-height: none;
     overflow: visible;
   }
   .lightbox__actions {
-    position: static;
-    margin-bottom: 0;
-    padding: 0;
     min-height: 0;
-    overflow-y: auto;
     align-content: end;
     margin-top: 0;
   }

@@ -58,6 +58,8 @@ export interface StartDetails {
   danger?: boolean;
   /** A licence / region restriction restated as a "Licence" row (UI-054), e.g. "Runs in Canada — licence excludes EU/UK/KR/US". */
   licence?: string;
+  /** Risks to read before paying (a gated download that may fail), each an amber notice in the dialog. */
+  warnings?: string[];
 }
 
 interface Gpu extends Omit<GpuProfileInfo, "profile" | "live" | "needsStart" | "autoStopAt"> {
@@ -540,6 +542,7 @@ export function GpuProvider({ children }: { children: ReactNode }) {
         confirmLabel={startAsk?.extra?.confirmLabel}
         danger={startAsk?.extra?.danger}
         licence={startAsk?.extra?.licence}
+        warnings={startAsk?.extra?.warnings}
         selfStopOff={selfStopOff}
         onAnswer={answerStart}
         info={

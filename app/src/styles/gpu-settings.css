@@ -283,6 +283,18 @@
   vertical-align: 2px;
 }
 
+/* Focus scrolling keeps a field clear of the sticky section links on top and the unsaved-changes
+   bar at the bottom (WCAG 2.4.11). */
+.page.settings-page {
+  scroll-padding: 64px 0 80px;
+}
+
+/* The toast stack sits above the sticky bar (state/toast.tsx) and publishes its height as
+   --toast-reserve: the page's end can scroll out from under it. */
+.settings-page > .page__inner {
+  padding-bottom: max(48px, calc(var(--toast-reserve, 0px) + 16px));
+}
+
 /* Unsaved-changes bar (UX-021). */
 .settings-bar {
   position: sticky;

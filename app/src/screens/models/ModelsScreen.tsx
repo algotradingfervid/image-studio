@@ -56,6 +56,13 @@ const SECTIONS = [
   { id: "lora-title", label: "LoRA library" },
 ] as const;
 
+/** The element each section starts at, for the scroll-spy (the headings' own boxes). */
+const SECTION_BOX: Record<(typeof SECTIONS)[number]["id"], string> = {
+  "models-image": "models-image",
+  "models-video": "models-video",
+  "lora-title": "lora-library",
+};
+
 export function ModelsScreen({ active }: { active: boolean }) {
   const lib = useLibrary();
   const { reloadStatus } = lib;
@@ -111,24 +118,41 @@ export function ModelsScreen({ active }: { active: boolean }) {
 
   // Section nav: the section in view is marked current (UI-038). `.page` is the scroller.
   const pageRef = useRef<HTMLDivElement>(null);
+  const navRef = useRef<HTMLElement>(null);
   const [current, setCurrent] = useState<string>(SECTIONS[0].id);
+  // After a nav click the clicked section stays current until that smooth scroll settles.
+  const spyPaused = useRef(0);
   useEffect(() => {
     const page = pageRef.current;
     if (!page || !active) return;
     let raf = 0;
+    let settle = 0;
     const update = () => {
       raf = 0;
-      const top = page.getBoundingClientRect().top + 80;
+      if (spyPaused.current) return;
+      // A section is current once it fills the top third of what's visible under the sticky bar
+      // (UI-038 fix-check: a section that fills the screen must not wait for its heading to reach the bar).
+      const barBottom = navRef.current?.getBoundingClientRect().bottom ?? page.getBoundingClientRect().top;
+      const viewBottom = page.getBoundingClientRect().bottom;
+      const probe = barBottom + (viewBottom - barBottom) / 3;
       let at: string = SECTIONS[0].id;
       for (const s of SECTIONS) {
-        const h = document.getElementById(s.id);
-        if (h && h.getBoundingClientRect().top <= top) at = s.id;
+        const el = document.getElementById(SECTION_BOX[s.id]);
+        if (el && el.getBoundingClientRect().top <= probe) at = s.id;
       }
-      // At the very bottom the last section is current even if its heading can't reach the top.
-      if (page.scrollTop + page.clientHeight >= page.scrollHeight - 4) at = SECTIONS[SECTIONS.length - 1].id;
+      // At the bottom the last section is current even if it can't reach the probe line.
+      if (page.scrollTop + page.clientHeight >= page.scrollHeight - 2) at = SECTIONS[SECTIONS.length - 1].id;
       setCurrent(at);
     };
     const onScroll = () => {
+      if (spyPaused.current) {
+        window.clearTimeout(settle);
+        settle = window.setTimeout(() => {
+          spyPaused.current = 0;
+          update();
+        }, 160);
+        return;
+      }
       if (!raf) raf = requestAnimationFrame(update);
     };
     update();
@@ -136,8 +160,23 @@ export function ModelsScreen({ active }: { active: boolean }) {
     return () => {
       page.removeEventListener("scroll", onScroll);
       if (raf) cancelAnimationFrame(raf);
+      window.clearTimeout(settle);
     };
   }, [active, lib.models.length, lib.loras.length]);
+
+  const jumpTo = (id: string) => {
+    const page = pageRef.current;
+    const el = document.getElementById(id);
+    if (!page || !el) return;
+    setCurrent(id);
+    const before = page.scrollTop;
+    el.scrollIntoView({ behavior: "smooth", block: "start" });
+    // Paused only when a scroll actually follows (its scroll events end the pause).
+    spyPaused.current = 1;
+    window.setTimeout(() => {
+      if (page.scrollTop === before) spyPaused.current = 0;
+    }, 100);
+  };
 
   const videoVolume = lib.videoModels.find((m) => m.volume)?.volume ?? lib.settings?.videoVolumeNames?.[0] ?? "image-studio-video";
 
@@ -158,14 +197,14 @@ export function ModelsScreen({ active }: { active: boolean }) {
             </button>
           )}
         </header>
-        <nav className="section-nav section-nav--models" aria-label="Models sections">
+        <nav ref={navRef} className="section-nav section-nav--models" aria-label="Models sections">
           {SECTIONS.map((s) => (
             <button
               key={s.id}
               type="button"
               className={`section-nav__link ${current === s.id ? "is-current" : ""}`}
               aria-current={current === s.id ? "true" : undefined}
-              onClick={() => document.getElementById(s.id)?.scrollIntoView({ behavior: "smooth", block: "start" })}
+              onClick={() => jumpTo(s.id)}
             >
               {s.label}
             </button>
@@ -331,8 +370,8 @@ function ModelCard({ model: m, all, profile }: { model: ModelView; all: ModelVie
 
   const download = async () => {
     const details = [`Downloads ${formatBytes(missingBytes)} to ${volumeName}${vol ? ` · about ${formatBytes(Math.max(0, vol.freeBytes - missingBytes))} free afterwards` : ""}.`];
-    if (gated) details.push(gatedLine);
-    if (!(await gpu.confirmStart(`download ${m.name}`, profile, { details, confirmLabel: `Start GPU & download ${formatBytes(missingBytes)}` }))) return;
+    const warnings = gated ? [gatedLine] : undefined;
+    if (!(await gpu.confirmStart(`download ${m.name}`, profile, { details, warnings, confirmLabel: `Start GPU & download ${formatBytes(missingBytes)}` }))) return;
     setStarting(true);
     try {
       const t = await api.downloadModel(m.id);

@@ -81,6 +81,10 @@ function aspectOf(im: ImageRecord): number {
 
 /** Gap between tiles; matches `.gallery--justified { gap }`. */
 const GAP = 10;
+/** Narrowest tile at the target row height; a very tall item is cropped (object-fit: cover) to this. */
+const MIN_TILE_W = 96;
+/** Rows are not shrunk below this share of the target height (keeps narrow tiles >= ~77 px). */
+const MIN_ROW_SHARE = 0.8;
 
 /**
  * Justified rows (UI-073): fill each row with tiles until it would get shorter than the target row
@@ -104,9 +108,9 @@ function justify(ars: number[], width: number, rowH: number): number[] | null {
       continue;
     }
     // Adding tile i makes the row shorter than the target: keep it, or end the row before it,
-    // whichever lands closer to the target height.
+    // whichever lands closer to the target height; never shrink a row far below the target.
     const before = n > 1 ? (width - GAP * (n - 2)) / sum : Infinity;
-    if (before - rowH < rowH - h) {
+    if (n > 1 && (before - rowH < rowH - h || (h < rowH * MIN_ROW_SHARE && before <= rowH * 1.5))) {
       close(start, i - 1, before);
       start = i;
       sum = ars[i];
@@ -180,7 +184,9 @@ export function Gallery({
   const sentinel = useRef<HTMLDivElement>(null);
   const [listEl, setListEl] = useState<HTMLUListElement | null>(null);
   const box = useRowBox(listEl);
-  const widths = justify(items.map(aspectOf), box.width, box.rowH);
+  // Tile aspect ratios, with very tall items widened (cropped) to a minimum width (UI-023).
+  const ars = items.map((im) => (box.rowH > 0 ? Math.max(aspectOf(im), MIN_TILE_W / box.rowH) : aspectOf(im)));
+  const widths = justify(ars, box.width, box.rowH);
   const loadRef = useRef(onLoadMore);
   loadRef.current = onLoadMore;
   galleryPager.hasMore = hasMore;
@@ -292,7 +298,7 @@ export function Gallery({
       {migrationNote}
       <ul ref={setListEl} className={`gallery gallery--justified ${widths ? "is-measured" : ""}`} aria-label="Generated images, newest first">
         {items.map((im, i) => {
-          const style = { "--ar": aspectOf(im), ...(widths ? { "--w": `${widths[i]}px` } : null) } as CSSProperties;
+          const style = { "--ar": ars[i], ...(widths ? { "--w": `${widths[i]}px` } : null) } as CSSProperties;
           return im.kind === "video" ? (
             <li key={im.id} className="gallery__item" style={style}>
               <VideoTile im={im} modelName={modelNames[im.model] ?? im.model} isNew={isNew(im)} onOpen={() => onOpen(i)} />

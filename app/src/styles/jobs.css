@@ -14,7 +14,7 @@
   min-width: 0;
 }
 
-.jobs__finished-head {
+.jobs__head {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -288,4 +288,50 @@
   .toolbar .badge--mock {
     display: none;
   }
+}
+
+/* ------------------------------------------------------------ toasts (UI-022 follow-up) */
+
+/* Narrower, and lifted above sticky action bars by the toast provider (state/toast.tsx). */
+.toasts {
+  width: min(320px, calc(100vw - 36px));
+}
+
+/* Scrolling pages end with room for the toast stack (--toast-reserve, set by the provider), so
+   their last rows and buttons can always be scrolled out from under it. */
+.models-page > .page__inner {
+  padding-bottom: calc(48px + var(--toast-reserve, 0px));
+}
+
+.canvas {
+  padding-bottom: calc(28px + var(--toast-reserve, 0px));
+}
+
+/* Both pods billing: compact pills that fit side by side at 1440 and 820 px without "…" — state
+   word and cost stay; GPU name, elapsed time and phase move to each pill's details. */
+.gpu-pills--both .gpu-pill__gpu,
+.gpu-pills--both .gpu-pill__elapsed,
+.gpu-pills--both .gpu-pill__phase {
+  display: none;
+}
+
+.gpu-pills--both .gpu-pill__btn > .icon {
+  display: none;
+}
+
+/* ------------------------------------------------- header tabs and vault pill */
+
+/* Activity / unsaved dots sit in the tab's corner, so a tab never changes width when one
+   appears (UI-016 follow-up). */
+.toolbar .tab__dot,
+:root[data-settings-dirty] .toolbar #tab-settings .tab__label::after {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  margin: 0;
+}
+
+/* Header vault button: light text on the pill's tint (#ffad6e measured 3.63:1 at worst). */
+.toolbar .vault-pill__btn {
+  color: var(--text);
 }

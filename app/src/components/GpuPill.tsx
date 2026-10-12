@@ -22,7 +22,8 @@ export function GpuPills() {
   const both = gpu.runningTotal.count > 1;
   void now; // re-render for the total
   return (
-    <div className="gpu-pills gpu-pills--dual" role="group" aria-label="GPU pods">
+    // Both pods live: each pill goes compact (state word + cost; GPU and elapsed time in its details).
+    <div className={`gpu-pills gpu-pills--dual ${both ? "gpu-pills--both" : ""}`} role="group" aria-label="GPU pods">
       {PROFILES.map((p) => (
         <GpuPill key={p} profile={p} />
       ))}

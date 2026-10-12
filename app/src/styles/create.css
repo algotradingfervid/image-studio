@@ -75,9 +75,18 @@
 
 /* ---------- validation ---------- */
 .input.is-invalid,
-.textarea.is-invalid {
+.textarea.is-invalid,
+.input.is-invalid:hover:not(:disabled),
+.textarea.is-invalid:hover:not(:disabled) {
   border-color: var(--danger);
   box-shadow: 0 0 0 1px var(--danger-soft);
+}
+
+/* Invalid wins over hover and focus (the base sheet loads later, so these need the extra class). */
+.input.is-invalid:focus,
+.input.is-invalid:focus-visible {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 1px var(--danger) inset, 0 0 0 3px var(--danger-soft);
 }
 
 .field-error {
@@ -109,6 +118,32 @@
   cursor: not-allowed;
 }
 
+/* The ⌘↵ badge reads at >= 4.5:1 on the orange (it was dimmed to 0.75). */
+.panel__foot .btn--generate .kbd-group {
+  opacity: 1;
+}
+
+/* While the vault set-up form shows, its button is the one filled primary (UI-074): Generate is
+   outlined but works the same. */
+.panel__foot .btn--generate.is-quiet,
+.panel__foot .btn--generate.is-quiet:hover,
+.panel__foot .btn--generate.is-quiet[aria-disabled="true"] {
+  background: transparent;
+  border: 1px solid var(--accent);
+  box-shadow: none;
+  color: var(--accent-hi);
+}
+
+.panel__foot .btn--generate.is-quiet:hover:not([aria-disabled="true"]) {
+  background: var(--accent-soft);
+}
+
+.panel__foot .btn--generate.is-quiet kbd {
+  background: transparent;
+  border-color: var(--accent-line);
+  color: var(--accent-hi);
+}
+
 .panel__foot .panel__hint--block {
   color: var(--warn);
 }
@@ -137,11 +172,19 @@
   order: 5;
   display: flex;
   flex: 1 1 100%;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 0 6px;
   min-width: 0;
   margin-left: 0;
   padding-left: 24px;
+  overflow: hidden;
+}
+
+/* One line: segments stay whole; only the last one may shorten with an ellipsis. */
+.advanced__seg:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* Segments never break inside; the separator belongs to the segment after it. */
@@ -170,6 +213,20 @@
   font-size: 11px;
   font-weight: 800;
   line-height: 1;
+}
+
+/* ---------- start image sources: laid out like the References row (left-aligned, hint inline) ---------- */
+.dropzone.start-sources {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  padding: 14px 10px;
+}
+
+.start-sources .start-sources__btns {
+  justify-content: flex-start;
+  gap: 6px 8px;
 }
 
 /* ---------- references from gallery ---------- */

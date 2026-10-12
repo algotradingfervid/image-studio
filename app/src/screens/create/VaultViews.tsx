@@ -251,6 +251,9 @@ export function VaultCreate({ generalCount, generalMore }: { generalCount: numbe
   const [error, setError] = useState<string | null>(null);
   /** Fields left at least once: errors show on blur, not on every keystroke (UX-061). */
   const [touched, setTouched] = useState({ pw: false, confirm: false });
+  // While this form shows, its button is the one filled primary (vault.setupActive, UI-074).
+  const { registerSetup } = vault;
+  useEffect(() => registerSetup(), [registerSetup]);
   /** Confirm has focus: while it's being retyped, a mismatch waits for its full length (UI-067). */
   const [confirmFocused, setConfirmFocused] = useState(false);
   const id = useId();

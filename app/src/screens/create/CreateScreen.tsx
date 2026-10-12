@@ -434,8 +434,8 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         setTainted(false);
         showNotice(
           submitted
-            ? { tone: "info", title: "Sent to the vault — prompt cleared", detail: "The vault is locked, so nothing from this job stays on screen. Unlock to get the prompt back.", sticky: true }
-            : { tone: "info", title: "Vault locked — vault start image and prompt cleared", detail: "Unlock the vault to restore them.", sticky: true },
+            ? { tone: "info", title: "Sent to the vault — prompt cleared", detail: "The vault is locked, so nothing from this job stays on screen. Unlock to get the prompt back.", sticky: true, vault: true }
+            : { tone: "info", title: "Vault locked — vault start image and prompt cleared", detail: "Unlock the vault to restore them.", sticky: true, vault: true },
         );
       }
       return stash;
@@ -470,6 +470,10 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
             : undefined,
         vault: true,
       });
+    },
+    // Erased vault: drop the "unlock to restore" notice (nothing can come back).
+    () => {
+      if (notice?.vault) clearNotice();
     },
   );
 
@@ -993,7 +997,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     // source, a start image already in the form is kept.
     let startFailed = false;
     let replacedStart = false;
-    let keptStart = false;
+    let removedStart = false;
     if (im.initImage && m.supportsImg2Img) {
       replacedStart = !!startImage;
       setStartImage(null);
@@ -1006,10 +1010,9 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
       } finally {
         setStartBusy(false);
       }
-    } else if (startImage && m.supportsImg2Img) {
-      keptStart = true;
     } else if (startImage) {
-      replacedStart = true;
+      // The source had no start image (or the model takes none): the form matches the source.
+      removedStart = true;
       setStartImage(null);
     }
 
@@ -1034,8 +1037,8 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     const changes = [
       snap.mode !== "image" ? "switched to Image" : "",
       snap.prompt.trim() && snap.prompt !== im.prompt ? "replaced your prompt" : "",
-      replacedStart ? (im.initImage && m.supportsImg2Img ? "replaced your start image" : `removed your start image (${m.name} doesn't take one)`) : "",
-      keptStart ? "kept your start image" : "",
+      replacedStart ? "replaced your start image" : "",
+      removedStart ? (m.supportsImg2Img ? "removed your start image (the restored image had none)" : `removed your start image (${m.name} doesn't take one)`) : "",
     ].filter(Boolean);
     const gaps = [
       !m.installed ? `${m.name} isn't installed — install it in Models to generate` : "",
@@ -1374,8 +1377,10 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         <div className="panel__foot">
           <PanelNoticeView notice={notice} onDismiss={clearNotice} onHold={holdNotice} />
           {saveToSwitch}
-          <button type="submit" className="btn btn--generate" disabled={submitting} aria-disabled={!!blocker || undefined} aria-describedby="gen-hint">
-            <Icon name="spark" size={18} />
+          {/* Never `disabled` (also not while queuing): after the GPU confirmation focus comes back here (UI-006). */}
+          <button type="submit" className={`btn btn--generate ${vault.setupActive ? "is-quiet" : ""}`} aria-disabled={!!blocker || submitting || undefined} aria-describedby="gen-hint">
+            {/* Blocked: a plain "!" mark, not the spark that reads as a loading spinner. */}
+            <Icon name={blocker ? "alert" : "spark"} size={18} />
             <span>
               {submitting
                 ? "Queuing…"

@@ -6,21 +6,10 @@ import { Icon } from "../../components/Icon";
 import { formatBytes, pct } from "../../lib/format";
 import { useGpu } from "../../state/gpu";
 import { useLibrary } from "../../state/library";
+import { findLoraDuplicate, LORA_LINK_HELP, LORA_LINK_LABEL, loraDuplicateText, loraLinkProblem } from "../create/Controls";
 import { useToast } from "../../state/toast";
 
 const NAME_MAX = 60;
-/** The one error for input that isn't a link at all (UI-017); host/format errors come from the resolver. */
-const LINK_HELP = "Paste a Hugging Face …/blob/main/x.safetensors link or a Civitai model page.";
-
-/** True for an http(s) URL; the browser's own type="url" bubble is off (noValidate). */
-function looksLikeLink(text: string): boolean {
-  try {
-    const u = new URL(text);
-    return u.protocol === "https:" || u.protocol === "http:";
-  } catch {
-    return false;
-  }
-}
 
 export function LoraLibrary() {
   const lib = useLibrary();
@@ -41,9 +30,11 @@ export function LoraLibrary() {
     e.preventDefault();
     const link = url.trim();
     if (!link) return;
-    if (!looksLikeLink(link)) {
+    // Same check and wording as Create's "Add LoRA from link" (UI-017/UI-018); the browser's bubble is off (noValidate).
+    const problem = loraLinkProblem(link);
+    if (problem) {
       setPreview(null);
-      setResolveError(LINK_HELP);
+      setResolveError(problem);
       urlRef.current?.focus();
       return;
     }
@@ -104,9 +95,10 @@ export function LoraLibrary() {
   const chosen = lib.imageModels.find((m) => m.id === modelId);
   const chosenMissing = !!chosen && !chosen.installed;
   const nameTooLong = name.trim().length > NAME_MAX;
-  // The same file for the same model is refused by the core (it would share one file on the volume).
-  const duplicate = preview ? lib.loras.find((l) => l.modelId === modelId && l.filename === preview.data.filename) : undefined;
-  const sameSource = preview ? lib.loras.find((l) => l.sourceUrl.trim() === preview.link && l.modelId !== modelId) : undefined;
+  // One rule and wording with Create's "Add LoRA from link" (UI-018): the same link or file for this
+  // model is refused (the core refuses the same file); for another model it's only a note.
+  const dup = preview ? findLoraDuplicate(lib.loras, preview.link, preview.data.filename, modelId) : null;
+  const duplicate = dup?.blocking ? dup.lora : undefined;
   const addLabel = adding ? "Adding…" : wrongBase ? "Add anyway" : gpu.profiles.image.needsStart ? "Add & download (starts GPU)" : "Add to library";
   const addBlocked = !modelId ? "Choose which model this LoRA is for." : !name.trim() ? "Give it a name." : nameTooLong ? `Keep the name to ${NAME_MAX} characters.` : duplicate ? "Already in your library for this model." : null;
   // Always one line under the buttons, so choosing a model doesn't shift the form (UI-075).
@@ -131,7 +123,7 @@ export function LoraLibrary() {
 
       <form className="link-form" onSubmit={resolve} noValidate>
         <label className="field__label" htmlFor="lora-url">
-          Civitai or Hugging Face link
+          {LORA_LINK_LABEL}
         </label>
         <div className="link-form__row">
           <div className="input-icon">
@@ -164,7 +156,7 @@ export function LoraLibrary() {
           </button>
         </div>
         <p id="lora-url-help" className="hint">
-          A Hugging Face file link (…/blob/main/x.safetensors) or a Civitai model page.
+          {LORA_LINK_HELP}
         </p>
       </form>
       {resolveError && (
@@ -241,14 +233,9 @@ export function LoraLibrary() {
                 <Icon name="info" /> {chosen.name} isn't installed yet; this LoRA won't be usable until you download it ({formatBytes(chosen.totalBytes - chosen.presentBytes)}) above.
               </p>
             )}
-            {duplicate && (
-              <p className="notice notice--warn" role="alert">
-                <Icon name="alert" /> Already in your library as “{duplicate.name}” ({modelName(duplicate.modelId)}) — the same file.
-              </p>
-            )}
-            {!duplicate && sameSource && (
-              <p className="hint">
-                <Icon name="info" size={12} /> This link is already in your library as “{sameSource.name}” for {modelName(sameSource.modelId)}.
+            {dup && (
+              <p className={`notice ${dup.blocking ? "notice--warn" : ""}`} role={dup.blocking ? "alert" : undefined}>
+                <Icon name={dup.blocking ? "alert" : "info"} /> {loraDuplicateText(dup, modelName)}
               </p>
             )}
             <div className="field">
