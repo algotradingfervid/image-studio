@@ -4,7 +4,7 @@ import { ProgressBar } from "../../components/Dialog";
 import { Icon } from "../../components/Icon";
 import { formatDuration, pct } from "../../lib/format";
 import { useGpu } from "../../state/gpu";
-import { useVault } from "../../state/vault";
+import { showVaultTab, useVault } from "../../state/vault";
 
 export interface JobView extends Job {
   modelName: string;
@@ -47,6 +47,21 @@ const LOADER_STAGES = new Set(["loading_text_encoder", "loading_model"]);
 
 /** The pod start phases (mirror of app/src-tauri/src/pod.rs PHASE_*). */
 const POD_PHASES = ["Creating pod", "Waiting for machine", "Pulling image", "Booting ComfyUI"];
+
+/** Spoken state in the card's name (UI-057). */
+const STATE_WORD: Record<string, string> = {
+  queued: "queued",
+  starting: "starting",
+  running: "running",
+  completed: "done",
+  cancelled: "cancelled",
+  failed: "failed",
+};
+
+/** Clicks this soon after a card finished, or the list moved, are ignored (UI-056: Cancel turns into Dismiss). */
+const CLICK_GUARD_MS = 600;
+
+const clip = (s: string, n = 60) => (s.length > n ? `${s.slice(0, n - 1).trimEnd()}…` : s);
 
 /** Models that finished an image in this session (their weights are likely in GPU memory). */
 const warmModels = new Set<string>();
@@ -96,6 +111,11 @@ export function JobCard({
   onOpenImage,
   index,
   count,
+  number,
+  queuedAfter,
+  collapsed = false,
+  onToggle,
+  guardUntil = 0,
 }: {
   job: JobView;
   /** A vault job while the vault is locked: no prompt, no thumbnails (spec v6). */
@@ -111,6 +131,15 @@ export function JobCard({
   /** 0-based position among the cards shown (UX-011); numbered only when `count` > 1. */
   index?: number;
   count?: number;
+  /** Stable job number (UI-056): kept when other cards are dismissed; replaces `index` + 1. */
+  number?: number;
+  /** A queued job: the number of the job it waits for. */
+  queuedAfter?: number;
+  /** A finished card shown as its one-line summary (UI-012); `onToggle` expands it. */
+  collapsed?: boolean;
+  onToggle?: () => void;
+  /** Cancel / Dismiss / expand ignore clicks until then (ms epoch): the list just moved under the pointer (UI-056). */
+  guardUntil?: number;
 }) {
   const video = job.kind === "video";
   const active = isJobActive(job);
@@ -154,6 +183,25 @@ export function JobCard({
   useEffect(() => {
     if (job.completed > 0 && job.modelName) warmModels.add(job.modelName);
   }, [job.completed, job.modelName]);
+
+  const cardRef = useRef<HTMLElement>(null);
+  const refocus = useRef(false);
+  useEffect(() => {
+    if (!refocus.current) return;
+    refocus.current = false;
+    cardRef.current?.querySelector<HTMLElement>(collapsed ? ".job-card__row" : ".job-card__collapse")?.focus();
+  }, [collapsed]);
+
+  // UI-065: a lock wipes a vault job's prompt and outputs from the card; after the next unlock they
+  // come back from the vault's own list. Only the opaque output ids are kept across the lock.
+  const outputIds = useRef<string[]>([]);
+  if (job.images.length) outputIds.current = job.images.map((r) => r.id);
+  const rehydrated =
+    !sealed && job.destination === "vault" && job.images.length === 0 && outputIds.current.length > 0
+      ? outputIds.current.map((id) => vault.items.find((x) => x.id === id)).filter((r): r is NonNullable<typeof r> => !!r)
+      : null;
+  const outputs = rehydrated ?? job.images;
+  const prompt = job.prompt || rehydrated?.[0]?.prompt || "";
 
   const k = Math.min(job.completed + 1, job.total);
   const noun = video ? "video" : "image";
@@ -260,10 +308,12 @@ export function JobCard({
 
   if (gpuNote && (job.status === "queued" || job.status === "starting")) hint = gpuNote;
 
-  // UX-011: number concurrent cards by their order in the list.
-  const numbered = index != null && (count ?? 0) > 1;
+  // UX-011 / UI-056: number concurrent cards; the number stays with the job when others go.
+  const num = number ?? (index != null ? index + 1 : null);
+  const numbered = num != null && (count ?? 0) > 1;
   if (numbered) {
-    title = job.status === "queued" && index! > 0 ? `Job ${index! + 1} · queued · starts after job ${index}` : `Job ${index! + 1} · ${title}`;
+    const after = queuedAfter ?? (index != null && index > 0 ? index : null);
+    title = job.status === "queued" && after != null ? `Job ${num} · queued · starts after job ${after}` : `Job ${num} · ${title}`;
   }
   const videoSpecs = video
     ? [
@@ -275,19 +325,68 @@ export function JobCard({
 
   const showCountTag = job.total > 1 && active && !staged;
   const started = job.status === "running" || job.completed > 0;
-  const promptLine = `${job.modelName}${job.prompt ? ` · ${job.prompt}` : ""}`;
+  const promptLine = `${job.modelName}${prompt ? ` · ${prompt}` : ""}`;
+
+  // UI-057: names that tell cards apart ("Job 4, Z-Image Turbo, done").
+  const jobName = num != null ? `job ${num}` : "this job";
+  const stateWord = STATE_WORD[job.status] ?? job.status;
+  const cardName = sealed
+    ? `${num != null ? `Job ${num}` : video ? "Video" : "Generation"} for the vault, ${stateWord}`
+    : `${num != null ? `Job ${num}, ` : ""}${job.modelName || (video ? "Video" : "Generation")}, ${stateWord}`;
+  const valueText = caption ? caption.left : bar?.indeterminate ? title : undefined;
+  const toVault = job.destination === "vault";
+  // A click that lands just after the card or the list changed under the pointer is ignored (UI-056).
+  const guarded = (fn?: () => void) => () => {
+    const t = Date.now();
+    if (t < guardUntil || (finishedAt.current != null && t - finishedAt.current < CLICK_GUARD_MS)) return;
+    fn?.();
+  };
+  // Expanding swaps the summary row for the full card (and back): focus follows to its counterpart.
+  const toggle = onToggle
+    ? () => {
+        refocus.current = true;
+        onToggle();
+      }
+    : undefined;
+  const dismissBtn = onDismiss ? (
+    <button type="button" className="icon-btn job-card__dismiss" aria-label={`Dismiss ${jobName}`} title={`Dismiss ${jobName}`} onClick={guarded(onDismiss)}>
+      <Icon name="x" />
+    </button>
+  ) : null;
+  const statusIcon = active ? <span className="pulse" aria-hidden /> : <Icon name={job.status === "completed" ? "check" : job.status === "failed" ? "alert" : "stop"} />;
+  const vaultBadge = toVault ? (
+    <span className="job-card__badge">
+      <Icon name="lock" size={12} /> {job.status === "completed" || (!active && job.completed > 0) ? "Saved to vault" : active ? "To vault" : "Vault"}
+    </span>
+  ) : null;
+
+  // UI-012: a finished card as one summary row; the button expands it in place.
+  if (collapsed && !active) {
+    return (
+      <article ref={cardRef} className={`job-card job-card--collapsed job-card--${job.status} ${sealed ? "job-card--sealed" : ""}`} aria-label={cardName}>
+        <button type="button" className="job-card__row" aria-expanded={false} onClick={guarded(toggle)}>
+          <span className="job-card__status">
+            {statusIcon}
+            <span className="job-card__title">{title}</span>
+          </span>
+          <span className="job-card__summary">{sealed ? "" : promptLine}</span>
+          <Icon name="chevronDown" className="job-card__chev" />
+        </button>
+        {vaultBadge}
+        {dismissBtn}
+      </article>
+    );
+  }
 
   return (
-    <article
-      className={`job-card job-card--${job.status} ${sealed ? "job-card--sealed" : ""}`}
-      aria-label={sealed ? `${video ? "Video" : "Generation"} for the vault` : `${video ? "Video" : "Generation"}: ${job.prompt}`}
-    >
+    <article ref={cardRef} className={`job-card job-card--${job.status} ${sealed ? "job-card--sealed" : ""}`} aria-label={cardName}>
       <div className="job-card__head">
         <div className="job-card__status">
-          {active ? <span className="pulse" aria-hidden /> : <Icon name={job.status === "completed" ? "check" : job.status === "failed" ? "alert" : "stop"} />}
+          {statusIcon}
           <span className="job-card__title" aria-live="polite">
             {title}
           </span>
+          {vaultBadge}
         </div>
         <div className="job-card__meta">
           {showCountTag && (
@@ -301,14 +400,19 @@ export function JobCard({
             </span>
           )}
           {active ? (
-            <button type="button" className="btn btn--ghost btn--sm" onClick={onCancel}>
+            <button type="button" className="btn btn--ghost btn--sm" onClick={guarded(onCancel)} aria-label={`Cancel ${jobName}`}>
               <Icon name="stop" /> Cancel
             </button>
-          ) : onDismiss ? (
-            <button type="button" className="icon-btn icon-btn--sm" aria-label="Dismiss" onClick={onDismiss}>
-              <Icon name="x" />
-            </button>
-          ) : null}
+          ) : (
+            <>
+              {onToggle && (
+                <button type="button" className="icon-btn job-card__collapse" aria-expanded={true} aria-label={`Collapse ${jobName}`} title="Collapse" onClick={guarded(toggle)}>
+                  <Icon name="chevronDown" />
+                </button>
+              )}
+              {dismissBtn}
+            </>
+          )}
         </div>
       </div>
 
@@ -329,7 +433,13 @@ export function JobCard({
 
       {bar && (
         <div className="job-card__progress">
-          <ProgressBar label={video ? "Video progress" : "Generation progress"} value={bar.value} indeterminate={bar.indeterminate} tone={bar.tone} />
+          <ProgressBar
+            label={`${num != null ? `Job ${num} ` : ""}${video ? "video progress" : "progress"}`}
+            value={bar.value}
+            indeterminate={bar.indeterminate}
+            tone={bar.tone}
+            valueText={valueText}
+          />
           {caption && (
             <div className="job-card__caption mono">
               <span>{caption.left}</span>
@@ -371,20 +481,28 @@ export function JobCard({
         ) : (
           <p className="job-card__prompt" title={promptLine}>
             <strong>{job.modelName}</strong>
-            {job.prompt ? ` · ${job.prompt}` : ""}
-            {job.destination === "vault" && (
-              <span className="job-card__dest" title={job.status === "completed" ? "Saved to the vault" : "Goes to the vault"}>
-                {" "}
-                <Icon name="lock" size={11} label="Vault" />
-              </span>
+            {prompt ? ` · ${prompt}` : ""}
+            {toVault && !prompt && !active && job.completed > 0 && outputs.length === 0 && (
+              <>
+                {" · "}
+                <button type="button" className="link-btn" onClick={() => showVaultTab()}>
+                  Show in the Vault tab
+                </button>
+              </>
             )}
           </p>
         )}
-        {!sealed && job.images.length > 0 && (
+        {!sealed && outputs.length > 0 && (
           <div className="job-card__thumbs">
-            {job.images.map((im) => (
-              <button key={im.id} type="button" className="job-thumb" onClick={() => onOpenImage(im.id)} aria-label={`Open ${im.kind === "video" ? "video" : "image"} seed ${im.seed}`}>
-                <img src={fileSrc(im.kind === "video" ? (im.posterPath ?? "") : im.path)} alt="" />
+            {outputs.map((im, i) => (
+              <button
+                key={im.id}
+                type="button"
+                className="job-thumb"
+                onClick={() => onOpenImage(im.id)}
+                aria-label={`Open ${im.kind === "video" ? "video" : "image"} ${i + 1} of ${outputs.length}${prompt ? `: ${clip(prompt)}` : ""}`}
+              >
+                <img src={fileSrc(im.thumbPath ?? (im.kind === "video" ? (im.posterPath ?? "") : im.path))} alt="" />
               </button>
             ))}
           </div>
@@ -392,6 +510,124 @@ export function JobCard({
       </div>
       {job.error && <p className="job-card__error">{job.error}</p>}
     </article>
+  );
+}
+
+/** The gallery's selected tab: where focus goes when the last job card is removed. */
+const galleryTab = () => document.querySelector<HTMLElement>('.canvas [role="tab"][aria-selected="true"]');
+
+/**
+ * The job cards above the gallery (UI-012). Running and queued jobs come first, in the order they
+ * were submitted, so a new paid job and its Cancel are never pushed below the fold. Finished jobs
+ * follow, newest first, as one-line summaries (the newest stays open while nothing runs) in a
+ * capped scroll area, with "Clear finished" from two on. Job numbers stay with their job (UI-056).
+ */
+export function JobList({
+  jobs,
+  vaultUnlocked,
+  podMode,
+  gpuNoteFor,
+  onCancel,
+  onDismiss,
+  onOpenImage,
+}: {
+  jobs: JobView[];
+  vaultUnlocked: boolean;
+  podMode: boolean;
+  /** Video jobs: the cost note while the video GPU is off/starting. */
+  gpuNoteFor?: (job: JobView) => string | null;
+  onCancel: (jobId: string) => void;
+  /** Remove these finished cards (one Dismiss, or Clear finished). */
+  onDismiss: (jobIds: string[]) => void;
+  onOpenImage: (id: string) => void;
+}) {
+  const rootRef = useRef<HTMLElement>(null);
+  // Stable numbers, from 1 again once every card is gone. Render-time writes are idempotent.
+  const numbers = useRef(new Map<string, number>());
+  const nextNumber = useRef(1);
+  if (!jobs.length) {
+    numbers.current.clear();
+    nextNumber.current = 1;
+  }
+  for (const j of jobs) if (!numbers.current.has(j.jobId)) numbers.current.set(j.jobId, nextNumber.current++);
+  const doneAt = useRef(new Map<string, number>());
+  for (const j of jobs) if (!isJobActive(j) && !doneAt.current.has(j.jobId)) doneAt.current.set(j.jobId, Date.now());
+
+  const active = jobs.filter(isJobActive);
+  // Newest first: by when each finished, then (same moment, e.g. restored cards) the later submission first.
+  const order = new Map(jobs.map((j, i) => [j.jobId, i]));
+  const finished = jobs
+    .filter((j) => !isJobActive(j))
+    .sort((a, b) => (doneAt.current.get(b.jobId) ?? 0) - (doneAt.current.get(a.jobId) ?? 0) || order.get(b.jobId)! - order.get(a.jobId)!);
+
+  // A job that finishes moves its card: clicks just after that are ignored, so a late click
+  // meant for one card's Cancel can't land on the control that slid under the pointer.
+  const shape = useRef({ key: "", at: 0 });
+  const key = `${active.map((j) => j.jobId).join()}|${finished.map((j) => j.jobId).join()}`;
+  if (shape.current.key !== key) shape.current = { key, at: shape.current.key ? Date.now() : 0 };
+  const guardUntil = shape.current.at + CLICK_GUARD_MS;
+
+  /** Explicit expand / collapse per finished card; otherwise only the newest opens, and only while nothing runs. */
+  const [open, setOpen] = useState<Record<string, boolean>>({});
+  const collapsedAt = (j: JobView, i: number) => !(open[j.jobId] ?? (active.length === 0 && i === 0));
+
+  // After a card goes, focus the next card (else the previous one, else the gallery tab), never <body>.
+  const dismiss = (ids: string[]) => {
+    const cards = [...(rootRef.current?.querySelectorAll<HTMLElement>("[data-job-id]") ?? [])];
+    const gone = new Set(ids);
+    const first = cards.findIndex((c) => gone.has(c.dataset.jobId ?? ""));
+    const rest = cards.filter((c) => !gone.has(c.dataset.jobId ?? ""));
+    const next = rest.find((c) => cards.indexOf(c) > first) ?? [...rest].reverse().find((c) => cards.indexOf(c) < first);
+    onDismiss(ids);
+    requestAnimationFrame(() => {
+      const target = next?.querySelector<HTMLElement>(".job-card__row, .job-card__dismiss, .btn") ?? galleryTab();
+      target?.focus();
+    });
+  };
+
+  if (!jobs.length) return null;
+
+  const card = (j: JobView, i: number, list: JobView[]) => {
+    const fin = !isJobActive(j);
+    const prev = !fin && i > 0 ? numbers.current.get(list[i - 1].jobId) : undefined;
+    return (
+      <div key={j.jobId} data-job-id={j.jobId} className="jobs__item">
+        <JobCard
+          job={j}
+          number={numbers.current.get(j.jobId)}
+          count={jobs.length}
+          queuedAfter={prev}
+          sealed={j.destination === "vault" && !vaultUnlocked}
+          podMode={podMode}
+          gpuNote={gpuNoteFor?.(j) ?? null}
+          onCancel={() => onCancel(j.jobId)}
+          onDismiss={fin ? () => dismiss([j.jobId]) : undefined}
+          onOpenImage={onOpenImage}
+          collapsed={fin && collapsedAt(j, i)}
+          onToggle={fin ? () => setOpen((o) => ({ ...o, [j.jobId]: collapsedAt(j, i) })) : undefined}
+          guardUntil={guardUntil}
+        />
+      </div>
+    );
+  };
+
+  return (
+    <section className="jobs" aria-label="Jobs" ref={rootRef}>
+      {active.map((j, i) => card(j, i, active))}
+      {finished.length > 0 && (
+        <div className="jobs__finished" role="group" aria-label="Finished jobs">
+          {finished.length >= 2 && (
+            <div className="jobs__finished-head">
+              <span className="hint">{finished.length} finished</span>
+              <button type="button" className="btn btn--ghost btn--sm" onClick={() => dismiss(finished.map((j) => j.jobId))}>
+                <Icon name="x" size={13} /> Clear finished
+              </button>
+            </div>
+          )}
+          <div className="jobs__finished-list">{finished.map((j, i) => card(j, i, finished))}</div>
+        </div>
+      )}
+    </section>
   );
 }
 

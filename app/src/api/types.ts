@@ -385,7 +385,10 @@ export interface MigrationProgress {
 }
 
 /** Vault error codes: the backend's error strings start with `"<CODE>: "`. */
-export type VaultErrorCode = "WRONG_PASSWORD" | "WEAK_PASSWORD" | "VAULT_EXISTS" | "NO_VAULT" | "VAULT_LOCKED";
+export type VaultErrorCode = "WRONG_PASSWORD" | "WEAK_PASSWORD" | "VAULT_EXISTS" | "NO_VAULT" | "VAULT_LOCKED" | "CONFIRM_REQUIRED" | "VAULT_BUSY";
+
+/** The word the user types to erase the vault (`vault_erase`, UI-059); the core checks it too. */
+export const VAULT_ERASE_WORD = "erase";
 
 export const VAULT_PASSWORD_MIN = 8;
 export const VAULT_AUTOLOCK_MIN = 1;

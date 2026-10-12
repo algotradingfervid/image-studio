@@ -1,0 +1,291 @@
+/* Job cards, header GPU controls and toasts (agent C, UI review fixes 2026-10-12). Imported from main.tsx after styles.css. */
+
+/* ------------------------------------------------------------ job list (UI-012) */
+
+.jobs__item {
+  min-width: 0;
+}
+
+/* Finished jobs: below the running ones, in a capped scroll area so they never push the gallery
+   or a new job off-screen. */
+.jobs__finished {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.jobs__finished-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 28px;
+}
+
+.jobs__finished-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+  max-height: 240px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* One-line summary of a finished job: the row expands it; Dismiss sits apart at the far end. */
+.job-card--collapsed {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 4px 4px 6px;
+  border-radius: var(--r);
+  box-shadow: none;
+  animation: none;
+}
+
+.job-card__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 32px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.job-card__row:hover {
+  background: var(--panel-2);
+}
+
+.job-card__row .job-card__status {
+  flex: 0 1 auto;
+}
+
+.job-card__row .job-card__title {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  overflow-wrap: normal;
+}
+
+.job-card__summary {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.job-card__chev {
+  flex: none;
+  color: var(--text-2);
+}
+
+.job-card__collapse .icon {
+  transform: rotate(180deg);
+}
+
+/* Dismiss / Collapse: 32 px targets (44 px on touch), away from where Cancel was (UI-056). */
+.job-card__dismiss,
+.job-card__collapse {
+  flex: none;
+  width: 32px;
+  height: 32px;
+}
+
+@media (pointer: coarse) {
+  .job-card__dismiss,
+  .job-card__collapse,
+  .job-card__row {
+    min-width: 44px;
+    min-height: 44px;
+  }
+}
+
+/* "Saved to vault" in words next to the status, not only an 11 px glyph (UI-065). */
+.job-card__badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 999px;
+  border: 1px solid var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent-hi);
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------- header GPU pills (UI-016 / UI-058 / UI-006) */
+
+.gpu-pill {
+  position: relative;
+}
+
+/* Shrink weights must add up to at least 1, or flexbox absorbs only part of the overflow and the
+   pills spill left over the vault pill (two running pills at 0.25 each did). A running pill still
+   gives way last. */
+.toolbar .gpu-pills .gpu-pill {
+  flex-shrink: 4;
+}
+
+.toolbar .gpu-pills .gpu-pill--running {
+  flex-shrink: 1;
+}
+
+.gpu-pill__ind {
+  display: inline-flex;
+  flex: none;
+}
+
+/* The pill's text is the button that opens its details. */
+.gpu-pill .gpu-pill__text {
+  display: inline-block;
+  min-width: 0;
+  height: 24px;
+  padding: 0 2px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: 24px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.gpu-pill__word {
+  color: inherit;
+}
+
+.gpu-pill__btn[aria-disabled="true"] {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* Start / Stop / Lock: 24 px tall visuals with a 44 px tall hit area (UI-016). */
+.gpu-pill__btn,
+.vault-pill__btn {
+  position: relative;
+}
+
+.gpu-pill__btn::after,
+.vault-pill__btn::after {
+  content: "";
+  position: absolute;
+  inset: -10px -3px;
+}
+
+.gpu-pill__pop {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 30;
+  width: 300px;
+  max-width: calc(100vw - 24px);
+  padding: 10px 12px;
+  border-radius: var(--r);
+  background: var(--panel-2);
+  box-shadow: var(--shadow-pop);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 450;
+  white-space: normal;
+}
+
+.gpu-pill__pop[hidden] {
+  display: none;
+}
+
+.gpu-pill__pop-title {
+  margin: 0 0 6px;
+  font-weight: 650;
+}
+
+.gpu-pill__pop dl {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+}
+
+.gpu-pill__pop dl > div {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.gpu-pill__pop dt {
+  color: var(--text-2);
+}
+
+.gpu-pill__pop dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.vault-pill--locked {
+  border-color: var(--line-2);
+  background: rgba(0, 0, 0, 0.25);
+  color: var(--text-2);
+}
+
+/* Narrower windows: price, elapsed time, cost and the phase go to the details popover; the
+   profile and its state word stay (UI-058). */
+@media (max-width: 1100px) {
+  .gpu-pills .gpu-pill__gpu,
+  .gpu-pills .gpu-pill__phase,
+  .gpu-pills .gpu-pill__rate,
+  .gpu-pills .gpu-pill__elapsed,
+  .gpu-pills .gpu-pill__cost {
+    display: none;
+  }
+}
+
+/* ~800-900 px: one stable header. Tabs keep their labels (their icons go), the pills keep their
+   words and the Start / Stop / Lock words (their icons go), whatever runs (UI-016). */
+@media (max-width: 900px) {
+  .toolbar .tab {
+    padding: 0 10px;
+  }
+
+  .toolbar .tab > .icon {
+    display: none;
+  }
+
+  .toolbar .gpu-pill__btn > .icon,
+  .toolbar .vault-pill__btn > .icon {
+    display: none;
+  }
+
+  .toolbar .gpu-pill__btn,
+  .toolbar .vault-pill__btn {
+    padding: 0 9px;
+  }
+
+  .toolbar .gpu-pill {
+    gap: 5px;
+    padding-left: 9px;
+  }
+
+  .toolbar .vault-pill__text {
+    display: none;
+  }
+
+  /* The browser-mock badge is for development only; its room goes to the status pills. */
+  .toolbar .badge--mock {
+    display: none;
+  }
+}

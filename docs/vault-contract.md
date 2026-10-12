@@ -44,6 +44,7 @@ get `vault: false`.
 | `vault_lock` | – | `VaultStatus` | |
 | `vault_change_password` | `{ oldPassword, newPassword }` | `VaultStatus` | `WRONG_PASSWORD`, `WEAK_PASSWORD`, `VAULT_LOCKED` |
 | `vault_set_auto_lock` | `{ minutes }` | `VaultStatus` | |
+| `vault_erase` | `{ confirm }` (the word the user typed; must be `"erase"`) | `VaultStatus` (no vault: `exists: false`) — locks, deletes `vault.json` first (without the wrapped private key nothing can be decrypted again), then every item, blob and the migration journal; emits `vault-update`. Works locked or unlocked, needs no password, decrypts and returns nothing. The only way out of a forgotten password (UI-059) | `CONFIRM_REQUIRED` (anything but `"erase"`), `NO_VAULT`, `VAULT_BUSY` (a migration or a move into/out of the vault is running; the UI says "Wait for the move into the vault to finish.") |
 | `vault_touch` | – | – (resets the inactivity timer; UI calls it on user input, throttled to once per 30 s) | |
 | `list_vault_items` | – | `ImageRecord[]` newest first | `VAULT_LOCKED` |
 | `delete_vault_item` | `{ id }` | – | `VAULT_LOCKED` |
@@ -57,7 +58,7 @@ get `vault: false`.
 
 ## Events
 
-- `vault-update` → `VaultStatus` on create / unlock / lock / auto-lock / password change and
+- `vault-update` → `VaultStatus` on create / unlock / lock / auto-lock / password change / erase and
   whenever vault items change, including when a vault job's output is sealed (UI re-fetches
   `list_vault_items` when unlocked).
 - `vault-migration` → `MigrationProgress` during create/resume. `done`/`total` count every

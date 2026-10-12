@@ -112,7 +112,7 @@ function Shell() {
 
   return (
     <div className="app">
-      <header className="toolbar" data-tauri-drag-region>
+      <header className="toolbar" aria-label="Image Studio" data-tauri-drag-region>
         <div className="brand" data-tauri-drag-region>
           <span className="brand__mark" aria-hidden />
           <span className="brand__name" title="Image Studio">Image Studio</span>
@@ -148,20 +148,26 @@ function Shell() {
           ))}
         </nav>
         <div className="toolbar__end" data-tauri-drag-region>
-          {vault.unlocked && (
-            <div className="vault-pill" role="status" aria-label="Vault unlocked">
-              <Icon name="lockOpen" size={13} />
-              <span className="vault-pill__text">
-                Vault<span className="vault-pill__more"> unlocked</span>
+          {/* UI-064: the pill stays while a vault exists — "Locked" with Unlock after a lock — and its
+              one button keeps focus through Lock ⇄ Unlock (UI-006); the change is announced. */}
+          {(vault.unlocked || vault.exists) && (
+            <div className={`vault-pill ${vault.unlocked ? "" : "vault-pill--locked"}`} role="group" aria-label="Vault">
+              <Icon name={vault.unlocked ? "lockOpen" : "lock"} size={13} />
+              <span className="vault-pill__text" aria-hidden>
+                Vault<span className="vault-pill__more"> {vault.unlocked ? "unlocked" : "locked"}</span>
               </span>
               <button
                 type="button"
                 className="btn btn--sm vault-pill__btn"
-                onClick={() => void vault.lock()}
-                title="Lock the vault now — its items disappear until you unlock"
+                onClick={() => (vault.unlocked ? void vault.lock() : vault.requestUnlock())}
+                aria-label={vault.unlocked ? "Lock the vault" : "Unlock the vault"}
+                title={vault.unlocked ? "Lock the vault now — its items disappear until you unlock" : "Unlock the vault to see its items"}
               >
-                <Icon name="lock" size={13} /> Lock
+                <Icon name={vault.unlocked ? "lock" : "unlock"} size={13} /> {vault.unlocked ? "Lock" : "Unlock"}
               </button>
+              <span className="visually-hidden" role="status">
+                {vault.unlocked ? "Vault unlocked" : vault.lockReason ? "Vault locked" : ""}
+              </span>
             </div>
           )}
           <GpuPills />
@@ -211,20 +217,29 @@ function Shell() {
         </div>
       )}
 
-      {TABS.map((t) => (
-        <section
-          key={t.id}
-          id={`panel-${t.id}`}
-          role="tabpanel"
-          aria-labelledby={`tab-${t.id}`}
-          className="screen"
-          hidden={tab !== t.id}
-        >
-          {t.id === "create" && <CreateScreen active={tab === "create"} onNavigate={setTab} />}
-          {t.id === "models" && <ModelsScreen active={tab === "models"} />}
-          {t.id === "settings" && <SettingsScreen />}
-        </section>
-      ))}
+      {/* The one main landmark, named after the open tab; the toolbar above is the only banner. Each
+          screen has an h1: Models and Settings show theirs, Create's is visually hidden (UI-042). */}
+      <main className="screens" aria-labelledby={`tab-${tab}`}>
+        {TABS.map((t) => (
+          <section
+            key={t.id}
+            id={`panel-${t.id}`}
+            role="tabpanel"
+            aria-labelledby={`tab-${t.id}`}
+            className="screen"
+            hidden={tab !== t.id}
+          >
+            {t.id === "create" && (
+              <>
+                <h1 className="visually-hidden">Create</h1>
+                <CreateScreen active={tab === "create"} onNavigate={setTab} />
+              </>
+            )}
+            {t.id === "models" && <ModelsScreen active={tab === "models"} />}
+            {t.id === "settings" && <SettingsScreen />}
+          </section>
+        ))}
+      </main>
     </div>
   );
 }

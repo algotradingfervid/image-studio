@@ -2,6 +2,11 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import "./styles.css";
+// Per-area sheets (UI review fixes) load after the base sheet so they can override it.
+import "./styles/models.css";
+import "./styles/vault.css";
+import "./styles/jobs.css";
+import "./styles/viewer.css";
 import { logUi } from "./api";
 
 // Uncaught UI errors go to the diagnostics log (~/Library/Logs/Image Studio/app.log).

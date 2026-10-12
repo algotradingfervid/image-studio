@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
-import { requestModelFocus } from "../models/ModelsScreen";
+import { LORA_LIBRARY_TARGET, requestModelFocus } from "../models/ModelsScreen";
 import * as api from "../../api";
 import {
   DENOISE_DEFAULT,
@@ -55,7 +55,7 @@ import {
 } from "./Controls";
 import { countGallery, Gallery, totalFor, type GalleryTotals } from "./Gallery";
 import { GalleryPicker } from "./GalleryPicker";
-import { JobCard, type JobView } from "./JobCard";
+import { JobList, type JobView } from "./JobCard";
 import { Lightbox } from "./Lightbox";
 import { VideoPanel, type VideoPanelHandle } from "./VideoPanel";
 import { MigrationView, SaveToSwitch, VaultCreate, VaultLockScreen } from "./VaultViews";
@@ -66,8 +66,10 @@ const MODE_KEY = "imagestudio.createMode";
 /** The user's last Save-to choice (UX-009: it never changes by itself). */
 const SAVE_TO_KEY = "imagestudio.saveTo";
 const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp|tiff?|heic)$/i;
-/** A second Generate within this long of the last one is ignored (double-click guard). */
-const GENERATE_GUARD_MS = 800;
+/** A second Generate within this long of the last one is ignored (double-click guard; 1.5 s covers a hesitant double tap, UI-078). */
+const GENERATE_GUARD_MS = 1500;
+/** The same job sent again within this long gets a "Queued again · Undo" notice (UI-078). */
+const REPEAT_WINDOW_MS = 4000;
 /** The non-vault Image form draft (UX-058): restored after a reload, never holds vault content. */
 const DRAFT_KEY = "imagestudio.draft.image";
 interface ImageDraft {
@@ -156,7 +158,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   // Pod backend with the GPU not starting/running: Generate starts it first (after the start confirmation).
   const startsGpu = gpu.profiles.image.needsStart;
   const imageModels = lib.imageModels;
-  const { notice, show: showNotice, clear: clearNotice } = usePanelNotice();
+  const { notice, show: showNotice, clear: clearNotice, hold: holdNotice } = usePanelNotice();
 
   // ---------- Image | Video ----------
   const [mode, setModeState] = useState<CreateMode>(readMode);
@@ -225,6 +227,13 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   const startFileInput = useRef<HTMLInputElement>(null);
   const inFlight = useRef(false);
   const lastSubmit = useRef(0);
+  /** The last queued job's settings, to spot an accidental repeat (UI-078). */
+  const lastQueued = useRef<{ key: string; at: number } | null>(null);
+  const formRef = useRef<HTMLFormElement>(null);
+  /** "Add LoRA": where focus goes when the link dialog closes (its menu item is gone, UI-006). */
+  const loraAddRef = useRef<HTMLButtonElement>(null);
+  /** The form's scroll position while the link dialog is open, restored on close (UI-036). */
+  const loraLinkScroll = useRef(0);
 
   const model = imageModels.find((m) => m.id === modelId);
   const maxRefs = model?.maxReferences ?? 0;
@@ -836,33 +845,35 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
 
   // ---------- generate ----------
   const imageGpuStatus = gpu.profiles.image.state?.status;
-  const blocker = !model
-    ? "Choose a model"
-    : !configured
-      ? "Connect RunPod in Settings first"
-      : !model.installed
-        ? `${model.name} isn't installed`
-        : gpu.podMode && imageGpuStatus === "stopping"
-          ? "The image GPU is stopping — Generate is available again once it has stopped"
-          : !prompt.trim()
-            ? "Write a prompt"
-            : advBlocker(adv, model)
-              ? advBlocker(adv, model)
-              : refBusy
-                ? "Adding references…"
-                : startBusy
-                  ? "Adding the start image…"
-                  : null;
+  // Every reason Generate can't run, in form order (UI-009): the button is aria-disabled while any is
+  // left, the hint lists them all, and a click goes to the first one without starting the GPU.
+  const advProblem = advBlocker(adv, model);
+  const blockers = !model
+    ? ["Choose a model"]
+    : [
+        !configured ? "Connect RunPod in Settings first" : "",
+        !model.installed ? `${model.name} isn't installed` : "",
+        gpu.podMode && imageGpuStatus === "stopping" ? "The image GPU is stopping — Generate is available again once it has stopped" : "",
+        !prompt.trim() ? "Write a prompt" : "",
+        advProblem ?? "",
+        refBusy ? "Adding references…" : "",
+        startBusy ? "Adding the start image…" : "",
+      ].filter(Boolean);
+  const blocker = blockers[0] ?? null;
 
   const doGenerate = async () => {
     // Double-click guard (UX-011): ignore while a submit is in flight and just after one.
     if (submitting || inFlight.current || Date.now() - lastSubmit.current < GENERATE_GUARD_MS) return;
     if (blocker) {
-      if (!prompt.trim() && blocker === "Write a prompt") {
+      if (model && !model.installed) {
+        formRef.current?.querySelector<HTMLElement>(".model-missing .link-btn")?.focus();
+      } else if (!prompt.trim()) {
         setPromptError(true);
         promptRef.current?.focus();
-      } else if (blocker.startsWith("Fix ")) setAdvOpen(true);
-      else toast.info(blocker);
+      } else if (advProblem) {
+        setAdvOpen(true);
+        requestAnimationFrame(() => formRef.current?.querySelector<HTMLElement>('.advanced [aria-invalid="true"]')?.focus());
+      } else toast.info(blocker);
       return;
     }
     if (!model) return;
@@ -894,6 +905,18 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
       try {
         const { jobId } = await api.generate(input);
         const meta = { modelName: model.name, prompt: input.prompt, destination: saveTo };
+        // The same settings again within a few seconds: most likely a double tap, so say so with Undo (UI-078).
+        const key = JSON.stringify({ ...input, seed: input.seed ?? "random" });
+        const prev = lastQueued.current;
+        lastQueued.current = { key, at: Date.now() };
+        if (prev && prev.key === key && Date.now() - prev.at < REPEAT_WINDOW_MS)
+          showNotice({
+            tone: "info",
+            title: "Queued again — same settings as the job before",
+            detail: "Undo cancels this copy; the first job keeps running.",
+            undo: () => void cancelJob(jobId),
+            vault: saveTo === "vault",
+          });
         setJobs((js) =>
           js.some((j) => j.jobId === jobId)
             ? js.map((j) => (j.jobId === jobId ? { ...j, ...meta } : j))
@@ -1044,8 +1067,17 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     requestAnimationFrame(() => promptRef.current?.focus());
   };
 
+  /** The General header count follows the grid at once; the background recount then confirms it (UI-080). */
+  const bumpGeneralTotals = (rec: ImageRecord | undefined, by: 1 | -1) => {
+    if (!rec) return;
+    setGeneralTotals((t) =>
+      t ? { items: Math.max(0, t.items + by), images: Math.max(0, t.images + (isVideo(rec) ? 0 : by)), videos: Math.max(0, t.videos + (isVideo(rec) ? by : 0)) } : t,
+    );
+  };
+
   /** An item left the visible list (deleted, or moved to the other tab): show its neighbour. */
   const onRemoved = (id: string) => {
+    if (galleryTab === "general") bumpGeneralTotals(imagesRef.current.find((x) => x.id === id), -1);
     const i = shown.findIndex((x) => x.id === id);
     const neighbour = i >= 0 ? (shown[i + 1] ?? shown[i - 1]) : undefined;
     setLightboxId((cur) => (cur === id ? (neighbour?.id ?? null) : cur));
@@ -1061,6 +1093,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   /** A vault item moved to General: slot it into the loaded General list by date. */
   const onMovedToGeneral = (rec: ImageRecord) => {
     onRemoved(rec.id);
+    bumpGeneralTotals(rec, 1);
     const list = imagesRef.current;
     if (list.some((x) => x.id === rec.id)) return;
     const t = Date.parse(rec.createdAt);
@@ -1069,6 +1102,12 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     const next = at < 0 ? [...list, rec] : [...list.slice(0, at), rec, ...list.slice(at)];
     imagesRef.current = next;
     setImages(next);
+  };
+
+  /** After the LoRA link dialog: the form is where it was before (focus return must not scroll it, UI-036). */
+  const restoreLoraLinkScroll = () => {
+    const top = loraLinkScroll.current;
+    requestAnimationFrame(() => panelScrollRef.current?.scrollTo({ top }));
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
@@ -1141,18 +1180,15 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
 
   const sizeAspect = startActive && startImage?.w && startImage.h ? ratioLabel(startImage.w, startImage.h) : null;
   const sizeHighlight = sizeAspect && ASPECTS.some((a) => a.key === sizeAspect) ? sizeAspect : undefined;
-  const footHint =
-    blocker === "Write a prompt"
-      ? "Write a prompt to generate."
-      : blocker
-        ? blocker
-        : activeJobs
-          ? `${plural(activeJobs, "job")} running`
-          : startsGpu
-            ? `Starts the GPU pod first (${gpu.startTarget}, ${gpu.costLabel}; a few minutes). It auto-stops after ${gpu.idleMinutes} idle min.`
-            : gpu.podMode
-              ? `Runs on your GPU pod (${gpu.gpuName}, ${gpu.costLabel}).`
-              : "Each image is one RunPod job.";
+  const footHint = blocker
+    ? `${blockers.join(" · ")}${blockers.length === 1 && blocker === "Write a prompt" ? " to generate" : ""}.`.replace(/(…|\.)\.$/, "$1")
+    : activeJobs
+      ? `${plural(activeJobs, "job")} running`
+      : startsGpu
+        ? `Starts the GPU pod first (${gpu.startTarget}, ${gpu.costLabel}; a few minutes). It auto-stops after ${gpu.idleMinutes} idle min.`
+        : gpu.podMode
+          ? `Runs on your GPU pod (${gpu.gpuName}, ${gpu.costLabel}).`
+          : "Each image is one RunPod job.";
 
   return (
     <div className="create">
@@ -1171,6 +1207,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         history={images}
       />
       <form
+        ref={formRef}
         className="panel"
         aria-label="Generation settings"
         hidden={mode !== "image"}
@@ -1190,7 +1227,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
               <ModelPicker models={imageModels} value={modelId} onChange={selectModel} />
             )}
             {model && !model.installed && (
-              <div className="notice notice--inline">
+              <div className="notice notice--inline model-missing">
                 <Icon name="cube" />
                 <span>
                   {model.task ? `${model.name} is downloading to your volume.` : `${model.name} isn't on your RunPod volume yet.`}
@@ -1293,8 +1330,16 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
               onChange={setLoraPicks}
               onRemoved={onLoraRemoved}
               onToggleWord={toggleWord}
-              onOpenLibrary={() => onNavigate("models")}
-              onAddFromLink={() => setLoraLinkOpen(true)}
+              onOpenLibrary={() => {
+                // Models scrolls to and focuses its LoRA library section (UI-037; contract in ModelsScreen).
+                requestModelFocus(LORA_LIBRARY_TARGET);
+                onNavigate("models");
+              }}
+              onAddFromLink={() => {
+                loraLinkScroll.current = panelScrollRef.current?.scrollTop ?? 0;
+                setLoraLinkOpen(true);
+              }}
+              addButtonRef={loraAddRef}
             />
           </section>
 
@@ -1327,14 +1372,9 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         </div>
 
         <div className="panel__foot">
-          <PanelNoticeView notice={notice} onDismiss={clearNotice} />
+          <PanelNoticeView notice={notice} onDismiss={clearNotice} onHold={holdNotice} />
           {saveToSwitch}
-          <button
-            type="submit"
-            className="btn btn--generate"
-            disabled={submitting || (!!blocker && blocker !== "Write a prompt" && !blocker.startsWith("Fix "))}
-            aria-describedby="gen-hint"
-          >
+          <button type="submit" className="btn btn--generate" disabled={submitting} aria-disabled={!!blocker || undefined} aria-describedby="gen-hint">
             <Icon name="spark" size={18} />
             <span>
               {submitting
@@ -1346,31 +1386,22 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
               <kbd>↵</kbd>
             </span>
           </button>
-          <p id="gen-hint" className={`hint panel__hint ${blocker && blocker !== "Write a prompt" ? "panel__hint--block" : ""}`}>
+          <p id="gen-hint" className={`hint panel__hint ${blocker ? "panel__hint--block" : ""}`}>
             {footHint}
           </p>
         </div>
       </form>
 
-      <main className="canvas" ref={scrollRef} aria-label="Results">
-        {jobs.length > 0 && (
-          <div className="jobs" aria-label="Generations in progress">
-            {jobs.map((j, i) => (
-              <JobCard
-                key={j.jobId}
-                job={j}
-                index={i}
-                count={jobs.length}
-                sealed={j.destination === "vault" && !vault.unlocked}
-                podMode={gpu.podMode}
-                gpuNote={j.kind === "video" && (j.status === "queued" || j.status === "starting") ? videoGpuNote : null}
-                onCancel={() => cancelJob(j.jobId)}
-                onDismiss={() => setJobs((js) => js.filter((x) => x.jobId !== j.jobId))}
-                onOpenImage={openFromJob}
-              />
-            ))}
-          </div>
-        )}
+      <section className="canvas" ref={scrollRef} aria-label="Results">
+        <JobList
+          jobs={jobs}
+          vaultUnlocked={vault.unlocked}
+          podMode={gpu.podMode}
+          gpuNoteFor={(j) => (j.kind === "video" && (j.status === "queued" || j.status === "starting") ? videoGpuNote : null)}
+          onCancel={(id) => void cancelJob(id)}
+          onDismiss={(ids) => setJobs((js) => js.filter((x) => !ids.includes(x.jobId)))}
+          onOpenImage={openFromJob}
+        />
         <div className="canvas__head">
           <h2 className="canvas__title">Gallery</h2>
           <GalleryTabs value={galleryTab} onChange={setGalleryTab} unlocked={vault.unlocked} exists={vault.exists} />
@@ -1445,7 +1476,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
             </>
           )}
         </div>
-      </main>
+      </section>
 
       <Lightbox
         items={shown}
@@ -1485,10 +1516,13 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         preferVault={saveTo === "vault"}
         modelNames={modelNames}
         currentId={startImage?.sourceId}
+        returnFocusRef={promptRef}
         onClose={() => setStartPickerOpen(false)}
         onPick={(rec) => {
           setStartPickerOpen(false);
           startFromRecord(rec);
+          // The picker's opener ("From gallery") is replaced by the thumbnail: continue at the prompt (UI-006).
+          requestAnimationFrame(() => promptRef.current?.focus());
         }}
       />
 
@@ -1498,6 +1532,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         purpose="reference"
         preferVault={saveTo === "vault"}
         modelNames={modelNames}
+        returnFocusRef={promptRef}
         onClose={() => setRefPickerOpen(false)}
         onPick={(rec) => void addRefFromGallery(rec)}
       />
@@ -1505,9 +1540,14 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
       <AddLoraLinkDialog
         open={loraLinkOpen}
         model={model}
-        onClose={() => setLoraLinkOpen(false)}
+        returnFocusRef={loraAddRef}
+        onClose={() => {
+          setLoraLinkOpen(false);
+          restoreLoraLinkScroll();
+        }}
         onAdded={(l) => {
           setLoraLinkOpen(false);
+          restoreLoraLinkScroll();
           pendingLoras.current.add(l.id);
           showNotice({
             tone: "ok",

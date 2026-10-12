@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useRef, useState, type DragEvent, type FormEvent, type ReactNode, type RefObject } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type DragEvent, type FormEvent, type ReactNode, type RefObject } from "react";
 import * as api from "../../api";
 import { DENOISE_MAX, DENOISE_MIN, DENOISE_STEP, fileSrc, isTaskActive, type Lora, type ModelView, type ResolvedLora } from "../../api";
 import { Dialog } from "../../components/Dialog";
@@ -138,34 +138,94 @@ export interface PanelNotice {
   detail?: string;
   /** Shows an Undo button; the notice closes when it's used. */
   undo?: () => void;
-  /** Stays until dismissed (otherwise hides after 8 s). */
+  /** Stays until dismissed (otherwise hides after its reading time, see `noticeMs`). */
   sticky?: boolean;
   /** Mentions vault content: cleared the moment the vault locks. */
   vault?: boolean;
 }
 
+/** Reading time (UI-022): about 1 s per 4 words, at least 6 s, and at least 10 s with an Undo. */
+export function noticeMs(n: PanelNotice): number {
+  const words = `${n.title} ${n.detail ?? ""}`.trim().split(/\s+/).length;
+  return Math.max(n.undo ? 10_000 : 6_000, words * 250);
+}
+
 export function usePanelNotice() {
   const [notice, setNotice] = useState<PanelNotice | null>(null);
   const timer = useRef<number | null>(null);
-  const clear = useCallback(() => {
+  /** Time left on the shown notice, and when its timer last (re)started; null when sticky. */
+  const left = useRef<number | null>(null);
+  const since = useRef(0);
+  const held = useRef(false);
+  const stop = () => {
     if (timer.current) window.clearTimeout(timer.current);
     timer.current = null;
+  };
+  const run = () => {
+    stop();
+    if (left.current == null || held.current) return;
+    since.current = Date.now();
+    timer.current = window.setTimeout(() => {
+      timer.current = null;
+      left.current = null;
+      setNotice(null);
+    }, left.current);
+  };
+  const clear = useCallback(() => {
+    stop();
+    left.current = null;
+    held.current = false;
     setNotice(null);
   }, []);
   const show = useCallback((n: PanelNotice) => {
-    if (timer.current) window.clearTimeout(timer.current);
-    timer.current = n.sticky ? null : window.setTimeout(() => setNotice(null), 8000);
+    left.current = n.sticky ? null : noticeMs(n);
+    held.current = false;
+    run();
     setNotice(n);
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  /** Pointer over / focus inside the notice: the countdown pauses, and resumes with the time it had left. */
+  const hold = useCallback((on: boolean) => {
+    if (held.current === on) return;
+    if (on && timer.current && left.current != null) left.current = Math.max(0, left.current - (Date.now() - since.current));
+    held.current = on;
+    if (on) stop();
+    else run();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => () => void (timer.current && window.clearTimeout(timer.current)), []);
-  return { notice, show, clear };
+  return { notice, show, clear, hold };
 }
 
-export function PanelNoticeView({ notice, onDismiss }: { notice: PanelNotice | null; onDismiss: () => void }) {
+/** Undo / Dismiss remove the button that had focus: hand it to the panel's Generate button (UI-006). */
+function focusGenerate(from: HTMLElement) {
+  const gen = from.closest(".panel__foot")?.querySelector<HTMLElement>(".btn--generate");
+  requestAnimationFrame(() => gen?.focus({ preventScroll: true }));
+}
+
+export function PanelNoticeView({
+  notice,
+  onDismiss,
+  onHold,
+}: {
+  notice: PanelNotice | null;
+  onDismiss: () => void;
+  /** Pause (true) / resume (false) the notice's countdown while the pointer or focus is on it (UI-022). */
+  onHold?: (held: boolean) => void;
+}) {
   return (
+    // In the footer's flow above Save to, so it pushes the form up instead of covering it (UI-022).
     <div className="panel-notice-slot" role="status" aria-live="polite">
       {notice && (
-        <div className={`panel-notice panel-notice--${notice.tone}`}>
+        <div
+          className={`panel-notice panel-notice--${notice.tone}`}
+          onMouseEnter={() => onHold?.(true)}
+          onMouseLeave={(e) => {
+            if (!e.currentTarget.contains(document.activeElement)) onHold?.(false);
+          }}
+          onFocus={() => onHold?.(true)}
+          onBlur={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null) && !e.currentTarget.matches(":hover")) onHold?.(false);
+          }}
+        >
           <Icon name={notice.tone === "warn" ? "alert" : notice.tone === "ok" ? "check" : notice.title.startsWith("Vault") ? "lock" : "info"} size={14} />
           <div className="panel-notice__body">
             <span className="panel-notice__title">{notice.title}</span>
@@ -175,7 +235,8 @@ export function PanelNoticeView({ notice, onDismiss }: { notice: PanelNotice | n
             <button
               type="button"
               className="btn btn--sm panel-notice__undo"
-              onClick={() => {
+              onClick={(e) => {
+                focusGenerate(e.currentTarget);
                 notice.undo?.();
                 onDismiss();
               }}
@@ -183,7 +244,15 @@ export function PanelNoticeView({ notice, onDismiss }: { notice: PanelNotice | n
               <Icon name="restore" size={13} /> Undo
             </button>
           )}
-          <button type="button" className="icon-btn icon-btn--sm" aria-label="Dismiss" onClick={onDismiss}>
+          <button
+            type="button"
+            className="icon-btn icon-btn--sm"
+            aria-label="Dismiss"
+            onClick={(e) => {
+              focusGenerate(e.currentTarget);
+              onDismiss();
+            }}
+          >
             <Icon name="x" size={13} />
           </button>
         </div>
@@ -445,6 +514,19 @@ export function StartImage({
 }) {
   const [over, setOver] = useState(false);
   const id = useId();
+  const rootRef = useRef<HTMLDivElement>(null);
+  // Remove unmounts the focused button: focus the first source button of the empty state (UI-006).
+  const refocus = useRef(false);
+  const remove = () => {
+    refocus.current = true;
+    window.setTimeout(() => (refocus.current = false), 500);
+    onRemove();
+  };
+  useEffect(() => {
+    if (!refocus.current || image) return;
+    refocus.current = false;
+    rootRef.current?.querySelector<HTMLElement>("button:not([disabled])")?.focus();
+  }, [image]);
   const onDrop = (e: DragEvent) => {
     e.preventDefault();
     setOver(false);
@@ -463,7 +545,7 @@ export function StartImage({
   if (!image) {
     if (onPickGallery) {
       return (
-        <div className={`dropzone dropzone--single start-sources ${over || dragActive ? "is-over" : ""}`} {...dragProps}>
+        <div ref={rootRef} className={`dropzone dropzone--single start-sources ${over || dragActive ? "is-over" : ""}`} {...dragProps}>
           <div className="start-sources__btns">
             <button type="button" className="btn btn--sm" onClick={onPickGallery} disabled={busy}>
               <Icon name="image" size={14} /> From gallery
@@ -477,7 +559,7 @@ export function StartImage({
       );
     }
     return (
-      <div className={`dropzone dropzone--single ${over || dragActive ? "is-over" : ""}`} {...dragProps}>
+      <div ref={rootRef} className={`dropzone dropzone--single ${over || dragActive ? "is-over" : ""}`} {...dragProps}>
         <button type="button" className="dropzone__add" onClick={onPick} disabled={busy}>
           <Icon name={busy ? "refresh" : "upload"} className={busy ? "spin" : ""} />
           <span>{busy ? "Adding…" : "Drop, paste (⌘V) or choose an image"}</span>
@@ -487,11 +569,11 @@ export function StartImage({
   }
 
   return (
-    <div className={`start-image ${over || dragActive ? "is-over" : ""}`} {...dragProps}>
+    <div ref={rootRef} className={`start-image ${over || dragActive ? "is-over" : ""}`} {...dragProps}>
       <figure className="ref-thumb start-image__thumb">
         <img src={fileSrc(image.thumbPath)} alt="Start image" />
         {!onPickGallery && (
-          <button type="button" className="ref-thumb__remove" aria-label="Remove start image" title="Remove start image" onClick={onRemove}>
+          <button type="button" className="ref-thumb__remove" aria-label="Remove start image" title="Remove start image" onClick={remove}>
             <Icon name="x" size={12} />
           </button>
         )}
@@ -539,7 +621,7 @@ export function StartImage({
             <button type="button" className="link-btn" onClick={onPick} disabled={busy}>
               Browse computer
             </button>
-            <button type="button" className="link-btn start-image__remove" onClick={onRemove} disabled={busy} aria-label="Remove start image">
+            <button type="button" className="link-btn start-image__remove" onClick={remove} disabled={busy} aria-label="Remove start image">
               <Icon name="x" size={12} /> Remove
             </button>
           </div>
@@ -566,6 +648,7 @@ export function LoraPicker({
   onToggleWord,
   onOpenLibrary,
   onAddFromLink,
+  addButtonRef,
 }: {
   model: ModelView | undefined;
   library: Lora[];
@@ -580,10 +663,15 @@ export function LoraPicker({
   onOpenLibrary: () => void;
   /** "Add LoRA from link…": opens the link dialog. */
   onAddFromLink: () => void;
+  /** The "Add LoRA" button, for callers that return focus to it (the link dialog, UI-006). */
+  addButtonRef?: RefObject<HTMLButtonElement | null>;
 }) {
   const [open, setOpen] = useState(false);
+  /** The menu opens upward when it would run past the bottom of the scroll area (under the footer, UI-035). */
+  const [up, setUp] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
-  const btnRef = useRef<HTMLButtonElement>(null);
+  const ownBtnRef = useRef<HTMLButtonElement>(null);
+  const btnRef = addButtonRef ?? ownBtnRef;
   const menuId = useId();
   const compatible = library.filter((l) => model && l.modelId === model.id);
   const available = compatible.filter((l) => l.present && !picks.some((p) => p.loraId === l.id));
@@ -591,24 +679,38 @@ export function LoraPicker({
   const added = compatible.filter((l) => picks.some((p) => p.loraId === l.id));
   const modelName = model?.name ?? "this model";
 
+  // Place the menu before it paints: below the button when it fits inside the scroll area, else above.
+  useLayoutEffect(() => {
+    if (!open) return setUp(false);
+    const menu = menuRef.current;
+    const btn = btnRef.current;
+    const scroller = btn?.closest<HTMLElement>(".panel__scroll");
+    if (!menu || !btn || !scroller) return;
+    const area = scroller.getBoundingClientRect();
+    const b = btn.getBoundingClientRect();
+    const h = menu.offsetHeight + 6;
+    setUp(b.bottom + h > area.bottom && b.top - h >= area.top);
+  }, [open, btnRef]);
+
   useEffect(() => {
     if (!open) return;
     const onDoc = (e: MouseEvent) => {
       if (!menuRef.current?.contains(e.target as Node) && !btnRef.current?.contains(e.target as Node)) setOpen(false);
     };
     document.addEventListener("mousedown", onDoc);
-    menuRef.current?.querySelector<HTMLElement>('[role="menuitem"]:not([disabled])')?.focus();
+    // preventScroll: opening the menu never scrolls the form (UI-036).
+    menuRef.current?.querySelector<HTMLElement>('[role="menuitem"]:not([disabled])')?.focus({ preventScroll: true });
     return () => document.removeEventListener("mousedown", onDoc);
-  }, [open]);
+  }, [open, btnRef]);
 
   const close = () => {
     setOpen(false);
-    btnRef.current?.focus();
+    btnRef.current?.focus({ preventScroll: true });
   };
 
   return (
     <div className="lora-picker">
-      {picks.map((p) => {
+      {picks.map((p, i) => {
         const l = library.find((x) => x.id === p.loraId);
         if (!l) return null;
         return (
@@ -622,9 +724,13 @@ export function LoraPicker({
                 className="lora-pick__remove"
                 aria-label={`Remove ${l.name}`}
                 title={`Remove ${l.name}`}
-                onClick={() => {
+                onClick={(e) => {
+                  // The row goes away with this button: focus the next row's Remove, else Add LoRA (UI-006).
+                  const rows = e.currentTarget.closest(".lora-picker")?.querySelectorAll<HTMLElement>(".lora-pick__remove");
+                  const next = rows?.[i + 1] ?? rows?.[i - 1];
                   onChange(picks.filter((x) => x.loraId !== p.loraId));
                   onRemoved?.(l);
+                  requestAnimationFrame(() => (next?.isConnected ? next : btnRef.current)?.focus({ preventScroll: true }));
                 }}
               >
                 <Icon name="x" size={12} />
@@ -711,7 +817,7 @@ export function LoraPicker({
           <div
             ref={menuRef}
             id={menuId}
-            className="menu lora-menu"
+            className={`menu lora-menu ${up ? "is-up" : ""}`}
             role="menu"
             aria-label={`LoRAs for ${modelName}`}
             onKeyDown={(e) => {
@@ -801,31 +907,67 @@ export function LoraPicker({
   );
 }
 
+// ---------------- Add a LoRA from a link (shared with the LoRA library, UI-018) ----------------
+
+/** Visible label of the link field, in both "add a LoRA from a link" flows. */
+export const LORA_LINK_LABEL = "Civitai or Hugging Face link";
+export const LORA_LINK_HELP = "Paste a Hugging Face file link (…/blob/main/x.safetensors) or a Civitai model page.";
+
+/**
+ * Checks a pasted LoRA link before it's sent to be resolved (UI-017): null when it can be checked,
+ * else the inline error. The core still validates it (file type, model id) when resolving.
+ */
+export function loraLinkProblem(raw: string): string | null {
+  const text = raw.trim();
+  if (!text) return `Paste a link first. ${LORA_LINK_HELP}`;
+  let u: URL;
+  try {
+    u = new URL(text);
+  } catch {
+    return `That doesn't look like a link. ${LORA_LINK_HELP}`;
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return `That doesn't look like a web link. ${LORA_LINK_HELP}`;
+  const host = u.hostname.toLowerCase();
+  const known = ["civitai.com", "huggingface.co"].some((h) => host === h || host.endsWith(`.${h}`));
+  if (!known) return `Only Hugging Face and Civitai links are supported. ${LORA_LINK_HELP}`;
+  return null;
+}
+
+const LORA_NAME_MAX = 60;
+
 /**
  * "Add LoRA from link" inside the Create screen (owner decision): resolve a Hugging Face / Civitai
  * link, confirm the name, model and trigger words, then add it (the download needs the image GPU,
- * so it goes through the start confirmation first, like the Models screen).
+ * so it goes through the start confirmation first, like the LoRA library). Same labels, checks
+ * and notices as the library's form (UI-018).
  */
 export function AddLoraLinkDialog({
   open,
   model,
   onClose,
   onAdded,
+  returnFocusRef,
 }: {
   open: boolean;
   model: ModelView | undefined;
   onClose: () => void;
   onAdded: (l: Lora) => void;
+  /** Focus target on close: the menu item that opened the dialog is gone by then (UI-006). */
+  returnFocusRef?: RefObject<HTMLElement | null>;
 }) {
   const lib = useLibrary();
   const gpu = useGpu();
   const [url, setUrl] = useState("");
   const [resolving, setResolving] = useState(false);
+  /** The link field's own problem (malformed / unsupported / couldn't resolve): shown on the field. */
+  const [linkError, setLinkError] = useState<string | null>(null);
+  /** Adding failed after the link was checked. */
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<{ link: string; data: ResolvedLora } | null>(null);
   const [name, setName] = useState("");
   const [modelId, setModelId] = useState("");
-  const [words, setWords] = useState("");
+  const [words, setWords] = useState<string[]>([]);
+  const [wordDraft, setWordDraft] = useState("");
   const [adding, setAdding] = useState(false);
   const urlRef = useRef<HTMLInputElement>(null);
   const id = useId();
@@ -833,44 +975,87 @@ export function AddLoraLinkDialog({
   useEffect(() => {
     if (!open) return;
     setUrl("");
+    setLinkError(null);
     setError(null);
     setPreview(null);
     setName("");
-    setWords("");
+    setWords([]);
+    setWordDraft("");
     setModelId(model?.id ?? "");
   }, [open, model?.id]);
 
   const resolve = async (e: FormEvent) => {
     e.preventDefault();
+    if (resolving) return;
     const link = url.trim();
-    if (!link || resolving) return;
+    const problem = loraLinkProblem(link);
+    if (problem) {
+      setLinkError(problem);
+      urlRef.current?.focus();
+      return;
+    }
     setResolving(true);
+    setLinkError(null);
     setError(null);
     setPreview(null);
     try {
       const data = await api.resolveLoraLink(link);
       setPreview({ link, data });
       setName(data.name);
-      setWords(data.triggerWords.join(", "));
+      setWords(data.triggerWords);
+      setWordDraft("");
     } catch (err) {
-      setError(api.errorMessage(err));
+      setLinkError(api.errorMessage(err));
+      urlRef.current?.focus();
     } finally {
       setResolving(false);
     }
   };
 
+  /** Splits on commas too (a pasted "a, b" becomes two chips), like the library. */
+  const addWord = (text = wordDraft) => {
+    const parts = text
+      .split(",")
+      .map((w) => w.trim())
+      .filter(Boolean);
+    if (parts.length) setWords((cur) => [...cur, ...parts.filter((w, i) => !cur.includes(w) && parts.indexOf(w) === i)]);
+    setWordDraft("");
+  };
+
+  const modelName = (mid: string) => lib.models.find((m) => m.id === mid)?.name ?? mid;
+  const nameTooLong = name.trim().length > LORA_NAME_MAX;
+  const suggested = preview?.data.suggestedModelId ? lib.imageModels.find((m) => m.id === preview.data.suggestedModelId) : undefined;
+  // Made for another of your models (UI-010): the form's model stays the default, the primary says "Add anyway".
+  const wrongBase = !!suggested && !!modelId && suggested.id !== modelId;
+  const baseMismatch = !!preview?.data.baseModel && !suggested;
+  const duplicate = preview ? lib.loras.find((l) => l.modelId === modelId && l.filename === preview.data.filename) : undefined;
+  const sameSource = preview ? lib.loras.find((l) => l.sourceUrl.trim() === preview.link && l.modelId !== modelId) : undefined;
+  const addBlocked = !preview
+    ? "Check the link first."
+    : !modelId
+      ? "Choose which model this LoRA is for."
+      : !name.trim()
+        ? "Give it a name."
+        : nameTooLong
+          ? `Keep the name to ${LORA_NAME_MAX} characters.`
+          : duplicate
+            ? "Already in your library for this model."
+            : null;
+  const addLabel = adding ? "Adding…" : wrongBase ? "Add anyway" : gpu.profiles.image.needsStart ? "Add & download (starts GPU)" : "Add to library";
+
   const add = async () => {
-    if (!preview || !modelId || !name.trim() || adding) return;
+    if (!preview || addBlocked || adding) return;
+    const size = preview.data.sizeBytes ?? 0;
+    const vol = lib.status?.volume;
+    const details = [
+      `Downloads ${formatBytes(size)} to ${lib.settings?.volumeNames?.[0] ?? "the image volume"}${vol ? ` · about ${formatBytes(Math.max(0, vol.freeBytes - size))} free afterwards` : ""}.`,
+    ];
     // Owner's rule: confirm before anything that starts a billed GPU. Cancel adds nothing.
-    if (!(await gpu.confirmStart(`download ${name.trim()}`, "image"))) return;
+    if (!(await gpu.confirmStart(`download ${name.trim()}`, "image", { details, confirmLabel: `Start GPU & download ${formatBytes(size)}` }))) return;
     setAdding(true);
     setError(null);
     try {
-      const triggerWords = words
-        .split(",")
-        .map((w) => w.trim())
-        .filter(Boolean);
-      const l = await api.addLora({ url: preview.link, modelId, name: name.trim(), triggerWords });
+      const l = await api.addLora({ url: preview.link, modelId, name: name.trim(), triggerWords: [...words, ...wordDraft.split(",").map((w) => w.trim()).filter(Boolean)] });
       await lib.reloadLoras();
       onAdded(l);
     } catch (err) {
@@ -880,9 +1065,8 @@ export function AddLoraLinkDialog({
     }
   };
 
-  const target = lib.imageModels.find((m) => m.id === modelId);
-  const suggested = preview?.data.suggestedModelId ? lib.imageModels.find((m) => m.id === preview.data.suggestedModelId) : undefined;
-  const mismatch = !!preview && ((suggested && suggested.id !== modelId) || (!suggested && !!preview.data.baseModel));
+  const linkErrId = `${id}-url-err`;
+  const warnId = `${id}-model-warn`;
 
   return (
     <Dialog
@@ -891,104 +1075,189 @@ export function AddLoraLinkDialog({
       title="Add LoRA from link"
       className="lora-link-dialog"
       initialFocusRef={urlRef}
+      returnFocusRef={returnFocusRef}
       footer={
         <>
+          {addBlocked && (
+            <p id={`${id}-add-why`} className="hint lora-link-dialog__why">
+              {addBlocked}
+            </p>
+          )}
           <button type="button" className="btn btn--ghost" onClick={onClose}>
             Cancel
           </button>
-          <button type="button" className="btn btn--primary" disabled={!preview || !modelId || !name.trim() || adding} onClick={() => void add()}>
-            {adding ? (
-              <>
-                <Icon name="refresh" className="spin" /> Adding…
-              </>
-            ) : (
-              <>
-                <Icon name="download" /> Add and download
-              </>
-            )}
+          <button
+            type="button"
+            className="btn btn--primary"
+            disabled={!!addBlocked || adding}
+            aria-describedby={addBlocked ? `${id}-add-why` : undefined}
+            onClick={() => void add()}
+          >
+            <Icon name={adding ? "refresh" : "download"} className={adding ? "spin" : undefined} /> {addLabel}
           </button>
         </>
       }
     >
       <p className="hint">
-        Paste a {model ? `${model.name} ` : ""}LoRA link: a Hugging Face file (…/blob/main/x.safetensors) or a Civitai model page. It downloads to
-        your volume and is added to this form when ready.
+        {model ? `For ${model.name}: ` : ""}
+        {LORA_LINK_HELP} It downloads to your volume and is added to this form when ready.
       </p>
-      <form className="link-form" onSubmit={resolve}>
-        <label className="visually-hidden" htmlFor={`${id}-url`}>
-          LoRA link
+      <form className="lora-link-dialog__form" onSubmit={resolve} noValidate>
+        <label className="field__label" htmlFor={`${id}-url`}>
+          {LORA_LINK_LABEL}
         </label>
-        <div className="input-icon">
-          <Icon name="link" />
-          <input
-            ref={urlRef}
-            id={`${id}-url`}
-            className="input"
-            type="url"
-            placeholder="https://civitai.com/models/… or https://huggingface.co/…"
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            autoComplete="off"
-            spellCheck={false}
-          />
+        <div className="link-form">
+          <div className="input-icon">
+            <Icon name="link" />
+            <input
+              ref={urlRef}
+              id={`${id}-url`}
+              className={`input ${linkError ? "is-invalid" : ""}`}
+              type="url"
+              placeholder="https://civitai.com/models/…"
+              value={url}
+              onChange={(e) => {
+                setUrl(e.target.value);
+                // A stale error never sits next to a corrected link (UI-017).
+                setLinkError(null);
+              }}
+              aria-invalid={!!linkError || undefined}
+              aria-describedby={linkError ? linkErrId : undefined}
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </div>
+          <button type="submit" className="btn" disabled={resolving}>
+            {resolving ? (
+              <>
+                <Icon name="refresh" className="spin" /> Checking…
+              </>
+            ) : (
+              "Check link"
+            )}
+          </button>
         </div>
-        <button type="submit" className="btn" disabled={resolving || !url.trim()}>
-          {resolving ? (
-            <>
-              <Icon name="refresh" className="spin" /> Checking…
-            </>
-          ) : (
-            "Check link"
-          )}
-        </button>
       </form>
-      {error && (
-        <p className="notice notice--error" role="alert">
-          <Icon name="alert" /> {error}
+      {linkError && (
+        <p id={linkErrId} className="notice notice--error lora-link-dialog__error" role="alert">
+          <Icon name="alert" /> {linkError}
         </p>
       )}
       {preview && (
-        <div className="lora-link-dialog__preview" aria-label="Resolved LoRA">
+        <div className="lora-link-dialog__preview" role="group" aria-label="Resolved LoRA">
           <div className="lora-preview__meta">
             <span className="badge">{preview.data.source === "civitai" ? "Civitai" : "Hugging Face"}</span>
             {preview.data.baseModel && <span className="tag">base: {preview.data.baseModel}</span>}
             {preview.data.sizeBytes ? <span className="tag mono">{formatBytes(preview.data.sizeBytes)}</span> : null}
           </div>
           <div className="field">
-            <label className="field__label" htmlFor={`${id}-name`}>
-              Name
-            </label>
-            <input id={`${id}-name`} className="input" value={name} onChange={(e) => setName(e.target.value)} />
+            <div className="field__label-row">
+              <label className="field__label" htmlFor={`${id}-name`}>
+                Name
+              </label>
+              <span className={`hint mono ${nameTooLong ? "hint--error" : ""}`} aria-live="polite">
+                {name.trim().length}/{LORA_NAME_MAX}
+              </span>
+            </div>
+            <input
+              id={`${id}-name`}
+              className={`input ${nameTooLong ? "is-invalid" : ""}`}
+              value={name}
+              maxLength={LORA_NAME_MAX + 20}
+              aria-invalid={nameTooLong || undefined}
+              onChange={(e) => setName(e.target.value)}
+            />
           </div>
           <div className="field">
             <label className="field__label" htmlFor={`${id}-model`}>
-              Made for model
+              Use with model
             </label>
-            <select id={`${id}-model`} className="input select" value={modelId} onChange={(e) => setModelId(e.target.value)}>
+            <select
+              id={`${id}-model`}
+              className="input select"
+              value={modelId}
+              onChange={(e) => setModelId(e.target.value)}
+              aria-describedby={wrongBase || baseMismatch ? warnId : undefined}
+            >
               <option value="" disabled>
                 Choose a model…
               </option>
               {lib.imageModels.map((m) => (
                 <option key={m.id} value={m.id}>
                   {m.name}
+                  {m.installed ? "" : " (not installed)"}
                 </option>
               ))}
             </select>
-            {mismatch && (
-              <p className="hint field-warn">
-                <Icon name="alert" size={12} />{" "}
-                {suggested
-                  ? `This LoRA looks made for ${suggested.name}; it only works with the model it was trained for.`
-                  : `Its base model (${preview.data.baseModel}) doesn't match any installed model; it may not work with ${target?.name ?? "the one you pick"}.`}
-              </p>
-            )}
           </div>
+          {wrongBase && suggested && (
+            <div id={warnId} className="notice notice--warn lora-link-dialog__warn">
+              <Icon name="alert" />
+              <span>
+                {preview.data.source === "civitai" ? "Civitai" : "The source"} lists this LoRA for {preview.data.baseModel ?? suggested.name}. It probably won't
+                work with {modelName(modelId)} — a LoRA only works with the model it was trained for.{" "}
+                <button type="button" className="link-btn" onClick={() => setModelId(suggested.id)}>
+                  Use for {suggested.name} instead
+                </button>
+              </span>
+            </div>
+          )}
+          {baseMismatch && (
+            <p id={warnId} className="notice notice--warn">
+              <Icon name="alert" /> Base model “{preview.data.baseModel}” doesn't match any of your models. It may not work.
+            </p>
+          )}
+          {duplicate && (
+            <p className="notice notice--warn" role="alert">
+              <Icon name="alert" /> Already in your library as “{duplicate.name}” ({modelName(duplicate.modelId)}) — the same file.
+            </p>
+          )}
+          {!duplicate && sameSource && (
+            <p className="hint">
+              <Icon name="info" size={12} /> This link is already in your library as “{sameSource.name}” for {modelName(sameSource.modelId)}.
+            </p>
+          )}
           <div className="field">
-            <label className="field__label" htmlFor={`${id}-words`}>
-              Trigger words <span className="section__aside">(comma separated, optional)</span>
-            </label>
-            <input id={`${id}-words`} className="input" value={words} onChange={(e) => setWords(e.target.value)} />
+            <span className="field__label" id={`${id}-words-label`}>
+              Trigger words
+            </span>
+            <div className="chips" role="group" aria-labelledby={`${id}-words-label`}>
+              {words.map((w) => (
+                <span key={w} className="chip chip--word is-static">
+                  {w}
+                  <button type="button" className="chip__x" aria-label={`Remove ${w}`} onClick={() => setWords(words.filter((x) => x !== w))}>
+                    <Icon name="x" size={11} />
+                  </button>
+                </span>
+              ))}
+              <input
+                className="input input--chip"
+                aria-label="Add trigger word"
+                placeholder={words.length ? "Add…" : "None — type to add"}
+                value={wordDraft}
+                onChange={(e) => setWordDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === ",") {
+                    e.preventDefault();
+                    addWord();
+                  }
+                }}
+                onPaste={(e) => {
+                  const text = e.clipboardData.getData("text");
+                  if (text.includes(",")) {
+                    e.preventDefault();
+                    addWord(wordDraft + text);
+                  }
+                }}
+                onBlur={() => addWord()}
+              />
+            </div>
           </div>
+          {error && (
+            <p className="notice notice--error" role="alert">
+              <Icon name="alert" /> {error}
+            </p>
+          )}
         </div>
       )}
     </Dialog>
@@ -1150,14 +1419,15 @@ export function Advanced({
   const dSteps = model?.defaults.steps ? String(model.defaults.steps) : "";
   const dCfg = model?.defaults.cfg ? String(model.defaults.cfg) : "";
   const randomEffective = values.randomSeed || values.seed.trim() === "";
-  const summary = [
-    randomEffective ? "random seed" : `seed ${values.seed}`,
-    `${values.steps.trim() || dSteps || "default"} steps`,
-    `CFG ${values.cfg.trim() || dCfg || "default"}`,
-    customNeg ? "custom negative" : "",
-  ]
-    .filter(Boolean)
-    .join(" · ");
+  // Collapsed summary: a value that blocks Generate shows in the error colour with its allowed range (UI-034).
+  const summary: { text: string; bad?: boolean }[] = [
+    randomEffective ? { text: "random seed" } : { text: issues.seed ? `seed ${values.seed.trim()} (0–${SEED_MAX})` : `seed ${values.seed}`, bad: !!issues.seed },
+    { text: issues.steps ? `${values.steps.trim()} steps (1–${STEPS_MAX})` : `${values.steps.trim() || dSteps || "default"} steps`, bad: !!issues.steps },
+    { text: issues.cfg ? `CFG ${values.cfg.trim()} (0–${CFG_MAX})` : `CFG ${values.cfg.trim() || dCfg || "default"}`, bad: !!issues.cfg },
+    ...(customNeg ? [{ text: "custom negative" }] : []),
+  ];
+  const badCount = [issues.seed, issues.steps, issues.cfg].filter(Boolean).length;
+  const stepsRef = useRef<HTMLInputElement>(null);
 
   // Opening the drawer brings it into view above the sticky footer (UX-022).
   const toggle = () => {
@@ -1180,9 +1450,20 @@ export function Advanced({
       <button type="button" className="advanced__toggle" aria-expanded={open} aria-controls={id} onClick={toggle}>
         <Icon name="sliders" />
         <span>Advanced</span>
-        {!isDefault && <span className="dot" aria-label="(modified)" />}
-        {(issues.seed || issues.steps || issues.cfg) && <span className="dot dot--danger" aria-label="(needs fixing)" />}
-        <span className="advanced__summary">{summary}</span>
+        {badCount > 0 ? (
+          <span className="advanced__bad" aria-label={`(${badCount === 1 ? "1 field needs" : `${badCount} fields need`} fixing)`}>
+            !
+          </span>
+        ) : (
+          !isDefault && <span className="dot" aria-label="(modified)" />
+        )}
+        <span className="advanced__summary">
+          {summary.map((p, i) => (
+            <span key={i} className={`advanced__seg ${p.bad ? "is-bad" : ""}`}>
+              {p.text}
+            </span>
+          ))}
+        </span>
         <Icon name="chevronDown" className={`chev ${open ? "is-open" : ""}`} />
       </button>
       <div id={id} className="advanced__body" hidden={!open}>
@@ -1237,6 +1518,7 @@ export function Advanced({
               Steps
             </label>
             <input
+              ref={stepsRef}
               id={`${id}-steps`}
               className={`input mono ${issues.steps ? "is-invalid" : ""}`}
               inputMode="numeric"
@@ -1302,7 +1584,16 @@ export function Advanced({
           <span className="hint">
             {model ? `${model.name} defaults: ${model.defaults.steps || "auto"} steps, CFG ${model.defaults.cfg || "auto"}` : ""}
           </span>
-          <button type="button" className="btn btn--ghost btn--sm" disabled={isDefault} onClick={() => onChange(defaults)}>
+          <button
+            type="button"
+            className="btn btn--ghost btn--sm"
+            disabled={isDefault}
+            onClick={() => {
+              onChange(defaults);
+              // The button disables itself: keep focus in the drawer, on Steps (UI-006).
+              requestAnimationFrame(() => stepsRef.current?.focus({ preventScroll: true }));
+            }}
+          >
             <Icon name="restore" /> Reset to defaults
           </button>
         </div>

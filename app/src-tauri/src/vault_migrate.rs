@@ -292,6 +292,7 @@ fn seal_or_reuse(core: &Core, rec: &ImageRecord) -> Result<(VaultItem, Migration
 
 /// "Move to vault": encrypt, verify, record, then delete the plaintext and row.
 pub fn move_to_vault(core: &Core, id: &str) -> Result<ImageRecord, String> {
+    let _busy = core.vault.begin_move();
     let rec = core
         .db
         .lock()
@@ -318,6 +319,7 @@ fn write_plain(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// "Move to General": decrypt into `images/` / `videos/` / `references/`,
 /// insert the database row, then remove the vault item.
 pub fn move_to_general(core: &Core, id: &str) -> Result<ImageRecord, String> {
+    let _busy = core.vault.begin_move();
     let item = core.vault.item(id)?;
     let video = item.kind == KIND_VIDEO;
     let media_dir = if video {
@@ -385,6 +387,7 @@ pub fn migration_pending(core: &Core) -> bool {
 /// already verified (those only need their originals removed). Always ends
 /// with a `vault-migration` event (`done` or `error`) and a `vault-update`.
 pub fn migrate(core: &Core, opts: MigrateOptions) -> Result<MigrationProgress, String> {
+    let _busy = core.vault.begin_move(); // erase waits for / refuses a running migration
     let mut progress = MigrationProgress {
         phase: "encrypting".into(),
         done: 0,

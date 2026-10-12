@@ -186,7 +186,10 @@ for (const id of ["chroma", "zimage", "qwen"]) {
   for (const f of models.find((m) => m.id === id)!.files) present.add(f.filename);
 }
 for (const m of videoModels) if (m.id === "h3" || params.has("videoInstalled")) for (const f of m.files) present.add(f.filename);
+/** LoRA files on the image volume, keyed like the core's (folder loras/<modelId>, filename): the same
+ * file added for two models is two files, so deleting one entry never removes the other's (UI-011). */
 const loraFiles = new Set<string>();
+const loraKey = (l: { modelId: string; filename: string }) => `loras/${l.modelId}/${l.filename}`;
 
 const modelTasks = new Map<string, Task>();
 const loraTasks = new Map<string, Task>();
@@ -237,7 +240,7 @@ const loras: Omit<Lora, "present" | "task">[] = [
     triggerWords: ["sumi-e", "ink wash painting"],
   },
 ];
-for (const l of loras) loraFiles.add(l.filename);
+for (const l of loras) loraFiles.add(loraKey(l));
 
 const images: ImageRecord[] = [];
 
@@ -466,7 +469,7 @@ function modelView(m: RegistryModel): ModelView {
 
 function loraView(l: (typeof loras)[number]): Lora {
   const t = loraTasks.get(l.id) ?? null;
-  return { ...l, present: loraFiles.has(l.filename), task: t && (t.status === "queued" || t.status === "running") ? t : null };
+  return { ...l, present: loraFiles.has(loraKey(l)), task: t && (t.status === "queued" || t.status === "running") ? t : null };
 }
 
 function usedBytes(p: GpuProfile) {
@@ -478,7 +481,7 @@ function usedBytes(p: GpuProfile) {
         seen.add(f.filename);
         used += f.sizeBytes;
       }
-  if (p === "image") for (const l of loras) if (loraFiles.has(l.filename)) used += l.sizeBytes ?? 0;
+  if (p === "image") for (const l of loras) if (loraFiles.has(loraKey(l))) used += l.sizeBytes ?? 0;
   return used;
 }
 
@@ -742,11 +745,12 @@ if (!params.has("empty")) {
   }
   // A few videos (spec v5) between the images, newest-first order kept.
   const vids = [
-    { at: 1, model: "h3", prompt: "A paper boat drifting down a rain-soaked street, gentle camera follow", res: "1280x720", d: 5, fps: 24, audio: true },
-    { at: 6, model: "ltx25", prompt: "Timelapse of clouds rolling over a mountain ridge at sunrise, wide shot", res: "768x512", d: 8, fps: 25, audio: false },
-    { at: 13, model: "h3", prompt: "A street musician playing violin under a bridge, warm evening light, slow dolly in", res: "720x1280", d: 6, fps: 24, audio: true, i2v: true },
-    { at: 22, model: "ltx25", prompt: "Waves crashing on black sand, drone pulling back", res: "1280x720", d: 4, fps: 24, audio: true },
-    { at: 30, model: "h3", prompt: "Steam rising from a cup of coffee on a windowsill, rain outside", res: "1280x720", d: 3, fps: 24, audio: false },
+    // Sizes each model really offers (shared/models.json), so "Use these settings" restores them as they are (UI-069).
+    { at: 1, model: "h3", prompt: "A paper boat drifting down a rain-soaked street, gentle camera follow", res: "864x480", d: 5, fps: 24, audio: true },
+    { at: 6, model: "ltx25", prompt: "Timelapse of clouds rolling over a mountain ridge at sunrise, wide shot", res: "896x512", d: 8, fps: 25, audio: false },
+    { at: 13, model: "h3", prompt: "A street musician playing violin under a bridge, warm evening light, slow dolly in", res: "480x864", d: 6, fps: 24, audio: true, i2v: true },
+    { at: 22, model: "ltx25", prompt: "Waves crashing on black sand, drone pulling back", res: "1280x704", d: 4, fps: 24, audio: true },
+    { at: 30, model: "h3", prompt: "Steam rising from a cup of coffee on a windowsill, rain outside", res: "864x480", d: 3, fps: 24, audio: false },
   ];
   for (const v of vids) {
     if (v.at >= images.length) continue;
@@ -790,6 +794,8 @@ const vault = {
   /** Sealed items (decrypted only while unlocked in the real core). */
   items: [] as ImageRecord[],
   migrating: false,
+  /** Moves into / out of the vault running now (erase is refused meanwhile, like the core). */
+  moving: 0,
   lastTouch: Date.now(),
 };
 
@@ -1526,13 +1532,14 @@ const commands: Record<string, Handler> = {
       source: (i.url.includes("civitai") ? "civitai" : "huggingface") as Lora["source"],
       sourceUrl: i.url,
       filename,
-      sizeBytes: 180 * 1024 ** 2,
+      // One size source: the resolved size the preview and GPU confirm showed (UI-053).
+      sizeBytes: resolved.sizeBytes ?? 180 * 1024 ** 2,
       triggerWords: i.triggerWords ?? [],
     };
     loras.unshift(l);
     const task: Task = { taskId: uid("task"), kind: "download", target: { type: "lora", id: l.id }, status: "queued", bytes: 0, totalBytes: l.sizeBytes, file: filename, error: null };
     loraTasks.set(l.id, task);
-    void runDownloadTask(task, [{ filename, sizeBytes: l.sizeBytes }], (f) => loraFiles.add(f));
+    void runDownloadTask(task, [{ filename, sizeBytes: l.sizeBytes }], () => loraFiles.add(loraKey(l)));
     return loraView(l);
   },
   list_loras: () => loras.map(loraView),
@@ -1541,13 +1548,20 @@ const commands: Record<string, Handler> = {
     if (!loras.some((l) => l.id === a.id)) throw new Error("LoRA not found");
     const t = loraTasks.get(String(a.id));
     if (t) taskCancel.add(t.taskId);
-    await ensureGpuReady("image", undefined, undefined, "task");
-    await sleep(500);
+    // Like the core: a file that isn't on the volume (or that another entry uses) needs no GPU.
+    const target = loras.find((l) => l.id === a.id)!;
+    const needsGpu = loraFiles.has(loraKey(target)) && !loras.some((o) => o.id !== target.id && loraKey(o) === loraKey(target));
+    if (needsGpu) {
+      await ensureGpuReady("image", undefined, undefined, "task");
+      await sleep(500);
+    }
     const idx = loras.findIndex((l) => l.id === a.id);
     if (idx < 0) throw new Error("LoRA not found");
-    loraFiles.delete(loras[idx].filename);
+    // Only this entry's file; another entry keeps its own (UI-011).
+    const row = loras[idx];
+    if (!loras.some((o) => o.id !== row.id && loraKey(o) === loraKey(row))) loraFiles.delete(loraKey(row));
     loras.splice(idx, 1);
-    releaseGpu("image", "finished"); // a pod started only for this delete stops again
+    if (needsGpu) releaseGpu("image", "finished"); // a pod started only for this delete stops again
     return null; // removed immediately
   },
 
@@ -1669,6 +1683,16 @@ const commands: Record<string, Handler> = {
     emitVault();
     return vaultStatus();
   },
+  vault_erase: async (a) => {
+    // Like the core: the typed word, locked or unlocked, no password; nothing is revealed.
+    if (String(a.confirm ?? "") !== "erase") throw new Error('CONFIRM_REQUIRED: Type "erase" to erase the vault');
+    if (!vault.exists) throw new Error("NO_VAULT: No vault has been created yet");
+    if (vault.migrating || vault.moving) throw new Error("VAULT_BUSY: Wait for the move into the vault to finish");
+    await sleep(400);
+    Object.assign(vault, { exists: false, unlocked: false, password: "", items: [], migrating: false });
+    emitVault();
+    return vaultStatus();
+  },
   vault_set_auto_lock: async (a) => {
     // Like the core: only while unlocked.
     if (!vault.unlocked) throw new Error("VAULT_LOCKED: Unlock the vault to change its auto-lock time");
@@ -1700,7 +1724,8 @@ const commands: Record<string, Handler> = {
     requireUnlocked();
     const idx = images.findIndex((x) => x.id === a.id);
     if (idx < 0) throw new Error("Image not found");
-    await sleep(400); // encrypt, verify, delete the plaintext
+    vault.moving++;
+    await sleep(400).finally(() => vault.moving--); // encrypt, verify, delete the plaintext
     const [rec] = images.splice(idx, 1);
     const moved = asVaultItem(rec);
     insertNewestFirst(vault.items, moved);
@@ -1711,7 +1736,8 @@ const commands: Record<string, Handler> = {
     requireUnlocked();
     const idx = vault.items.findIndex((x) => x.id === a.id);
     if (idx < 0) throw new Error("Vault item not found");
-    await sleep(400);
+    vault.moving++;
+    await sleep(400).finally(() => vault.moving--);
     const [rec] = vault.items.splice(idx, 1);
     const moved: ImageRecord = { ...rec, vault: false, thumbPath: null };
     insertNewestFirst(images, moved);

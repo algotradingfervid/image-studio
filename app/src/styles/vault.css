@@ -1,0 +1,73 @@
+/* Vault views and vault settings (agent E, UI review fixes 2026-10-12). Imported from main.tsx after styles.css. */
+
+/* Settings > Vault rows wrap at ~800px instead of squeezing their text (UI-008). */
+.vault-settings .vault-settings__row {
+  flex-wrap: wrap;
+}
+
+.vault-settings .vault-settings__grow {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+
+.vault-settings__field-error {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 5px 0 0;
+}
+
+.vault-settings__danger-title .icon {
+  color: var(--danger);
+}
+
+/* Lock screen / unlock dialog: the way out of a forgotten password (UI-059). */
+.vault-gate__forgot {
+  margin: 14px 0 0;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.vault-unlock-dialog .vault-gate__forgot {
+  text-align: left;
+}
+
+.vault-erase {
+  display: grid;
+  gap: 14px;
+}
+
+.vault-erase .hint {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: -6px 0 0;
+}
+
+/* Set-up: why Create is disabled, under it (UI-067). */
+.vault-create .vault-create__why {
+  margin: -8px 0 0;
+  text-align: right;
+}
+
+/* Migration result: labels are never cut off; three per row in a narrow gallery (UI-066). */
+.vault-migration {
+  container-type: inline-size;
+}
+
+.vault-migration__counts dt {
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+}
+
+@container (max-width: 560px) {
+  .vault-migration__counts {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+.notice.vault-migration__saveto {
+  margin: 0;
+  flex-wrap: wrap;
+}

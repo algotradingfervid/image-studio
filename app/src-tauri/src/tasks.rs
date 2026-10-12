@@ -346,7 +346,17 @@ pub fn delete_lora(core: &Arc<Core>, id: &str) -> Result<Option<Task>, String> {
     ensure_idle(core, TargetType::Lora, id)?;
     let folder = lora_folder(&row.model_id);
     let profile = profile_for_model(core, &row.model_id);
-    if !present_set_for(core, profile).contains(&(folder.clone(), row.filename.clone())) {
+    // Another entry on the same file keeps it: remove only this record (UI-011).
+    let entries: Vec<(String, crate::delete_rule::FileKey)> = core
+        .db
+        .lock()
+        .unwrap()
+        .list_loras()?
+        .into_iter()
+        .map(|l| (l.id, (lora_folder(&l.model_id), l.filename)))
+        .collect();
+    let shared = crate::delete_rule::lora_file_shared_with(id, &entries).is_some();
+    if shared || !present_set_for(core, profile).contains(&(folder.clone(), row.filename.clone())) {
         core.db.lock().unwrap().delete_lora(id)?;
         return Ok(None);
     }

@@ -323,6 +323,7 @@ pub fn run() {
             commands::vault_unlock,
             commands::vault_lock,
             commands::vault_change_password,
+            commands::vault_erase,
             commands::vault_set_auto_lock,
             commands::list_vault_items,
             commands::move_to_vault,

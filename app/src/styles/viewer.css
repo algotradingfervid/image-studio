@@ -1,0 +1,118 @@
+/* Lightbox / viewer and gallery picker (agent B, UI review fixes 2026-10-12). Imported from main.tsx after styles.css. */
+
+/* ---- feedback labels that never resize their button (UI-013) ---- */
+.swap-label {
+  display: inline-grid;
+}
+.swap-label > span {
+  grid-area: 1 / 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+}
+.swap-label > .swap-label__off {
+  visibility: hidden;
+}
+
+/* ---- side panel ---- */
+/* Desktop: the details are part of the side panel's column. */
+.lightbox__details {
+  display: contents;
+}
+/* Nothing in the column shrinks: the panel scrolls instead of clipping the specs (UI-026). */
+.lightbox__side > *,
+.lightbox__details > * {
+  flex-shrink: 0;
+}
+.lightbox .nowrap {
+  white-space: nowrap;
+}
+
+/* Metadata labels 12 px, values 13 px (UI-030). */
+.lightbox .specs dt {
+  font-size: 12px;
+  letter-spacing: 0.04em;
+}
+.lightbox .specs dd {
+  font-size: 13px;
+}
+.lightbox .start-spec__label {
+  font-size: 12px;
+}
+.lightbox .lightbox__counter {
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+/* In a short window the details scroll under the actions, which stay in view at the bottom. */
+.lightbox__actions {
+  position: sticky;
+  bottom: -18px;
+  z-index: 1;
+  margin-bottom: -18px;
+  padding: 10px 0 18px;
+  background: var(--panel);
+}
+
+/* Inline confirms replace their trigger in place (UI-026); the panel scrolls if one is tall. */
+.lightbox__actions > .confirm {
+  margin: 0;
+}
+
+/*
+ * Portrait windows (a tablet at 820x1180, UI-027): media on top at full width, details and actions
+ * side by side underneath, each scrolling on its own so the actions stay in view.
+ */
+@media (orientation: portrait) {
+  .lightbox__layout {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) minmax(300px, 42%);
+  }
+  .lightbox__stage {
+    grid-template: minmax(0, 1fr) / minmax(0, 1fr);
+    padding: 20px 56px 32px;
+  }
+  .lightbox__stage img,
+  .lightbox__stage .lightbox__video,
+  .lightbox__poster img {
+    max-height: 100%;
+  }
+  .lightbox__poster {
+    max-height: 100%;
+  }
+  .lightbox__side {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(220px, 260px);
+    gap: 18px;
+    padding: 16px 18px;
+    border-left: 0;
+    border-top: 1px solid var(--line);
+    overflow: hidden;
+  }
+  .lightbox__details {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    min-height: 0;
+    overflow-y: auto;
+  }
+  .lightbox .lightbox__prompt {
+    max-height: none;
+    overflow: visible;
+  }
+  .lightbox__actions {
+    position: static;
+    margin-bottom: 0;
+    padding: 0;
+    min-height: 0;
+    overflow-y: auto;
+    align-content: end;
+    margin-top: 0;
+  }
+}
+
+/* ---- start-image picker (UI-032) ---- */
+.picker__empty-actions {
+  justify-content: center;
+}

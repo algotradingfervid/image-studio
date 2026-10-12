@@ -37,8 +37,10 @@ import type { JobView } from "./JobCard";
 
 const LAST_VIDEO_MODEL_KEY = "imagestudio.lastVideoModel";
 const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp|tiff?|heic)$/i;
-/** A second Generate within this long of the last one is ignored (double-click guard). */
-const GENERATE_GUARD_MS = 800;
+/** A second Generate within this long of the last one is ignored (double-click guard; 1.5 s covers a hesitant double tap, UI-078). */
+const GENERATE_GUARD_MS = 1500;
+/** The same video sent again within this long gets a "Queued again · Undo" notice (UI-078). */
+const REPEAT_WINDOW_MS = 4000;
 /** The non-vault Video form draft (UX-058): restored after a reload, never holds vault content. */
 const DRAFT_KEY = "imagestudio.draft.video";
 
@@ -210,7 +212,7 @@ export const VideoPanel = forwardRef<
   const configured = isConfigured(lib.settings);
   const startsGpu = vgpu.needsStart;
   const models = lib.videoModels;
-  const { notice, show: showNotice, clear: clearNotice } = usePanelNotice();
+  const { notice, show: showNotice, clear: clearNotice, hold: holdNotice } = usePanelNotice();
 
   const draft = useRef(readDraft<{ modelId: string; prompt: string; form: VideoForm; adv: AdvancedValues }>(DRAFT_KEY)).current;
   const [modelId, setModelId] = useState(() => draft?.modelId || readLast());
@@ -242,6 +244,9 @@ export const VideoPanel = forwardRef<
   const fileInput = useRef<HTMLInputElement>(null);
   const inFlight = useRef(false);
   const lastSubmit = useRef(0);
+  /** The last queued video's settings, to spot an accidental repeat (UI-078). */
+  const lastQueued = useRef<{ key: string; at: number } | null>(null);
+  const formRef = useRef<HTMLFormElement>(null);
 
   // Report vault start images upward.
   const vaultStart = startIsVault(startImage);
@@ -562,7 +567,10 @@ export const VideoPanel = forwardRef<
         const sz = resSize(rec.aspectRatio) ?? (rec.width && rec.height ? ([rec.width, rec.height] as [number, number]) : null);
         const best = sz ? closestResolution(resOpts, sz[0], sz[1]) : null;
         if (best) resolution = best;
-        resNote = `${resLabel(rec.aspectRatio)} isn't offered by ${m.name}; using ${resLabel(resolution)}`;
+        // Say why and what was picked instead (UI-069): the closest size of the same shape.
+        resNote = best
+          ? `${m.name} no longer offers ${resLabel(rec.aspectRatio)}, so it uses the closest ${sz ? `${orientationOf(sz[0], sz[1])} ` : ""}size, ${resLabel(resolution)}`
+          : `${m.name} no longer offers ${resLabel(rec.aspectRatio)}, so it uses its default, ${resLabel(resolution)}`;
       }
       if (m.id !== modelId) memory.current.set(modelId, currentMemory());
       setModelId(m.id);
@@ -639,36 +647,38 @@ export const VideoPanel = forwardRef<
 
   // ---------- generate ----------
   const videoGpuStatus = vgpu.state?.status;
-  const blocker =
+  // Every reason Generate can't run, in form order (UI-009): the button is aria-disabled while any is
+  // left, the hint lists them all, and a click goes to the first one without starting the GPU.
+  const advProblem = advBlocker(adv, model);
+  const blockers =
     models.length === 0
-      ? "No video models in this build"
+      ? ["No video models in this build"]
       : !model
-        ? "Choose a video model"
-        : !configured
-          ? "Connect RunPod in Settings first"
-          : !model.installed
-            ? `${model.name} isn't installed`
-            : gpu.podMode && videoGpuStatus === "stopping"
-              ? "The video GPU is stopping — Generate is available again once it has stopped"
-              : !prompt.trim()
-                ? "Write a prompt"
-                : advBlocker(adv, model)
-                  ? advBlocker(adv, model)
-                  : startBusy
-                    ? "Adding the start image…"
-                    : !form.resolution
-                      ? "Choose a resolution"
-                      : null;
+        ? ["Choose a video model"]
+        : [
+            !configured ? "Connect RunPod in Settings first" : "",
+            !model.installed ? `${model.name} isn't installed` : "",
+            gpu.podMode && videoGpuStatus === "stopping" ? "The video GPU is stopping — Generate is available again once it has stopped" : "",
+            startBusy ? "Adding the start image…" : "",
+            !prompt.trim() ? "Write a prompt" : "",
+            !form.resolution ? "Choose a resolution" : "",
+            advProblem ?? "",
+          ].filter(Boolean);
+  const blocker = blockers[0] ?? null;
 
   const doGenerate = async () => {
     // Double-click guard (UX-011): ignore while a submit is in flight and just after one.
     if (submitting || inFlight.current || Date.now() - lastSubmit.current < GENERATE_GUARD_MS) return;
     if (blocker) {
-      if (blocker === "Write a prompt") {
+      if (model && !model.installed) {
+        formRef.current?.querySelector<HTMLElement>(".model-missing .link-btn")?.focus();
+      } else if (!prompt.trim()) {
         setPromptError(true);
         promptRef.current?.focus();
-      } else if (blocker.startsWith("Fix ")) setAdvOpen(true);
-      else toast.info(blocker);
+      } else if (advProblem) {
+        setAdvOpen(true);
+        requestAnimationFrame(() => formRef.current?.querySelector<HTMLElement>('.advanced [aria-invalid="true"]')?.focus());
+      } else toast.info(blocker);
       return;
     }
     if (!model) return;
@@ -676,7 +686,9 @@ export const VideoPanel = forwardRef<
     lastSubmit.current = Date.now();
     try {
       // Owner's rule: confirm before starting a billed GPU. Cancel queues nothing.
-      if (!(await gpu.confirmStart("generate a video", "video"))) return;
+      // The model's region / licence restriction is restated in the paid confirmation (UI-054).
+      const licence = modelNotes(model).find((n) => n.tone === "warn")?.text;
+      if (!(await gpu.confirmStart("generate a video", "video", licence ? { licence } : undefined))) return;
       const input: GenerateVideoInput = {
         model: model.id,
         prompt: prompt.trim(),
@@ -697,6 +709,18 @@ export const VideoPanel = forwardRef<
       setSubmitting(true);
       try {
         const { jobId } = await api.generateVideo(input);
+        // The same settings again within a few seconds: most likely a double tap, so say so with Undo (UI-078).
+        const key = JSON.stringify({ ...input, seed: input.seed ?? "random" });
+        const prev = lastQueued.current;
+        lastQueued.current = { key, at: Date.now() };
+        if (prev && prev.key === key && Date.now() - prev.at < REPEAT_WINDOW_MS)
+          showNotice({
+            tone: "info",
+            title: "Queued again — same settings as the video before",
+            detail: "Undo cancels this copy; the first video keeps running.",
+            undo: () => void api.cancelJob(jobId).catch((e) => toast.error("Couldn't cancel", e)),
+            vault: saveTo === "vault",
+          });
         onQueued({
           jobId,
           kind: "video",
@@ -766,20 +790,18 @@ export const VideoPanel = forwardRef<
     return { min, cost: (min / 60) * vgpu.costPerHr, runs: rates.length };
   }, [history, selSize?.[0], selSize?.[1], frames, vgpu.costPerHr]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const footHint =
-    blocker === "Write a prompt"
-      ? "Write a prompt to generate."
-      : blocker
-        ? blocker
-        : activeJobs
-          ? `${activeJobs} video${activeJobs === 1 ? "" : "s"} running`
-          : startsGpu
-            ? `Starts the video GPU in Canada first (${vgpu.startTarget}, ${vgpu.costLabel}; a few minutes). It auto-stops after ${vgpu.idleMinutes} idle min.`
-            : `Runs on the video GPU (${vgpu.gpuName}, ${vgpu.costLabel}).`;
+  const footHint = blocker
+    ? `${blockers.join(" · ")}${blockers.length === 1 && blocker === "Write a prompt" ? " to generate" : ""}.`.replace(/(…|\.)\.$/, "$1")
+    : activeJobs
+      ? `${activeJobs} video${activeJobs === 1 ? "" : "s"} running`
+      : startsGpu
+        ? `Starts the video GPU in Canada first (${vgpu.startTarget}, ${vgpu.costLabel}; a few minutes). It auto-stops after ${vgpu.idleMinutes} idle min.`
+        : `Runs on the video GPU (${vgpu.gpuName}, ${vgpu.costLabel}).`;
   const soundWord = model?.audio && form.audio;
 
   return (
     <form
+      ref={formRef}
       className="panel"
       aria-label="Video settings"
       hidden={hidden}
@@ -815,7 +837,7 @@ export const VideoPanel = forwardRef<
             </ul>
           )}
           {model && !model.installed && (
-            <div className="notice notice--inline">
+            <div className="notice notice--inline model-missing">
               <Icon name="cube" />
               <span>{model.task ? `${model.name} is downloading to the video volume.` : `${model.name} isn't on the video volume yet.`}</span>
               <button
@@ -889,8 +911,17 @@ export const VideoPanel = forwardRef<
             </p>
           )}
           {!prompt.trim() && sourcePrompt && startImage && (
-            <button type="button" className="chip chip--word source-prompt" onClick={() => setPrompt(sourcePrompt.text)} title={sourcePrompt.text}>
-              <Icon name="plus" size={11} /> Use the image's prompt: {clip(sourcePrompt.text, 48)}
+            // The label is its own span so the ellipsis shows (bare text in a flex button only clips, UI-033);
+            // the full prompt is the accessible name, not only a mouse tooltip.
+            <button
+              type="button"
+              className="chip chip--word source-prompt"
+              onClick={() => setPrompt(sourcePrompt.text)}
+              title={sourcePrompt.text}
+              aria-label={`Use the image's prompt: ${sourcePrompt.text}`}
+            >
+              <Icon name="plus" size={11} />
+              <span className="source-prompt__label">Use the image's prompt: {sourcePrompt.text}</span>
             </button>
           )}
         </section>
@@ -1035,14 +1066,9 @@ export const VideoPanel = forwardRef<
       </div>
 
       <div className="panel__foot">
-        <PanelNoticeView notice={notice} onDismiss={clearNotice} />
+        <PanelNoticeView notice={notice} onDismiss={clearNotice} onHold={holdNotice} />
         {saveToSwitch}
-        <button
-          type="submit"
-          className="btn btn--generate"
-          disabled={submitting || (!!blocker && blocker !== "Write a prompt" && !blocker.startsWith("Fix "))}
-          aria-describedby="video-gen-hint"
-        >
+        <button type="submit" className="btn btn--generate" disabled={submitting} aria-disabled={!!blocker || undefined} aria-describedby="video-gen-hint">
           <Icon name="video" size={18} />
           <span>{submitting ? "Queuing…" : startsGpu ? "Start GPU & Generate video" : "Generate video"}</span>
           <span className="kbd-group" aria-hidden>
@@ -1050,7 +1076,7 @@ export const VideoPanel = forwardRef<
             <kbd>↵</kbd>
           </span>
         </button>
-        <p id="video-gen-hint" className={`hint panel__hint ${blocker && blocker !== "Write a prompt" ? "panel__hint--block" : ""}`}>
+        <p id="video-gen-hint" className={`hint panel__hint ${blocker ? "panel__hint--block" : ""}`}>
           {footHint}
         </p>
       </div>
@@ -1060,11 +1086,14 @@ export const VideoPanel = forwardRef<
         preferVault={saveTo === "vault"}
         modelNames={modelNames}
         currentId={startImage?.vaultId ?? startImage?.galleryId ?? undefined}
+        returnFocusRef={promptRef}
         onClose={() => setPickerOpen(false)}
         onPick={(rec) => {
           setPickerOpen(false);
           setStartImage(fromGallery(rec, modelNames[rec.model]));
           setSourcePrompt(rec.prompt ? { text: rec.prompt, vault: !!rec.vault } : null);
+          // The picker's opener ("From gallery") is replaced by the thumbnail: continue at the prompt (UI-006).
+          requestAnimationFrame(() => promptRef.current?.focus());
         }}
       />
 

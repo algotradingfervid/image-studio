@@ -7,9 +7,9 @@ import { formatUsd } from "../lib/format";
 import { Dialog } from "./Dialog";
 import { Icon } from "./Icon";
 
-/** Where each profile's pod runs (spec v5). */
+/** Where each profile's pod runs (spec v5); one pattern for both, "Country (datacenter)" (UI-077). */
 export const PROFILE_POD: Record<GpuProfile, { pod: string; region: string }> = {
-  image: { pod: "Images pod", region: "EU-RO-1 (Romania)" },
+  image: { pod: "Images pod", region: "Romania (EU-RO-1)" },
   video: { pod: "Video pod", region: "Canada (CA-MTL-3)" },
 };
 
@@ -31,6 +31,8 @@ export function StartGpuDialog({
   details,
   confirmLabel,
   selfStopOff,
+  danger,
+  licence,
   onAnswer,
 }: {
   open: boolean;
@@ -43,15 +45,22 @@ export function StartGpuDialog({
   confirmLabel?: string;
   /** "Let the pod stop itself when idle" is off: the pod keeps billing if the app closes. */
   selfStopOff?: boolean;
+  /** The confirm destroys data (a delete that needs the GPU): danger styling instead of primary (UI-019). */
+  danger?: boolean;
+  /** A licence / region restriction of what will run, shown as its own row (UI-054). */
+  licence?: string;
   onAnswer: (ok: boolean) => void;
 }) {
-  const confirmRef = useRef<HTMLButtonElement>(null);
+  // Opens on Cancel, as every paid or destructive confirm does: a habitual Enter must not start a
+  // billed pod (UI-005). Tab reaches the Start button.
+  const cancelRef = useRef<HTMLButtonElement>(null);
   const price = info ? `~${formatUsd(info.costPerHr)}/h` : "";
   const where = info ? PROFILE_POD[info.profile] : null;
-  const which = info?.profile === "video" ? "video GPU" : "Images GPU";
+  // Same casing as the header pills and every other GPU title (UI-054).
+  const which = info?.profile === "video" ? "Video GPU" : "Images GPU";
 
-  // Enter confirms (Cancel / ✕ keep their own meaning); a held key's repeats are ignored so the
-  // ⌘Enter that opened the dialog can't also confirm it.
+  // Enter activates the focused button (Cancel and ✕ cancel; Start or any other control inside
+  // confirms); a held key's repeats are ignored so the ⌘Enter that opened the dialog can't act on it.
   const onKeyDown = (e: KeyboardEvent<HTMLDialogElement>) => {
     if (e.key !== "Enter") return;
     e.preventDefault();
@@ -66,16 +75,16 @@ export function StartGpuDialog({
       open={open}
       onClose={() => onAnswer(false)}
       className="start-gpu"
-      initialFocusRef={confirmRef}
+      initialFocusRef={cancelRef}
       onKeyDown={onKeyDown}
       title={action ? `Start the ${which} to ${action}?` : `Start the ${which}?`}
       footer={
         <>
-          <button type="button" className="btn" data-cancel onClick={() => onAnswer(false)}>
+          <button ref={cancelRef} type="button" className="btn" data-cancel onClick={() => onAnswer(false)}>
             Cancel
           </button>
-          <button ref={confirmRef} type="button" className="btn btn--primary" onClick={() => onAnswer(true)}>
-            <Icon name="bolt" /> {confirmLabel ? `${confirmLabel} (${price})` : `Start GPU (${price})`}
+          <button type="button" className={`btn ${danger ? "btn--danger" : "btn--primary"}`} onClick={() => onAnswer(true)}>
+            <Icon name={danger ? "trash" : "bolt"} /> {confirmLabel ? `${confirmLabel} (${price})` : `Start GPU (${price})`}
           </button>
         </>
       }
@@ -89,6 +98,12 @@ export function StartGpuDialog({
             </dd>
             <dt>GPU</dt>
             <dd>{info.gpu}</dd>
+            {licence && (
+              <>
+                <dt>Licence</dt>
+                <dd>{licence}</dd>
+              </>
+            )}
             <dt>Price</dt>
             <dd>
               <strong className="mono">{price}</strong>

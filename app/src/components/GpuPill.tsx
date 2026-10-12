@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import type { GpuProfile } from "../api";
 import { formatElapsed, formatUsd, toDate } from "../lib/format";
 import { useNow } from "../lib/useNow";
@@ -41,7 +41,21 @@ function untilText(at: number, now: number): string {
   return m <= 1 ? "<1 min" : `${m} min`;
 }
 
-/** One profile's pill: status, live elapsed time and cost, Start/Stop. */
+/** "28m" / "<1m": the idle countdown short enough for the pill at any width (UI-058). */
+function untilShort(at: number, now: number): string {
+  const m = Math.ceil(Math.max(0, at - now) / 60_000);
+  return m <= 1 ? "<1m" : `${m}m`;
+}
+
+/**
+ * One profile's pill: a short state word that shows at every width ("Starting", "Idle 28m"),
+ * then GPU, elapsed time and cost as room allows; the text opens a details popover (start time,
+ * cost so far, auto-stop) for keyboard, touch and screen readers (UI-058).
+ *
+ * The Start / Stop / Retry action is ONE button whose label changes with the state, and it is
+ * never `disabled` while its confirm is open, so focus stays on it through a confirm and the
+ * Start → Stop swap instead of dropping to <body> (UI-006).
+ */
 export function GpuPill({ profile = "image" }: { profile?: GpuProfile }) {
   const gpu = useGpu();
   const info = gpu.profiles[profile];
@@ -49,143 +63,180 @@ export function GpuPill({ profile = "image" }: { profile?: GpuProfile }) {
   const running = g?.status === "running" || g?.status === "starting";
   const now = useNow(running, 15_000);
   const [busy, setBusy] = useState(false);
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const popId = useId();
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: PointerEvent) => {
+      if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", onDown);
+    return () => document.removeEventListener("pointerdown", onDown);
+  }, [open]);
 
   if (!g) return null;
 
   const label = PROFILE_LABEL[profile];
-  const what = profile === "video" ? "video GPU" : "Images GPU";
-  const aria = `${label} GPU status`;
+  const what = `${label} GPU`;
   const start = async () => {
+    if (busy) return;
     setBusy(true);
-    await gpu.start(profile);
-    setBusy(false);
+    try {
+      await gpu.start(profile);
+    } finally {
+      setBusy(false);
+    }
   };
   const stop = () => gpu.stop(profile);
 
-  switch (g.status) {
-    case "stopped":
-      return (
-        <div className={`gpu-pill gpu-pill--stopped gpu-pill--${profile}`} role="status" aria-label={aria}>
-          <span className="gpu-pill__dot" aria-hidden />
-          <span className="gpu-pill__text" title={`${label} pod stopped · not billing · starts ${info.startTarget} at ${info.costLabel}`}>
-            <span className="gpu-pill__profile">{label}</span>
-            <span className="gpu-pill__state"> · stopped</span>
-          </span>
-          <button
-            type="button"
-            className="btn btn--sm gpu-pill__btn"
-            onClick={start}
-            disabled={busy}
-            title={`Start the ${what} pod (${info.startTarget}, ${info.costLabel})`}
-            aria-label={`Start the ${what}`}
-          >
-            <Icon name="bolt" size={13} /> Start
-          </button>
-        </div>
-      );
-    case "starting":
-      return (
-        <div className={`gpu-pill gpu-pill--starting gpu-pill--${profile}`} role="status" aria-label={aria}>
+  const started = toDate(g.startedAt);
+  const ms = started ? Math.max(0, now - started.getTime()) : 0;
+  const cost = (ms / 3_600_000) * info.costPerHr;
+  const isRunning = g.status === "running";
+  // useNow's clock can trail the moment the pod went idle: never count past the limit.
+  const idleNow = info.autoStopAt != null ? Math.max(now, info.autoStopAt - info.idleMinutes * 60_000) : now;
+  const countdown = isRunning && info.autoStopAt != null ? untilText(info.autoStopAt, idleNow) : null;
+  const noWatchdog = isRunning && g.watchdogArmed === false;
+  const watchdogMsg = `The ${what} pod can't auto-stop itself — the app will stop it after ${info.idleMinutes} idle min; keep the app open or stop manually.`;
+  const errorWithPod = g.status === "error" && !!g.podId;
+
+  // The state word: always visible. The live region announces only state changes, not the countdown.
+  const word =
+    g.status === "stopped"
+      ? "Stopped"
+      : g.status === "starting"
+        ? "Starting"
+        : g.status === "stopping"
+          ? "Stopping…"
+          : isRunning
+            ? countdown
+              ? `Idle ${untilShort(info.autoStopAt!, idleNow)}`
+              : "Running"
+            : errorWithPod
+              ? "Error · may still be billing"
+              : "Error";
+  const spoken =
+    g.status === "error" ? `${what}: error${errorWithPod ? ", may still be billing" : ""}` : `${what} ${g.status === "stopping" ? "stopping" : g.status}`;
+
+  const facts: [string, string][] = [
+    ["GPU", g.gpuType ? info.gpuName : info.startTarget],
+    ["Price", info.costLabel],
+  ];
+  if (g.status === "starting" && g.phase) facts.push(["Phase", g.phase]);
+  if (started && (isRunning || g.status === "starting"))
+    facts.push(["Started", `${started.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} · ~${formatUsd(cost)} so far`]);
+  if (isRunning)
+    facts.push([
+      "Auto-stop",
+      countdown ? `idle · stops in ${countdown}` : info.activeWork > 0 ? `busy · ${info.idleMinutes} idle min after the work ends` : `after ${info.idleMinutes} idle min`,
+    ]);
+  if (g.status === "stopped") facts.push(["Billing", "not billing"]);
+  if (g.status === "error" && g.error) facts.push(["Problem", g.error]);
+  if (noWatchdog) facts.push(["Note", watchdogMsg]);
+
+  // The one action button: what it does in this state.
+  const action =
+    g.status === "stopped" || (g.status === "error" && !g.podId)
+      ? {
+          text: g.status === "stopped" ? "Start" : "Retry",
+          icon: g.status === "stopped" ? ("bolt" as const) : ("refresh" as const),
+          name: g.status === "stopped" ? `Start the ${what}` : `Retry starting the ${what}`,
+          title: `Start the ${what} pod (${info.startTarget}, ${info.costLabel})`,
+          cls: "",
+          run: start,
+          off: busy,
+        }
+      : {
+          text: "Stop",
+          icon: "stop" as const,
+          name: `Stop the ${what}`,
+          title: g.status === "starting" ? `Cancel the start and remove the ${what} pod` : g.status === "stopping" ? "Stopping…" : `Stop the ${what} pod`,
+          cls: g.status === "starting" ? "btn--ghost" : errorWithPod ? "btn--danger" : "",
+          run: stop,
+          off: g.status === "stopping",
+        };
+
+  return (
+    <div
+      ref={rootRef}
+      className={`gpu-pill gpu-pill--${g.status} gpu-pill--${profile}`}
+      role="group"
+      aria-label={what}
+      onKeyDown={(e) => {
+        if (e.key === "Escape" && open) {
+          e.stopPropagation();
+          setOpen(false);
+          rootRef.current?.querySelector<HTMLElement>(".gpu-pill__text")?.focus();
+        }
+      }}
+    >
+      <span className="gpu-pill__ind" aria-hidden>
+        {g.status === "starting" || g.status === "stopping" ? (
           <Icon name="refresh" size={13} className="spin" />
-          <span className="gpu-pill__text" title={`${label} · starting ${info.startTarget} · billed ${info.costLabel} from now`}>
-            <span className="gpu-pill__profile">{label}</span>
-            <span className="gpu-pill__gpu"> · Starting{g.phase ? ` · ${g.phase}` : "…"}</span>
-            <span className="mono gpu-pill__rate"> · ~{formatUsd(info.costPerHr)}/h</span>
-          </span>
-          <button type="button" className="btn btn--sm btn--ghost gpu-pill__btn" onClick={stop} title={`Cancel the start and remove the ${what} pod`} aria-label={`Stop the ${what}`}>
-            <Icon name="stop" size={13} /> Stop
-          </button>
-        </div>
-      );
-    case "running": {
-      const started = toDate(g.startedAt);
-      const ms = started ? now - started.getTime() : 0;
-      const cost = (Math.max(0, ms) / 3_600_000) * info.costPerHr;
-      const noWatchdog = g.watchdogArmed === false;
-      const watchdogMsg = `The ${what} pod can't auto-stop itself — the app will stop it after ${info.idleMinutes} idle min; keep the app open or stop manually.`;
-      // useNow's clock can trail the moment the pod went idle: never count past the limit.
-      const countdown = info.autoStopAt != null ? untilText(info.autoStopAt, Math.max(now, info.autoStopAt - info.idleMinutes * 60_000)) : null;
-      const tip = [
-        `${label} · ${g.gpuType ?? info.gpuName} · ${formatUsd(info.costPerHr)}/h`,
-        started ? `started ${started.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} · ~${formatUsd(cost)} so far` : null,
-        countdown ? `idle · auto-stops in ${countdown}` : info.activeWork > 0 ? `busy · auto-stops ${info.idleMinutes} idle min after the work ends` : `auto-stops after ${info.idleMinutes} idle min`,
-      ]
-        .filter(Boolean)
-        .join("\n");
-      return (
-        <div className={`gpu-pill gpu-pill--running gpu-pill--${profile}`} role="status" aria-label={aria}>
-          <span className="gpu-pill__dot" aria-hidden />
-          <span className="gpu-pill__text" title={tip}>
-            <span className="gpu-pill__profile">{label}</span>
-            <span className="gpu-pill__gpu"> · {info.gpuName}</span>
-            {started && (
-              <>
-                <span className="gpu-pill__elapsed">
-                  {" "}
-                  · <span className="mono">{formatElapsed(ms)}</span>
-                </span>
-                <span className="gpu-pill__cost">
-                  {" "}
-                  · <span className="mono">~{formatUsd(cost)}</span>
-                </span>
-              </>
-            )}
-            {countdown && <span className="gpu-pill__idle"> · idle, stops in {countdown}</span>}
-          </span>
-          {noWatchdog && (
-            <span className="gpu-pill__warn" title={watchdogMsg} tabIndex={0}>
-              <Icon name="alert" size={13} label={watchdogMsg} />
-            </span>
-          )}
-          <button type="button" className="btn btn--sm gpu-pill__btn" onClick={stop} aria-label={`Stop the ${what}`}>
-            <Icon name="stop" size={13} /> Stop
-          </button>
-        </div>
-      );
-    }
-    case "stopping":
-      return (
-        <div className={`gpu-pill gpu-pill--stopping gpu-pill--${profile}`} role="status" aria-label={aria}>
-          <Icon name="refresh" size={13} className="spin" />
-          <span className="gpu-pill__text">
-            <span className="gpu-pill__profile">{label}</span> · Stopping…
-          </span>
-        </div>
-      );
-    default:
-      // A pod may still exist (and bill): Stop comes first and is prominent.
-      if (g.podId) {
-        return (
-          <div className={`gpu-pill gpu-pill--error gpu-pill--${profile}`} role="status" aria-label={aria}>
-            <Icon name="alert" size={13} />
-            <span className="gpu-pill__text" title={g.error ?? undefined}>
-              {label} · Error · <strong>may still be billing</strong>
-            </span>
-            <button
-              type="button"
-              className="btn btn--sm btn--danger gpu-pill__btn"
-              onClick={stop}
-              title={g.error ? `${g.error}\n\nStop terminates the pod.` : "Stop terminates the pod."}
-              aria-label={`Stop the ${what}`}
-            >
-              <Icon name="stop" size={13} /> Stop
-            </button>
-            <button type="button" className="btn btn--sm btn--ghost gpu-pill__btn" onClick={start} disabled={busy} aria-label={`Retry starting the ${what}`}>
-              <Icon name="refresh" size={13} /> Retry
-            </button>
-          </div>
-        );
-      }
-      return (
-        <div className={`gpu-pill gpu-pill--error gpu-pill--${profile}`} role="status" aria-label={aria}>
+        ) : g.status === "error" ? (
           <Icon name="alert" size={13} />
-          <span className="gpu-pill__text" title={g.error ?? undefined}>
-            {label} · Error
-          </span>
-          <button type="button" className="btn btn--sm gpu-pill__btn" onClick={start} disabled={busy} aria-label={`Retry starting the ${what}`} title={g.error ?? undefined}>
-            <Icon name="refresh" size={13} /> Retry
-          </button>
-        </div>
-      );
-  }
+        ) : (
+          <span className="gpu-pill__dot" />
+        )}
+      </span>
+      <button type="button" className="gpu-pill__text" aria-expanded={open} aria-controls={popId} onClick={() => setOpen((o) => !o)}>
+        <span className="gpu-pill__profile">{label}</span>
+        <span className="gpu-pill__word"> · {word}</span>
+        {g.status === "starting" && g.phase && <span className="gpu-pill__phase"> · {g.phase}</span>}
+        {g.status === "starting" && <span className="mono gpu-pill__rate"> · ~{formatUsd(info.costPerHr)}/h</span>}
+        {isRunning && <span className="gpu-pill__gpu"> · {info.gpuName}</span>}
+        {isRunning && started && (
+          <>
+            <span className="gpu-pill__elapsed">
+              {" "}
+              · <span className="mono">{formatElapsed(ms)}</span>
+            </span>
+            <span className="gpu-pill__cost">
+              {" "}
+              · <span className="mono">~{formatUsd(cost)}</span>
+            </span>
+          </>
+        )}
+        <span className="visually-hidden"> (details)</span>
+      </button>
+      {noWatchdog && (
+        <span className="gpu-pill__warn" title={watchdogMsg}>
+          <Icon name="alert" size={13} label="Can't auto-stop itself" />
+        </span>
+      )}
+      <button
+        type="button"
+        className={`btn btn--sm gpu-pill__btn ${action.cls}`}
+        onClick={() => !action.off && void action.run()}
+        aria-disabled={action.off || undefined}
+        title={action.title}
+        aria-label={action.name}
+      >
+        <Icon name={action.icon} size={13} /> <span className="gpu-pill__btn-text">{action.text}</span>
+      </button>
+      {errorWithPod && (
+        <button type="button" className="btn btn--sm btn--ghost gpu-pill__btn" onClick={() => void start()} aria-disabled={busy || undefined} aria-label={`Retry starting the ${what}`}>
+          <Icon name="refresh" size={13} /> <span className="gpu-pill__btn-text">Retry</span>
+        </button>
+      )}
+      <span className="visually-hidden" role="status">
+        {spoken}
+      </span>
+      <div id={popId} className="gpu-pill__pop" hidden={!open}>
+        <p className="gpu-pill__pop-title">
+          {what} · {word}
+        </p>
+        <dl>
+          {facts.map(([k, v]) => (
+            <div key={k}>
+              <dt>{k}</dt>
+              <dd>{v}</dd>
+            </div>
+          ))}
+        </dl>
+      </div>
+    </div>
+  );
 }

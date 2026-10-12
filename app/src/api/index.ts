@@ -147,6 +147,12 @@ export const vaultLock = () => call<VaultStatus>("vault_lock");
 export const vaultChangePassword = (oldPassword: string, newPassword: string) =>
   call<VaultStatus>("vault_change_password", { oldPassword, newPassword });
 export const vaultSetAutoLock = (minutes: number) => call<VaultStatus>("vault_set_auto_lock", { minutes });
+/**
+ * Permanently deletes the vault: every item, the key material and the vault itself (UI-059).
+ * Locked or unlocked, no password. `confirm` is what the user typed; the core refuses anything
+ * but `VAULT_ERASE_WORD` (`CONFIRM_REQUIRED: …`). Returns the no-vault status.
+ */
+export const vaultErase = (confirm: string) => call<VaultStatus>("vault_erase", { confirm });
 /** Resets the inactivity timer (the UI calls it on user input, at most every 30 s). */
 export const vaultTouch = () => call<void>("vault_touch");
 /** Newest first; rejects with `VAULT_LOCKED` while locked. */

@@ -54,6 +54,10 @@ export interface StartDetails {
   details?: string[];
   /** Replaces "Start GPU (~$2.49/h)", e.g. "Start GPU & download 17.2 GB". */
   confirmLabel?: string;
+  /** The confirm button destroys data ("Start GPU & delete 2 files"): danger styling, not primary (UI-019). */
+  danger?: boolean;
+  /** A licence / region restriction restated as a "Licence" row (UI-054), e.g. "Runs in Canada — licence excludes EU/UK/KR/US". */
+  licence?: string;
 }
 
 interface Gpu extends Omit<GpuProfileInfo, "profile" | "live" | "needsStart" | "autoStopAt"> {
@@ -109,6 +113,8 @@ export function GpuProvider({ children }: { children: ReactNode }) {
   const prev = useRef<Record<GpuProfile, GpuState | null>>({ ...emptyStates });
   /** The last known start time / price of each pod, for the "ran 3 min · ~$0.12" stop toast. */
   const runInfo = useRef<Record<GpuProfile, { startedAt: string; costPerHr: number } | null>>({ image: null, video: null });
+  /** The action each pod was last started for ("download SDXL Pixel Art"), from the start confirmation. */
+  const startedFor = useRef<Record<GpuProfile, string | null>>({ image: null, video: null });
   /** Active generation jobs by id → the profile they run on, and their progress (for the Stop dialog). */
   const [activeJobs, setActiveJobs] = useState<Map<string, ActiveJob>>(() => new Map());
   const [stopAsk, setStopAsk] = useState<GpuProfile | null>(null);
@@ -182,8 +188,11 @@ export function GpuProvider({ children }: { children: ReactNode }) {
       // Remember the run's start/price while the pod exists (the stop event no longer has them).
       if (g.status !== "stopped" && g.startedAt) runInfo.current[p] = { startedAt: g.startedAt, costPerHr: g.costPerHr ?? DEFAULT_COST };
       if (!before || before.status === g.status) return;
-      const what = p === "video" ? "video GPU" : "GPU";
-      const What = p === "video" ? "Video GPU" : "Images GPU";
+      const what = p === "video" ? "Video GPU" : "Images GPU";
+      const What = what;
+      const purpose = startedFor.current[p];
+      if (g.status === "stopped") startedFor.current[p] = null;
+      if (g.status === "starting") toast.dismissKey(`gpu-stopped-${p}`);
       // Run time and cost of the pod that just went away (from the last state that had them).
       const ranFrom = runInfo.current[p];
       const ran = (() => {
@@ -193,12 +202,21 @@ export function GpuProvider({ children }: { children: ReactNode }) {
         return ` · ran ${formatElapsed(ms)} · ~${formatUsd((ms / 3_600_000) * ranFrom.costPerHr)}`;
       })();
       if (g.status === "stopped") runInfo.current[p] = null;
+      // Toasts that report time and money stay until dismissed, one per pod (UI-022).
+      const costToast = (title: string, message: string) =>
+        ran ? toast.notify({ kind: "info", title, message, sticky: true, key: `gpu-stopped-${p}` }) : toast.info(title, message);
       if (g.status === "stopped" && g.stopReason === "cancelled") {
-        toast.info(`${What} stopped${ran}`, "It was starting only for the job you cancelled, so the app stopped it to end billing.");
+        costToast(`${What} stopped${ran}`, "It was starting only for the job you cancelled, so the app stopped it to end billing.");
       } else if (g.status === "stopped" && g.stopReason === "finished") {
-        toast.info(`${What} stopped${ran}`, "It was started only for a Models-screen task (Refresh, download or delete), which has finished.");
+        // Name the work it was started for (UI-021), whichever screen started it.
+        costToast(
+          `${What} stopped${ran}`,
+          purpose && !/^generate|^make|^create/i.test(purpose)
+            ? `It was started only to ${purpose}, which has finished.`
+            : "It was started only for a download, delete or status refresh, which has finished.",
+        );
       } else if (g.status === "stopped" && g.stopReason === "user") {
-        toast.info(`${What} stopped${ran}`, "Billing has ended for this pod.");
+        costToast(`${What} stopped${ran}`, "Billing has ended for this pod.");
       } else if (g.status === "stopped" && g.stopReason === "idle" && before.status === "error") {
         toast.info(`${What} pod stopped automatically`, "It was left over from a GPU problem, so the app stopped it to end billing.");
       } else if (g.status === "stopped" && g.stopReason === "idle") {
@@ -317,6 +335,8 @@ export function GpuProvider({ children }: { children: ReactNode }) {
 
   const answerStart = (ok: boolean) => {
     const resolve = startAsk?.resolve;
+    // What this start is for, to name it when the app stops the pod again after that work (UI-021).
+    if (ok && startAsk) startedFor.current[startAsk.profile] = startAsk.action ?? null;
     pendingAsk.current = null;
     setStartAsk(null);
     resolve?.(ok);
@@ -329,7 +349,7 @@ export function GpuProvider({ children }: { children: ReactNode }) {
         const g = await api.startGpu(profile);
         apply({ ...g, profile: g.profile ?? profile });
       } catch (e) {
-        toast.error(profile === "video" ? "Couldn't start the video GPU" : "Couldn't start the GPU", e);
+        toast.error(profile === "video" ? "Couldn't start the Video GPU" : "Couldn't start the Images GPU", e);
       }
     },
     [apply, toast, confirmStart],
@@ -342,7 +362,7 @@ export function GpuProvider({ children }: { children: ReactNode }) {
         const g = await api.stopGpu(profile);
         apply({ ...g, profile: g.profile ?? profile });
       } catch (e) {
-        toast.error(profile === "video" ? "Couldn't stop the video GPU" : "Couldn't stop the GPU", e);
+        toast.error(profile === "video" ? "Couldn't stop the Video GPU" : "Couldn't stop the Images GPU", e);
       } finally {
         setStopping(false);
         setStopAsk(null);
@@ -406,7 +426,10 @@ export function GpuProvider({ children }: { children: ReactNode }) {
     const done = js.reduce((a, j) => a + j.completed, 0);
     const unit = p === "video" ? "video" : "image";
     const lost = total - done;
-    return ` ${done} of ${total} ${unit}${total === 1 ? "" : "s"} done — stopping now keeps the finished ${unit}s and loses ${lost}.`;
+    const units = (n: number) => `${unit}${n === 1 ? "" : "s"}`;
+    // UI-055: plain words when nothing is finished yet.
+    if (done === 0) return ` Stopping now loses ${total === 1 ? `the ${unit}` : `all ${total} ${units(total)}`} in progress.`;
+    return ` ${done} of ${total} ${units(total)} done — stopping now keeps the finished ${units(done)} and loses ${lost}.`;
   };
 
   const stopInfo = stopAsk ? profiles[stopAsk] : null;
@@ -426,7 +449,7 @@ export function GpuProvider({ children }: { children: ReactNode }) {
       <Dialog
         open={!!stopAsk}
         onClose={stopping ? () => {} : () => setStopAsk(null)}
-        title={stopAsk === "video" ? "Stop the video GPU?" : "Stop the Images GPU?"}
+        title={stopAsk === "video" ? "Stop the Video GPU?" : "Stop the Images GPU?"}
         footer={
           <>
             <button type="button" className="btn" onClick={() => setStopAsk(null)} disabled={stopping} autoFocus>
@@ -437,19 +460,19 @@ export function GpuProvider({ children }: { children: ReactNode }) {
               className="btn btn--danger"
               onClick={() => stopAsk && void doStop(stopAsk)}
               disabled={stopping}
-              aria-label={stopAsk === "video" ? "Stop the video GPU" : "Stop the Images GPU"}
             >
-              <Icon name="stop" /> {stopping ? "Stopping…" : "Stop GPU"}
+              {/* The visible words are the whole name (UI-055: label in name). */}
+              <Icon name="stop" /> {stopping ? "Stopping…" : stopAsk === "video" ? "Stop Video GPU" : "Stop Images GPU"}
             </button>
           </>
         }
       >
         {stopInfo &&
           (stopInfo.activeWork === 0 ? (
-            <p className="gpu-dialog__lede">Nothing is running on the {stopInfo.profile === "video" ? "video" : "Images"} GPU now. Stop it?</p>
+            <p className="gpu-dialog__lede">Nothing is running on the {stopInfo.profile === "video" ? "Video" : "Images"} GPU now. Stop it?</p>
           ) : (
             <p className="gpu-dialog__lede">
-              {workText(stopInfo.profile)} {stopInfo.activeWork === 1 ? "is" : "are"} still running on the {stopInfo.profile === "video" ? "video" : "Images"} GPU.
+              {workText(stopInfo.profile)} {stopInfo.activeWork === 1 ? "is" : "are"} still running on the {stopInfo.profile === "video" ? "Video" : "Images"} GPU.
               {doneText(stopInfo.profile) || ` Stopping the pod ends ${stopInfo.activeWork === 1 ? "it" : "them"} now.`} Unfinished downloads are lost too.
             </p>
           ))}
@@ -515,6 +538,8 @@ export function GpuProvider({ children }: { children: ReactNode }) {
         action={startAsk?.action}
         details={startAsk?.extra?.details}
         confirmLabel={startAsk?.extra?.confirmLabel}
+        danger={startAsk?.extra?.danger}
+        licence={startAsk?.extra?.licence}
         selfStopOff={selfStopOff}
         onAnswer={answerStart}
         info={

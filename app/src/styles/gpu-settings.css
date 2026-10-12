@@ -86,9 +86,12 @@
   background: var(--panel-2);
 }
 
+/* The current section: the shared selected-tab underline, not a filled primary-looking pill (UI-039). */
 .section-nav__link.is-active {
-  color: var(--accent-ink);
-  background: var(--accent);
+  color: var(--text);
+  background: var(--panel-2);
+  box-shadow: var(--selected-bar);
+  border-radius: 6px;
 }
 
 .section-nav__link:focus-visible {
@@ -119,7 +122,10 @@
   color: var(--warn);
 }
 
-/* A disabled primary reads as disabled: grey outline, not muted orange (UX-028). */
+/* A disabled primary reads as disabled: grey outline, not muted orange (UX-028). aria-disabled
+   buttons keep focus while unavailable (UI-006) and look the same. */
+.settings .btn--primary[aria-disabled="true"],
+.settings .btn--primary[aria-disabled="true"]:hover,
 .settings .btn--primary:disabled,
 .settings-bar .btn--primary:disabled,
 .loras .btn--primary:disabled {
@@ -127,6 +133,10 @@
   background: transparent;
   color: var(--text-3);
   border-color: var(--line-3);
+}
+
+.settings .btn--primary[aria-disabled="true"] {
+  cursor: not-allowed;
 }
 
 /* .plain (styles.css, loaded after this file) would zero the padding/margin: out-rank it. */
@@ -201,6 +211,78 @@
   }
 }
 
+/* Settings fits an 800px window (UI-008): the column's grid track may shrink below its content's
+   min-content width, and long mono values and the settings path wrap instead of widening it. */
+.page__inner--narrow {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.config-rows dd .mono {
+  overflow-wrap: anywhere;
+}
+
+.config-file .vault-settings__row {
+  flex-wrap: wrap;
+}
+
+.config-file .config-file__path {
+  flex: 1 1 220px;
+}
+
+/* The auto-stop error has its own line, so it doesn't move the help and cost lines (UI-045). */
+.field-error-slot {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 18px;
+  margin: 0;
+}
+
+.field-error-slot ~ .hint {
+  margin: 0;
+}
+
+.settings .switch ~ .notice {
+  margin-top: 4px;
+}
+
+/* A blocked save's reason is scrolled above the sticky bar (UI-007). */
+.notice.settings__blocked {
+  margin-top: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.settings__blocked > span {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.settings__blocked,
+.settings__blocked .btn,
+.key-results-box {
+  scroll-margin: 72px 0 96px;
+}
+
+.key-results-box:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: var(--r);
+}
+
+/* A dot on the Settings tab while edits are unsaved (UI-047); the alt text is read out. */
+:root[data-settings-dirty] #tab-settings .tab__label::after {
+  content: "";
+  content: "" / ", unsaved changes";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--warn);
+  vertical-align: 2px;
+}
+
 /* Unsaved-changes bar (UX-021). */
 .settings-bar {
   position: sticky;
@@ -233,6 +315,23 @@
 .settings-bar__actions {
   display: inline-flex;
   gap: 6px;
+  margin-left: auto;
+}
+
+.settings-bar__status {
+  min-width: 0;
+}
+
+.settings-bar--warn .settings-bar__status {
+  color: #f6d98c;
+}
+
+.settings-bar--error .settings-bar__status {
+  color: #ffc1ba;
+}
+
+.settings-bar--error .settings-bar__dot {
+  background: var(--danger);
 }
 
 /* ---------------------------------------------------------------- start confirmation */

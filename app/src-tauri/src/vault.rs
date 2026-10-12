@@ -94,6 +94,13 @@ pub const ERR_WEAK_PASSWORD: &str = "WEAK_PASSWORD";
 pub const ERR_SAME_PASSWORD: &str = "SAME_PASSWORD";
 pub const ERR_EXISTS: &str = "VAULT_EXISTS";
 pub const ERR_NO_VAULT: &str = "NO_VAULT";
+/// `vault_erase` called without the typed confirmation word (UI-059).
+pub const ERR_CONFIRM: &str = "CONFIRM_REQUIRED";
+/// `vault_erase` while a migration or a move into/out of the vault runs.
+pub const ERR_BUSY: &str = "VAULT_BUSY";
+/// The word the user types to erase the vault; the core checks it too, so no
+/// stray call can wipe the vault.
+pub const ERASE_CONFIRM_WORD: &str = "erase";
 
 fn b64(v: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(v)
@@ -655,6 +662,19 @@ pub struct Vault {
     /// `(plaintext length, content type)` per blob id for `vault://`, filled
     /// while unlocked and dropped on lock.
     media_cache: Mutex<HashMap<String, (u64, &'static str)>>,
+    /// Migrations and moves into/out of the vault running now. `erase` holds
+    /// this lock for its whole run, so a move can't start halfway through it.
+    moves: Mutex<usize>,
+}
+
+/// Marks a migration or a move as running until dropped (see [`Vault::begin_move`]).
+pub struct MoveGuard<'a>(&'a Vault);
+
+impl Drop for MoveGuard<'_> {
+    fn drop(&mut self) {
+        let mut n = self.0.moves.lock().unwrap();
+        *n = n.saturating_sub(1);
+    }
 }
 
 /// Decrypted `vault://` response data.
@@ -683,7 +703,15 @@ impl Vault {
             last_activity: Mutex::new(Instant::now()),
             unlock_gate: Mutex::new(()),
             media_cache: Mutex::new(HashMap::new()),
+            moves: Mutex::new(0),
         }
+    }
+
+    /// Marks a migration or a move into/out of the vault as running (erase is
+    /// refused meanwhile). Waits while an erase runs.
+    pub fn begin_move(&self) -> MoveGuard<'_> {
+        *self.moves.lock().unwrap() += 1;
+        MoveGuard(self)
     }
 
     pub fn dir(&self) -> &Path {
@@ -891,6 +919,46 @@ impl Vault {
             serde_json::to_string_pretty(&file).unwrap().as_bytes(),
         )?;
         self.touch();
+        Ok(())
+    }
+
+    /// Permanently deletes the vault (UI-059: the only way out of a forgotten
+    /// password). Needs no password and decrypts nothing. Locks first, then
+    /// deletes `vault.json`: without the wrapped private key no blob or item can
+    /// ever be decrypted again, so the vault is gone from that point even if
+    /// removing the rest fails. Then every item, blob and the migration journal.
+    /// Afterwards `exists()` is false and a new vault can be created.
+    /// `confirm` must be [`ERASE_CONFIRM_WORD`].
+    pub fn erase(&self, confirm: &str) -> Result<(), String> {
+        if confirm != ERASE_CONFIRM_WORD {
+            return Err(format!(
+                "{ERR_CONFIRM}: Type \"{ERASE_CONFIRM_WORD}\" to erase the vault"
+            ));
+        }
+        // Held to the end: no move or migration can start while the vault is erased.
+        let moves = self.moves.lock().unwrap();
+        let _gate = self.unlock_gate.lock().unwrap();
+        let file = self.dir.join(VAULT_FILE);
+        if !self.exists() && !file.exists() {
+            return Err(format!("{ERR_NO_VAULT}: No vault has been created yet"));
+        }
+        if *moves > 0 {
+            return Err(format!(
+                "{ERR_BUSY}: Wait for the move into the vault to finish"
+            ));
+        }
+        self.lock();
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Could not erase the vault: {e}")),
+        }
+        *self.public_key.lock().unwrap() = None;
+        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+            // The key is gone, so what is left can't be read; a later create
+            // reuses the directory.
+            crate::alog!("vault", "erase: some vault files were not removed: {e}");
+        }
         Ok(())
     }
 
@@ -1475,6 +1543,46 @@ mod tests {
         assert_eq!(v.unlock(PW).unwrap_err(), "WRONG_PASSWORD: Wrong password");
         v.unlock(b"new password 123").unwrap();
         assert_eq!(v.open_blob(&b.id).unwrap().as_slice(), b"kept");
+    }
+
+    #[test]
+    fn erase_needs_the_word_deletes_everything_and_allows_a_new_vault() {
+        let (_d, v) = vault();
+        assert!(v.erase(ERASE_CONFIRM_WORD).unwrap_err().starts_with("NO_VAULT"));
+        v.create(PW, KdfParams::fast()).unwrap();
+        let b = v.seal_blob(b"secret pixels", "png").unwrap();
+        v.put_item(&sample_item(&b)).unwrap();
+        std::fs::write(v.journal_path(), b"{}").unwrap();
+        // Refused while a migration or move runs; allowed once it ends.
+        {
+            let _move = v.begin_move();
+            let _second = v.begin_move();
+            assert!(v.erase(ERASE_CONFIRM_WORD).unwrap_err().starts_with("VAULT_BUSY"));
+        }
+        assert_eq!(*v.moves.lock().unwrap(), 0, "guards released");
+        assert!(v.exists() && v.is_unlocked(), "nothing deleted while busy");
+        // Without the typed word nothing happens.
+        assert!(v.erase("").unwrap_err().starts_with("CONFIRM_REQUIRED"));
+        assert!(v.erase("Erase ").unwrap_err().starts_with("CONFIRM_REQUIRED"));
+        assert!(v.exists() && v.is_unlocked());
+        // Works while locked, without the password.
+        v.lock();
+        v.erase(ERASE_CONFIRM_WORD).unwrap();
+        assert!(!v.dir().exists(), "vault directory removed");
+        let s = v.status();
+        assert!(!s.exists && !s.unlocked && !s.migration_pending);
+        assert_eq!(s.item_count, None);
+        assert!(v.unlock(PW).unwrap_err().starts_with("NO_VAULT"));
+        assert!(v.seal_blob(b"x", "bin").is_err(), "no public key left");
+        // A fresh Vault over the same directory sees no vault either.
+        assert!(!Vault::new(v.dir().to_path_buf(), 10).exists());
+        // Start over with a new password; nothing of the old vault is there.
+        v.create(b"another password", KdfParams::fast()).unwrap();
+        assert!(v.items().unwrap().is_empty());
+        assert!(v.open_blob(&b.id).is_err());
+        // Erasing an unlocked vault drops its key and items too.
+        v.erase(ERASE_CONFIRM_WORD).unwrap();
+        assert!(!v.is_unlocked() && !v.exists());
     }
 
     #[test]

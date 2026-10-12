@@ -2,7 +2,7 @@
 // paginated with list_images and infinite scroll like the gallery. A General | Vault switch offers vault
 // images while unlocked; while locked the Vault side offers an inline unlock and shows nothing from the vault.
 
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type RefObject } from "react";
 import * as api from "../../api";
 import { fileSrc, type ImageRecord } from "../../api";
 import { Dialog } from "../../components/Dialog";
@@ -10,6 +10,7 @@ import { Icon } from "../../components/Icon";
 import { formatRelative } from "../../lib/format";
 import { useToast } from "../../state/toast";
 import { useVault } from "../../state/vault";
+import { countGallery } from "./Gallery";
 
 const PAGE = 36;
 
@@ -22,6 +23,7 @@ export function GalleryPicker({
   onPick,
   preferVault = false,
   currentId,
+  returnFocusRef,
 }: {
   open: boolean;
   /** Start on the Vault source when it's available (Save to = Vault). */
@@ -34,6 +36,8 @@ export function GalleryPicker({
   onPick: (rec: ImageRecord) => void;
   /** The record already in use: ringed, badged "Current" and listed first. */
   currentId?: string;
+  /** Focused after a pick or close when the control that opened the picker is gone (UI-006), e.g. the prompt. */
+  returnFocusRef?: RefObject<HTMLElement | null>;
 }) {
   const toast = useToast();
   const vault = useVault();
@@ -54,6 +58,8 @@ export function GalleryPicker({
   const sentinel = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const passwordRef = useRef<HTMLInputElement>(null);
+  /** All General images (the list is paged), for an exact count (UI-032). */
+  const [generalImages, setGeneralImages] = useState<number | null>(null);
 
   const loadMore = useCallback(
     async (reset = false) => {
@@ -94,9 +100,19 @@ export function GalleryPicker({
     setUnlockError(null);
     setSource(preferVault && unlockedRef.current ? "vault" : "general");
     void loadRef.current(true);
+    setGeneralImages(null);
+    let alive = true;
+    countGallery()
+      .then((t) => alive && setGeneralImages(t.images))
+      .catch(() => {
+        /* the count falls back to "n+" */
+      });
     // showModal() focuses the header's Close button; start in the search field instead.
     const h = requestAnimationFrame(() => searchRef.current?.focus());
-    return () => cancelAnimationFrame(h);
+    return () => {
+      alive = false;
+      cancelAnimationFrame(h);
+    };
   }, [open]);
 
   useEffect(() => {
@@ -144,9 +160,16 @@ export function GalleryPicker({
   }, [open, hasMore, loaded, shown.length, source]);
 
   const verb = purpose === "reference" ? "Add as reference" : "Use as start image";
+  // Exact while browsing all General images; "n+" only while a search still has pages to read.
+  const exact = !q && !fromVault && generalImages != null ? Math.max(generalImages, shown.length) : null;
+  const countText = `${exact ?? shown.length}${exact == null && listHasMore ? "+" : ""} ${fromVault ? "vault " : ""}image${(exact ?? shown.length) === 1 ? "" : "s"}${q ? " found" : ""}`;
+  const clearSearch = () => {
+    setQuery("");
+    searchRef.current?.focus();
+  };
 
   return (
-    <Dialog open={open} onClose={onClose} title={title} className="picker">
+    <Dialog open={open} onClose={onClose} title={title} className="picker" returnFocusRef={returnFocusRef}>
       <div className="picker__bar">
         {vault.exists && (
           <div className="segmented picker__source" role="radiogroup" aria-label="Pick from">
@@ -180,12 +203,10 @@ export function GalleryPicker({
             />
           </div>
         )}
-        {!vaultLockedView && (
-          <span className="hint mono">
-            {shown.length}
-            {listHasMore ? "+" : ""} {fromVault ? "vault " : ""}image{shown.length === 1 ? "" : "s"}
-          </span>
-        )}
+        {/* Always rendered (a live region must exist before it changes); announces result counts (UI-032). */}
+        <span className="hint mono" role="status">
+          {vaultLockedView ? "" : countText}
+        </span>
       </div>
       {fromVault && (
         <p className="hint picker__vault-note">
@@ -261,6 +282,16 @@ export function GalleryPicker({
         {!vaultLockedView && (fromVault || !loading) && shown.length === 0 && !listHasMore && (
           <div className="picker__empty hint">
             <p>{q ? `No images match “${query.trim()}”.` : fromVault ? "No images in the vault yet." : "No images yet — generate one in Image mode first."}</p>
+            {q && (
+              <>
+                <p>Search matches words in the prompt, the model name or the seed.</p>
+                <div className="btn-row picker__empty-actions">
+                  <button type="button" className="btn btn--sm" onClick={clearSearch}>
+                    <Icon name="x" size={13} /> Clear search
+                  </button>
+                </div>
+              </>
+            )}
             {vault.exists && !vault.unlocked && source === "general" && (
               <p>
                 Vault images aren't searched while the vault is locked.{" "}

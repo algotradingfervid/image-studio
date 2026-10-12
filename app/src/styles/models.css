@@ -1,0 +1,153 @@
+/* Models screen and LoRA library (agent D, UI review fixes 2026-10-12). Imported from main.tsx after styles.css. */
+
+/* Controls and state indicators get a 3:1 edge (UI review: --line-2 was 1.34:1). */
+.models-page .btn:not(.btn--ghost):not(.btn--primary):not(.btn--danger):not(.btn--accent-outline),
+.models-page .file-row__state {
+  border-color: var(--field-line);
+}
+
+.models-page .badge--muted {
+  border-color: var(--field-line);
+}
+
+/* Secondary GPU-starting action on model cards: the filled accent is kept for the form being
+   filled in, so only one filled primary is in view (UI-074). */
+.models-page .btn--accent-outline {
+  background: transparent;
+  border-color: var(--accent);
+  color: var(--accent-hi);
+}
+
+.models-page .btn--accent-outline:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+/* Cancel download / Cancel delete: one bordered style for both (UI-052). */
+.models-page .btn--outline {
+  background: transparent;
+  color: var(--text);
+}
+
+/* Section nav: opaque with a divider, and the section in view marked (UI-038). */
+.models-page .section-nav--models {
+  background: var(--bg);
+  backdrop-filter: none;
+  border-color: var(--line-3);
+  box-shadow: 0 6px 0 var(--bg), 0 7px 0 var(--line-2);
+}
+
+.models-page .section-nav__link.is-current {
+  color: var(--accent-hi);
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 1px var(--selected-line) inset;
+}
+
+/* Arrival from another screen (UI-037): a 2 s accent outline on the target card or section. */
+.models-page .is-arrived {
+  animation: models-arrived 2s var(--ease) 1;
+}
+
+@keyframes models-arrived {
+  0%,
+  70% {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  100% {
+    outline: 2px solid transparent;
+    outline-offset: 2px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .models-page .is-arrived {
+    animation: none;
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+}
+
+.models-page #lora-title:focus {
+  outline: none;
+}
+
+.models-page #lora-title:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+  border-radius: 4px;
+}
+
+/* Delete dialog: the GPU notice and "Frees …" are separate blocks (UI-070). */
+.notice + .delete-preview {
+  margin-top: 12px;
+}
+
+/* Volume note icon keeps its size (UI-070). */
+.models-page .volume > .hint .icon {
+  flex: none;
+}
+
+/* LoRA link form: visible label above the field + button row (UI-017/UI-018). */
+.models-page .link-form {
+  display: grid;
+  gap: 6px;
+}
+
+.models-page .link-form > .hint {
+  margin: 0;
+}
+
+.link-form__row {
+  display: flex;
+  gap: 8px;
+}
+
+/* LoRA rows: the inline delete confirm sits on its own line under the row (UI-011/UI-068). */
+.models-page .lora-row {
+  flex-wrap: wrap;
+}
+
+.lora-row__confirm {
+  flex: 1 0 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+}
+
+.lora-row__confirm-text {
+  margin: 0;
+  flex: 1 1 280px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.lora-row__confirm-actions {
+  display: flex;
+  gap: 12px;
+  flex: none;
+}
+
+.lora-row__confirm-actions > .btn {
+  height: 36px;
+  min-width: 72px;
+}
+
+.lora-row__stage {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+/* A LoRA row takes focus only programmatically, while it deletes. */
+.lora-row:focus {
+  outline: none;
+}
+
+.lora-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}

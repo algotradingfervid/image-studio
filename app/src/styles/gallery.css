@@ -23,6 +23,12 @@
   aspect-ratio: var(--ar, 0.8);
   height: auto;
 }
+/* Measured (Gallery.tsx justify(), UI-073): each tile gets its row's exact width, so full rows end
+   flush with the container; flex-grow only shares out the sub-pixel rest. */
+.gallery.gallery--justified.is-measured .gallery__item {
+  flex: var(--ar, 0.8) 1 var(--w);
+  max-width: none;
+}
 @media (max-width: 1100px) {
   .gallery.gallery--justified {
     --row-h: 160px;
@@ -34,20 +40,54 @@
   }
 }
 
-.tile__new {
+/* ---- tile badges (UI-023): one flex row, wrapping instead of overlapping on narrow tiles ---- */
+.tile {
+  container-type: inline-size;
+}
+.tile__badges {
   position: absolute;
   top: 7px;
+  left: 7px;
   right: 7px;
   z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 4px;
+  pointer-events: none;
+}
+.tile__badges > .tile__badge,
+.tile__badges > .tile__video-badge {
+  position: static;
+}
+/* The length stays top-right, also when it wraps onto its own line. */
+.tile__badges > .tile__video-badge {
+  margin-left: auto;
+}
+/* Narrow tiles: the sound icon gives way so the length stays readable. */
+@container (max-width: 140px) {
+  .tile__badges .tile__audio {
+    display: none;
+  }
+}
+.tile__new {
   padding: 1px 7px;
   border-radius: 999px;
   background: var(--accent);
   color: #1b0d03;
   font-size: 10.5px;
   font-weight: 700;
+  line-height: 18px;
   letter-spacing: 0.02em;
-  pointer-events: none;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+
+/* ---- tile caption (UI-024): a deeper scrim behind both lines, meta in --text-2 ---- */
+.gallery .tile__overlay {
+  background: linear-gradient(to top, rgba(8, 7, 6, 0.94), rgba(8, 7, 6, 0.88) 70%, rgba(8, 7, 6, 0));
+}
+.gallery .tile__meta {
+  color: var(--text-2);
 }
 
 .gallery-note {
@@ -86,6 +126,19 @@ dialog .toasts {
   left: 18px;
   max-width: calc(100vw - 36px);
 }
+/* In the viewer: 16 px inside its frame (24 px from the window; 16 px below 960 px), not across it (UI-072). */
+dialog.lightbox .toasts {
+  left: 40px;
+  bottom: 40px;
+  max-width: calc(100vw - 80px);
+}
+@media (max-width: 960px) {
+  dialog.lightbox .toasts {
+    left: 32px;
+    bottom: 32px;
+    max-width: calc(100vw - 64px);
+  }
+}
 
 /* ---- lightbox ---- */
 .lightbox__prompt.lightbox__prompt--select {
@@ -110,14 +163,7 @@ dialog .toasts {
   border-color: var(--warn);
 }
 
-/*
- * Inline confirm panels open just above their trigger, so the trigger stays put (the actions are
- * bottom-anchored) and the confirm button never lands under the pointer; it also ignores clicks
- * for 400 ms after it appears (UX-006).
- */
-.confirm.confirm--above {
-  margin-bottom: -2px;
-}
+/* Inline confirm buttons ignore clicks for 400 ms after they appear (UX-006). */
 .confirm .btn[aria-disabled="true"] {
   opacity: 0.55;
   cursor: default;
@@ -228,9 +274,13 @@ dialog .toasts {
   color: var(--text-2);
 }
 
+/* Neutral on the unselected Vault option; the selected one takes the option's own colour (UI-015). */
 .save-to__state {
-  color: var(--accent);
+  color: var(--text-2);
   font-weight: 600;
+}
+.is-selected > .save-to__state {
+  color: inherit;
 }
 .save-to__note .link-btn {
   font-weight: 600;

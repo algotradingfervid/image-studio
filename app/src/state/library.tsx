@@ -44,6 +44,8 @@ export function useLibrary(): Library {
   return v;
 }
 
+/** Tasks whose outcome was already toasted (task ids are unique for the app's lifetime). */
+const reportedTasks = new Set<string>();
 const terminal = (t: Task) => t.status === "completed" || t.status === "failed" || t.status === "cancelled";
 
 export function LibraryProvider({ children }: { children: ReactNode }) {
@@ -137,6 +139,10 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
     const un = api.onEvent("task-update", (t) => {
       applyTask(t);
       if (!terminal(t)) return;
+      // A finished task is emitted again when the app stops the GPU it started for it (gpuRelease
+      // "stopping", then "stopped"): report the outcome once per task (UI-020).
+      if (reportedTasks.has(t.taskId)) return;
+      reportedTasks.add(t.taskId);
       const name =
         t.target.type === "model"
           ? modelsRef.current.find((m) => m.id === t.target.id)?.name

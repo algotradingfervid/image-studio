@@ -8,7 +8,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import * as api from "../api";
 import { errorCode, type ImageRecord, type Job, type MigrationProgress, type VaultStatus } from "../api";
-import { VaultUnlockDialog } from "../screens/create/VaultViews";
+import { VaultEraseDialog, VaultUnlockDialog } from "../screens/create/VaultViews";
 import { useToast } from "./toast";
 
 /** `vault_touch` at most this often while unlocked (docs/vault-contract.md). */
@@ -52,6 +52,15 @@ interface Vault {
   lock(): Promise<void>;
   changePassword(oldPassword: string, newPassword: string): Promise<void>;
   setAutoLock(minutes: number): Promise<void>;
+  /**
+   * Deletes the vault for good (UI-059): items, key and the vault itself; the app is back to "no
+   * vault" (Save to shows General). `confirm` must be `VAULT_ERASE_WORD`.
+   */
+  erase(confirm: string): Promise<void>;
+  /** Open the "Erase vault and start over" confirmation (from the lock screens and Settings). */
+  requestErase(): void;
+  /** Bumped by every erase (Save to goes back to General). */
+  eraseEpoch: number;
   reloadItems(): Promise<void>;
   /** Drop an item locally (deleted / moved to General) before the event's refetch lands. */
   removeLocal(id: string): void;
@@ -85,6 +94,8 @@ export function VaultProvider({ children }: { children: ReactNode }) {
   const [generalEpoch, setGeneralEpoch] = useState(0);
   const [lockReason, setLockReason] = useState<VaultLockReason>(null);
   const [unlockAsk, setUnlockAsk] = useState(false);
+  const [eraseAsk, setEraseAsk] = useState(false);
+  const [eraseEpoch, setEraseEpoch] = useState(0);
   const unlockedRef = useRef(false);
   const statusRef = useRef<VaultStatus | null>(null);
   /** When the backend's inactivity timer was last reset (unlock / vault_touch). */
@@ -294,6 +305,28 @@ export function VaultProvider({ children }: { children: ReactNode }) {
     [apply],
   );
 
+  const erase = useCallback(
+    async (confirm: string) => {
+      manualLock.current = true; // an erase is not an idle lock
+      try {
+        const s = await api.vaultErase(confirm);
+        setMigration(null);
+        apply(s);
+        setLockReason(null);
+        setUnlockAsk(false);
+        setEraseEpoch((n) => n + 1);
+        // Nothing left to unlock: drop the "saved to the vault · Unlock" notice and its counts.
+        toast.dismissKey("vault-sealed");
+        toast.dismissKey("vault-locked-idle");
+        sealedCount.current = { image: 0, video: 0 };
+        sealedSeen.current.clear();
+      } finally {
+        manualLock.current = false;
+      }
+    },
+    [apply, toast],
+  );
+
   const removeLocal = useCallback((id: string) => setItems((xs) => xs.filter((x) => x.id !== id)), []);
   const addLocal = useCallback((recs: ImageRecord[]) => {
     if (!unlockedRef.current) return;
@@ -312,6 +345,8 @@ export function VaultProvider({ children }: { children: ReactNode }) {
     if (!showVaultTab()) setUnlockAsk(true);
   }, []);
   requestUnlockRef.current = requestUnlock;
+  // Opens on top of the unlock dialog when asked from there, so Cancel goes back to it.
+  const requestErase = useCallback(() => setEraseAsk(true), []);
   const bumpGeneral = useCallback(() => setGeneralEpoch((n) => n + 1), []);
 
   const value = useMemo<Vault>(
@@ -330,6 +365,9 @@ export function VaultProvider({ children }: { children: ReactNode }) {
       lock,
       changePassword,
       setAutoLock,
+      erase,
+      requestErase,
+      eraseEpoch,
       reloadItems,
       removeLocal,
       addLocal,
@@ -337,12 +375,13 @@ export function VaultProvider({ children }: { children: ReactNode }) {
       requestUnlock,
       bumpGeneral,
     }),
-    [status, unlocked, items, loading, migration, dismissMigration, lockEpoch, generalEpoch, create, unlock, lock, changePassword, setAutoLock, reloadItems, removeLocal, addLocal, lockReason, requestUnlock, bumpGeneral],
+    [status, unlocked, items, loading, migration, dismissMigration, lockEpoch, generalEpoch, create, unlock, lock, changePassword, setAutoLock, erase, requestErase, eraseEpoch, reloadItems, removeLocal, addLocal, lockReason, requestUnlock, bumpGeneral],
   );
   return (
     <Ctx.Provider value={value}>
       {children}
       <VaultUnlockDialog open={unlockAsk && !unlocked} onClose={() => setUnlockAsk(false)} onUnlocked={() => showVaultTab()} />
+      <VaultEraseDialog open={eraseAsk && !!status?.exists} onClose={() => setEraseAsk(false)} />
     </Ctx.Provider>
   );
 }

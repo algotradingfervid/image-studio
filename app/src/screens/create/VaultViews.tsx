@@ -2,11 +2,12 @@
 // lock screen, first-use "Create vault" form, migration progress/result, and the Save-to switch.
 
 import { useEffect, useId, useRef, useState, type FormEvent } from "react";
-import { errorCode, errorMessage, VAULT_PASSWORD_MIN, type Destination, type MigrationProgress } from "../../api";
+import { errorCode, errorMessage, VAULT_ERASE_WORD, VAULT_PASSWORD_MIN, type Destination, type MigrationProgress } from "../../api";
 import { Dialog, ProgressBar } from "../../components/Dialog";
 import { Icon } from "../../components/Icon";
 import { radioKeys } from "../../components/radio";
 import { pct } from "../../lib/format";
+import { useToast } from "../../state/toast";
 import { useVault } from "../../state/vault";
 import { countGallery, type GalleryTotals } from "./Gallery";
 
@@ -35,13 +36,28 @@ function strengthOf(pw: string): Strength {
   return { level: 3, label: "Strong." };
 }
 
+/** Puts focus on the Vault tab of the gallery (after the lock screen or the migration card goes away, UI-006). */
+export function focusVaultTab() {
+  requestAnimationFrame(() => document.getElementById("gallery-tab-vault")?.focus());
+}
+
 /** The password form shared by the Vault tab's lock screen and the unlock dialog. */
-function UnlockForm({ autoFocus = true, onUnlocked }: { autoFocus?: boolean; onUnlocked?: () => void }) {
+function UnlockForm({
+  autoFocus = true,
+  onUnlocked,
+  inputRef: givenRef,
+}: {
+  autoFocus?: boolean;
+  onUnlocked?: () => void;
+  /** The password input (the unlock dialog focuses it on open, UI-061). */
+  inputRef?: React.RefObject<HTMLInputElement | null>;
+}) {
   const vault = useVault();
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const ownRef = useRef<HTMLInputElement>(null);
+  const inputRef = givenRef ?? ownRef;
   const id = useId();
   const reason = vault.lockReason;
   const mins = vault.status?.autoLockMinutes ?? 10;
@@ -108,17 +124,26 @@ function UnlockForm({ autoFocus = true, onUnlocked }: { autoFocus?: boolean; onU
           `Auto-locks after ${mins} minute${mins === 1 ? "" : "s"} without activity (Settings → Vault).`
         )}
       </p>
+      <p className="vault-gate__forgot">
+        Forgot the password? It can't be recovered.{" "}
+        <button type="button" className="link-btn link-btn--danger" onClick={() => vault.requestErase()}>
+          Erase the vault and start over…
+        </button>
+      </p>
     </>
   );
 }
 
 /** Unlock from anywhere (the "saved to the vault · Unlock" notice when the Vault tab isn't on screen). */
 export function VaultUnlockDialog({ open, onClose, onUnlocked }: { open: boolean; onClose: () => void; onUnlocked?: () => void }) {
+  const pwRef = useRef<HTMLInputElement>(null);
   return (
-    <Dialog open={open} onClose={onClose} title="Unlock the vault" className="vault-unlock-dialog">
+    <Dialog open={open} onClose={onClose} title="Unlock the vault" className="vault-unlock-dialog" initialFocusRef={pwRef}>
       {open && (
         <div className="vault-unlock-dialog__body">
           <UnlockForm
+            autoFocus={false}
+            inputRef={pwRef}
             onUnlocked={() => {
               onClose();
               onUnlocked?.();
@@ -143,6 +168,8 @@ export function PasswordField({
   autoComplete = "current-password",
   inputRef,
   onBlur,
+  onFocus,
+  readOnly,
 }: {
   id: string;
   label: string;
@@ -155,6 +182,9 @@ export function PasswordField({
   autoComplete?: string;
   inputRef?: React.Ref<HTMLInputElement>;
   onBlur?: () => void;
+  onFocus?: () => void;
+  /** While a request runs: not editable but keeps focus (a disabled field drops it to <body>, UI-006). */
+  readOnly?: boolean;
 }) {
   const [show, setShow] = useState(false);
   return (
@@ -173,11 +203,13 @@ export function PasswordField({
           spellCheck={false}
           value={value}
           disabled={disabled}
+          readOnly={readOnly}
           autoFocus={autoFocus}
           aria-invalid={invalid || undefined}
           aria-describedby={describedBy}
           onChange={(e) => onChange(e.target.value)}
           onBlur={onBlur}
+          onFocus={onFocus}
         />
         <button
           type="button"
@@ -203,7 +235,8 @@ export function VaultLockScreen() {
       </div>
       <h3>Vault is locked</h3>
       <p className="vault-gate__lede">Vault items stay hidden everywhere in the app until you unlock it with your password.</p>
-      <UnlockForm />
+      {/* The lock screen goes away on unlock: focus moves to the Vault tab, not <body> (UI-006). */}
+      <UnlockForm onUnlocked={focusVaultTab} />
     </div>
   );
 }
@@ -218,6 +251,8 @@ export function VaultCreate({ generalCount, generalMore }: { generalCount: numbe
   const [error, setError] = useState<string | null>(null);
   /** Fields left at least once: errors show on blur, not on every keystroke (UX-061). */
   const [touched, setTouched] = useState({ pw: false, confirm: false });
+  /** Confirm has focus: while it's being retyped, a mismatch waits for its full length (UI-067). */
+  const [confirmFocused, setConfirmFocused] = useState(false);
   const id = useId();
 
   // Real totals instead of the loaded page's "24+" (UX-019).
@@ -238,8 +273,20 @@ export function VaultCreate({ generalCount, generalMore }: { generalCount: numbe
   const common = password.length > 0 && strength.level === 0;
   const short = password.length > 0 && password.length < VAULT_PASSWORD_MIN;
   const showShort = short && touched.pw;
-  const mismatch = confirm.length > 0 && confirm !== password && (touched.confirm || confirm.length >= password.length);
+  const mismatch = confirm.length > 0 && confirm !== password && (confirm.length >= password.length || (touched.confirm && !confirmFocused));
   const valid = password.length >= VAULT_PASSWORD_MIN && !common && confirm === password && ack;
+  // Why Create is disabled, next to it (UI-067).
+  const blockedWhy = busy
+    ? null
+    : password.length < VAULT_PASSWORD_MIN
+      ? `Choose a password of at least ${VAULT_PASSWORD_MIN} characters.`
+      : common
+        ? "Choose a less common password."
+        : confirm !== password
+          ? "Type the same password in Confirm password."
+          : !ack
+            ? "Tick the box above to continue."
+            : null;
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -316,7 +363,11 @@ export function VaultCreate({ generalCount, generalMore }: { generalCount: numbe
             invalid={mismatch}
             describedBy={`${id}-confirm-help`}
             autoComplete="new-password"
-            onBlur={() => setTouched((t) => ({ ...t, confirm: true }))}
+            onFocus={() => setConfirmFocused(true)}
+            onBlur={() => {
+              setConfirmFocused(false);
+              setTouched((t) => ({ ...t, confirm: true }));
+            }}
           />
           <p id={`${id}-confirm-help`} className={`hint ${mismatch ? "hint--error" : ""}`}>
             {mismatch ? "The passwords don't match." : confirm && confirm === password ? "Matches." : "Type it again."}
@@ -328,7 +379,10 @@ export function VaultCreate({ generalCount, generalMore }: { generalCount: numbe
         <Icon name="alert" size={18} />
         <div>
           <strong>No recovery — if you forget this password, the content is gone.</strong>
-          <p>There is no reset, hint or backup key. Nobody, including this app, can decrypt the vault without it.</p>
+          <p>
+            There is no reset, hint or backup key. Nobody, including this app, can decrypt the vault without it. If you forget it, the only way out is to erase the
+            vault and start over, which deletes everything in it.
+          </p>
           <label className="vault-warning__ack">
             <input type="checkbox" checked={ack} onChange={(e) => setAck(e.target.checked)} disabled={busy} />
             <span>I understand that a forgotten password can't be recovered.</span>
@@ -342,11 +396,16 @@ export function VaultCreate({ generalCount, generalMore }: { generalCount: numbe
         </p>
       )}
       <div className="btn-row btn-row--end">
-        <button type="submit" className="btn btn--primary" disabled={!valid || busy}>
+        <button type="submit" className="btn btn--primary" disabled={!valid || busy} aria-describedby={blockedWhy ? `${id}-why` : undefined}>
           {busy ? <Icon name="refresh" className="spin" /> : <Icon name="lock" />}
           {busy ? "Creating the vault…" : n > 0 && totals ? `Create vault & move ${n} item${n === 1 ? "" : "s"}` : "Create vault & move my gallery"}
         </button>
       </div>
+      {blockedWhy && (
+        <p id={`${id}-why`} className="hint vault-create__why">
+          {blockedWhy}
+        </p>
+      )}
     </form>
   );
 }
@@ -376,6 +435,23 @@ export function MigrationView({ progress, onDone }: { progress: MigrationProgres
   useEffect(() => {
     if (finished) doneRef.current?.focus();
   }, [finished]);
+  // The card goes away: focus moves to the Vault tab, not <body> (UI-006).
+  const close = () => {
+    onDone();
+    focusVaultTab();
+  };
+  // Save to stays on General after the move (UI-062): offer to switch it. Read from the Create
+  // panel's Save-to control (null when it isn't on screen: no offer).
+  const [saveToVault, setSaveToVault] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!done) return;
+    const radio = document.querySelector<HTMLElement>('.save-to [role="radio"][data-dest="vault"]');
+    setSaveToVault(radio ? radio.getAttribute("aria-checked") === "true" : null);
+  }, [done]);
+  const switchSaveTo = () => {
+    document.querySelector<HTMLElement>('.save-to [role="radio"][data-dest="vault"]')?.click();
+    setSaveToVault(true);
+  };
 
   return (
     <section className={`vault-migration card ${failed ? "is-error" : ""}`} aria-labelledby="vault-migration-title" aria-busy={!finished}>
@@ -387,7 +463,7 @@ export function MigrationView({ progress, onDone }: { progress: MigrationProgres
             ? "The move into the vault stopped"
             : "Moving your gallery into the vault…"}
         {finished && (
-          <button type="button" className="icon-btn icon-btn--sm vault-migration__close" aria-label="Dismiss" onClick={onDone}>
+          <button type="button" className="icon-btn icon-btn--sm vault-migration__close" aria-label="Dismiss" onClick={close}>
             <Icon name="x" />
           </button>
         )}
@@ -436,9 +512,20 @@ export function MigrationView({ progress, onDone }: { progress: MigrationProgres
             : "Each original was deleted only after its encrypted copy was verified."
           : "Each original is deleted only after its encrypted copy is verified. If the app quits, the move resumes on the next unlock."}
       </p>
+      {done && saveToVault === false && (
+        <p className="notice notice--warn notice--inline vault-migration__saveto">
+          <Icon name="info" size={14} />
+          <span>New creations still save to General, unencrypted.</span>
+          <button type="button" className="link-btn" onClick={switchSaveTo}>
+            Save new creations to the vault
+          </button>
+        </p>
+      )}
+      {done && saveToVault && <p className="hint">New creations save to the vault (Save to, in the Create panel).</p>}
       {finished && (
         <div className="btn-row btn-row--end">
-          <button type="button" className="btn btn--primary" onClick={onDone} ref={doneRef}>
+          {/* Secondary: the Create panel's Generate stays the one filled primary on screen (UI-074). */}
+          <button type="button" className="btn" onClick={close} ref={doneRef}>
             Done
           </button>
         </div>
@@ -463,6 +550,14 @@ export function SaveToSwitch({
 }) {
   const vault = useVault();
   const id = useId();
+  // After an erase the remembered choice goes back to General, so a vault created later doesn't
+  // silently receive new creations (the Create screen persists what onChange gets).
+  const erased = useRef(vault.eraseEpoch);
+  useEffect(() => {
+    if (vault.eraseEpoch === erased.current) return;
+    erased.current = vault.eraseEpoch;
+    onChange("general");
+  }, [vault.eraseEpoch, onChange]);
   if (!vault.exists) {
     return (
       <div className="save-to">
@@ -509,6 +604,7 @@ export function SaveToSwitch({
                 type="button"
                 role="radio"
                 aria-checked={on}
+                data-dest={d}
                 tabIndex={on ? 0 : -1}
                 disabled={disabled}
                 title={disabled ? (forcedReason ?? undefined) : undefined}
@@ -538,5 +634,128 @@ export function SaveToSwitch({
         </p>
       )}
     </div>
+  );
+}
+
+/**
+ * Focus the first on-screen "start a vault" control after an erase (the opener is gone, UI-006).
+ * Retried for a few frames: the control renders, and the modal closes (making the page focusable
+ * again), after this is called.
+ */
+function focusVaultStart(frames = 20) {
+  requestAnimationFrame(() => {
+    const el = [...document.querySelectorAll<HTMLElement>("[data-vault-start], .vault-create input[type=password]")].find((x) => x.getClientRects().length > 0);
+    el?.focus();
+    if ((!el || document.activeElement !== el) && frames > 0) focusVaultStart(frames - 1);
+  });
+}
+
+/**
+ * "Erase vault and start over" (UI-059): the only way out of a forgotten password. Typed
+ * confirmation only: the danger button stays disabled until the user types "erase"; focus starts
+ * on Cancel. Works locked or unlocked and never shows anything from the vault (the item count
+ * only while it's unlocked, when the user can see the items anyway).
+ */
+export function VaultEraseDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const vault = useVault();
+  const toast = useToast();
+  const [typed, setTyped] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const id = useId();
+
+  useEffect(() => {
+    if (!open) {
+      setTyped("");
+      setError(null);
+    }
+  }, [open]);
+
+  // A running migration or move would be cut in half: the core refuses (VAULT_BUSY), so say so up front.
+  const moving = !!vault.migration && vault.migration.phase !== "done" && vault.migration.phase !== "error";
+  const busyMsg = "Wait for the move into the vault to finish.";
+  const ok = typed.trim().toLowerCase() === VAULT_ERASE_WORD && !moving;
+  const count = vault.unlocked ? (vault.status?.itemCount ?? vault.items.length) : null;
+  const what = count == null ? "everything in the vault" : `all ${count} item${count === 1 ? "" : "s"} in the vault`;
+
+  const erase = async (e?: FormEvent) => {
+    e?.preventDefault();
+    if (!ok || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await vault.erase(VAULT_ERASE_WORD);
+      onClose();
+      toast.success("Vault erased", "Everything in it is deleted. You can create a new vault from Gallery → Vault.");
+      focusVaultStart();
+    } catch (err) {
+      setError(errorCode(err) === "VAULT_BUSY" ? busyMsg : `Couldn't erase the vault: ${errorMessage(err)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog
+      open={open}
+      onClose={() => !busy && onClose()}
+      title="Erase the vault and start over?"
+      className="vault-erase-dialog"
+      initialFocusRef={cancelRef}
+      footer={
+        <>
+          <button type="button" className="btn" ref={cancelRef} onClick={onClose} disabled={busy}>
+            Cancel
+          </button>
+          <button type="submit" form={`${id}-form`} className="btn btn--danger" disabled={!ok || busy} aria-describedby={`${id}-why`}>
+            {busy ? <Icon name="refresh" className="spin" /> : <Icon name="trash" />}
+            {busy ? "Erasing…" : "Erase vault"}
+          </button>
+        </>
+      }
+    >
+      {open && (
+        <form id={`${id}-form`} className="vault-erase" onSubmit={erase}>
+          <div className="vault-warning" role="note">
+            <Icon name="alert" size={18} />
+            <div>
+              <strong>This permanently deletes {what} and the vault's key.</strong>
+              <p>
+                Images, videos, their prompts and settings are deleted without being shown or decrypted. Nothing can be recovered. Your General gallery isn't
+                touched. Afterwards you can create a new vault with a new password.
+              </p>
+            </div>
+          </div>
+          <div className="field">
+            <label className="field__label" htmlFor={`${id}-word`}>
+              Type <strong className="mono">{VAULT_ERASE_WORD}</strong> to confirm
+            </label>
+            <input
+              id={`${id}-word`}
+              className="input mono"
+              autoComplete="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              value={typed}
+              readOnly={busy}
+              onChange={(e) => setTyped(e.target.value)}
+              aria-describedby={`${id}-why`}
+            />
+          </div>
+          <p id={`${id}-why`} className={`hint ${error || moving ? "hint--error" : ""}`} role={error || moving ? "alert" : undefined}>
+            {error || moving ? (
+              <>
+                <Icon name="alert" size={12} /> {error ?? busyMsg}
+              </>
+            ) : ok ? (
+              "Erase vault deletes it now."
+            ) : (
+              `Erase vault is enabled once you type “${VAULT_ERASE_WORD}”.`
+            )}
+          </p>
+        </form>
+      )}
+    </Dialog>
   );
 }

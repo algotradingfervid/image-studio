@@ -1,4 +1,6 @@
-/* Create screen (agent C): notices, validation, LoRA menu, start-image size, picker captions. */
+/* Create screen (agent C): notices, validation, LoRA menu, start-image size, picker captions.
+   This sheet is imported from Controls.tsx, so it loads BEFORE styles.css: a rule here that overrides a
+   base rule needs a more specific selector than the base one (equal specificity loses). */
 
 /* ---------- in-panel notice (footer, always visible) ---------- */
 .panel-notice-slot:empty {
@@ -97,12 +99,77 @@
   vertical-align: -2px;
 }
 
-.dot--danger {
-  background: var(--danger);
+/* Generate while something blocks it (UI-009): focusable (a click goes to the problem) but drawn
+   disabled, like the not-installed state. */
+.panel__foot .btn--generate[aria-disabled="true"],
+.panel__foot .btn--generate[aria-disabled="true"]:hover {
+  opacity: 0.4;
+  background: linear-gradient(180deg, #ffa262, var(--accent) 55%, #f07a30);
+  box-shadow: none;
+  cursor: not-allowed;
 }
 
-.panel__hint--block {
+.panel__foot .panel__hint--block {
   color: var(--warn);
+}
+
+/* ---------- Advanced header (UI-034): "needs fixing" is a red "!" badge, not the "modified" dot ---------- */
+/* The summary has its own left-aligned line under the title, so it never leaves an orphan beside it. */
+.advanced .advanced__toggle {
+  flex-wrap: wrap;
+  row-gap: 2px;
+  height: auto;
+  min-height: 40px;
+  padding: 8px 12px;
+  text-align: left;
+}
+
+.advanced__toggle > .icon,
+.advanced__toggle > span:not(.advanced__summary) {
+  flex: none;
+}
+
+.advanced .advanced__toggle > .chev {
+  margin-left: auto;
+}
+
+.advanced .advanced__summary {
+  order: 5;
+  display: flex;
+  flex: 1 1 100%;
+  flex-wrap: wrap;
+  gap: 0 6px;
+  min-width: 0;
+  margin-left: 0;
+  padding-left: 24px;
+}
+
+/* Segments never break inside; the separator belongs to the segment after it. */
+.advanced__seg {
+  white-space: nowrap;
+}
+
+.advanced__seg + .advanced__seg::before {
+  content: "· ";
+  color: var(--text-3);
+}
+
+.advanced__seg.is-bad {
+  color: var(--danger);
+  font-weight: 650;
+}
+
+.advanced__bad {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--danger);
+  color: #220805;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
 }
 
 /* ---------- references from gallery ---------- */
@@ -155,8 +222,8 @@
   margin-bottom: 8px;
 }
 
-.chip--aspect.is-matched {
-  border-color: var(--accent-line);
+.chips .chip--aspect.is-matched {
+  border-color: var(--selected-line);
   color: var(--accent-hi);
   opacity: 1;
 }
@@ -192,9 +259,14 @@
   text-align: right;
 }
 
-.lora-strength__value:hover,
+.lora-strength__value:hover {
+  border-color: var(--field-line-hover);
+}
+
 .lora-strength__value:focus-visible {
-  border-color: var(--line-2);
+  border-color: var(--selected-line);
+  box-shadow: var(--focus-ring);
+  outline: none;
 }
 
 .lora-pick__zero {
@@ -203,15 +275,25 @@
   color: var(--warn);
 }
 
-.chip--word.is-on {
+.chips .chip--word.is-on {
   background: var(--accent-soft);
-  border-color: var(--accent-line);
+  border-color: var(--selected-line);
+  box-shadow: var(--selected-ring);
   color: var(--accent-hi);
 }
 
 /* ---------- LoRA menu ---------- */
-.lora-menu {
+/* A raised surface with a visible edge over the dark panel (UI-035): the ring is >= 3:1 against it. */
+.menu.lora-menu {
   max-width: min(360px, calc(100vw - 48px));
+  background: #2c2925;
+  box-shadow: 0 0 0 1px rgba(255, 238, 214, 0.36), 0 20px 60px rgba(0, 0, 0, 0.6);
+}
+
+/* Not enough room below inside the scroll area (it would sit under the footer): open upward. */
+.menu.lora-menu.is-up {
+  top: auto;
+  bottom: calc(100% + 6px);
 }
 
 .lora-menu .lora-menu__item {
@@ -262,9 +344,45 @@
   margin: 0 0 4px;
 }
 
-/* ---------- Add LoRA from link ---------- */
+/* ---------- Add LoRA from link (same labels and notices as the LoRA library, UI-017 / UI-018) ---------- */
+.lora-link-dialog__form {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+}
+
 .lora-link-dialog .link-form {
-  margin-top: 10px;
+  margin: 0;
+}
+
+.lora-link-dialog__error {
+  margin-top: 8px;
+}
+
+.lora-link-dialog__warn .link-btn {
+  display: inline;
+  padding: 0;
+  min-height: 0;
+  color: inherit;
+  font-weight: 650;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* Why the primary is disabled, at the start of the footer (UI-050). */
+.dialog__foot .lora-link-dialog__why {
+  flex: 1 1 160px;
+  align-self: center;
+  margin: 0;
+  font-size: 12px;
+}
+
+/* A disabled primary reads as disabled: grey outline, not muted orange (as in the library, UI-050). */
+.lora-link-dialog .dialog__foot .btn--primary:disabled {
+  opacity: 1;
+  background: transparent;
+  color: var(--text-3);
+  border-color: var(--line-3);
 }
 
 .lora-link-dialog__preview {
@@ -290,9 +408,50 @@
 .source-prompt {
   margin-top: 8px;
   max-width: 100%;
+  min-width: 0;
+}
+
+.source-prompt > .icon {
+  flex: none;
+}
+
+/* The label is a real flex item, so the ellipsis shows (UI-033). */
+.source-prompt__label {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ---------- "Install … in Models →" notice (UI-014): message first, the link on its own line ---------- */
+.notice.model-missing {
+  flex-wrap: wrap;
+  align-items: flex-start;
+  row-gap: 4px;
+}
+
+.notice.model-missing > span {
+  flex: 1 1 calc(100% - 24px);
+  min-width: 0;
+}
+
+.notice.model-missing > .link-btn {
+  margin-left: 24px;
+  max-width: calc(100% - 24px);
+  white-space: normal;
+  text-align: left;
+}
+
+/* ---------- the sticky Image | Video switch: content fades out under it (UI-036) ---------- */
+.panel__scroll > .mode-switch::after {
+  content: "";
+  position: absolute;
+  left: -8px;
+  right: -8px;
+  top: calc(100% + 8px);
+  height: 14px;
+  pointer-events: none;
+  background: linear-gradient(to bottom, var(--bg-raise), rgba(19, 18, 16, 0));
 }
 
 /* ---------- start-image / reference picker ---------- */

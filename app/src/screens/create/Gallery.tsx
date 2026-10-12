@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
 import * as api from "../../api";
 import { fileSrc, inTauri, type ImageRecord } from "../../api";
 import { Icon, type IconName } from "../../components/Icon";
@@ -79,6 +79,65 @@ function aspectOf(im: ImageRecord): number {
   return 4 / 5;
 }
 
+/** Gap between tiles; matches `.gallery--justified { gap }`. */
+const GAP = 10;
+
+/**
+ * Justified rows (UI-073): fill each row with tiles until it would get shorter than the target row
+ * height, then scale that row to the exact width, so every full row ends at the container edge.
+ * The last row keeps the target height. Returns each tile's width in px (floored; the CSS flex-grow
+ * shares out the sub-pixel rest), or null before the container is measured.
+ */
+function justify(ars: number[], width: number, rowH: number): number[] | null {
+  if (!(width > 0) || !(rowH > 0)) return null;
+  const out: number[] = new Array(ars.length);
+  const close = (from: number, to: number, h: number) => {
+    for (let k = from; k <= to; k++) out[k] = Math.max(1, Math.floor(ars[k] * h));
+  };
+  let start = 0;
+  let sum = 0;
+  for (let i = 0; i < ars.length; i++) {
+    const n = i - start + 1;
+    const h = (width - GAP * (n - 1)) / (sum + ars[i]);
+    if (h > rowH) {
+      sum += ars[i];
+      continue;
+    }
+    // Adding tile i makes the row shorter than the target: keep it, or end the row before it,
+    // whichever lands closer to the target height.
+    const before = n > 1 ? (width - GAP * (n - 2)) / sum : Infinity;
+    if (before - rowH < rowH - h) {
+      close(start, i - 1, before);
+      start = i;
+      sum = ars[i];
+    } else {
+      close(start, i, h);
+      start = i + 1;
+      sum = 0;
+    }
+  }
+  for (let k = start; k < ars.length; k++) out[k] = Math.floor(ars[k] * rowH);
+  return out;
+}
+
+/** Width of the gallery list and its CSS target row height (`--row-h`), tracked across resizes. */
+function useRowBox(el: HTMLElement | null) {
+  const [box, setBox] = useState<{ width: number; rowH: number }>({ width: 0, rowH: 0 });
+  useLayoutEffect(() => {
+    if (!el) return;
+    const read = () => {
+      const width = el.clientWidth;
+      const rowH = parseFloat(getComputedStyle(el).getPropertyValue("--row-h")) || 0;
+      setBox((b) => (b.width === width && b.rowH === rowH ? b : { width, rowH }));
+    };
+    read();
+    const ro = new ResizeObserver(read);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [el]);
+  return box;
+}
+
 /** "5 s", "1:05". */
 export function formatClipLength(s: number | null | undefined): string {
   if (s == null || !isFinite(s)) return "";
@@ -119,6 +178,9 @@ export function Gallery({
   empty?: { icon: IconName; title: string; text: string };
 }) {
   const sentinel = useRef<HTMLDivElement>(null);
+  const [listEl, setListEl] = useState<HTMLUListElement | null>(null);
+  const box = useRowBox(listEl);
+  const widths = justify(items.map(aspectOf), box.width, box.rowH);
   const loadRef = useRef(onLoadMore);
   loadRef.current = onLoadMore;
   galleryPager.hasMore = hasMore;
@@ -228,34 +290,35 @@ export function Gallery({
   return (
     <>
       {migrationNote}
-      <ul className="gallery gallery--justified" aria-label="Generated images, newest first">
-        {items.map((im, i) =>
-          im.kind === "video" ? (
-            <li key={im.id} className="gallery__item" style={{ "--ar": aspectOf(im) } as CSSProperties}>
-              <VideoTile im={im} modelName={modelNames[im.model] ?? im.model} onOpen={() => onOpen(i)} />
-              {isNew(im) && <NewDot />}
+      <ul ref={setListEl} className={`gallery gallery--justified ${widths ? "is-measured" : ""}`} aria-label="Generated images, newest first">
+        {items.map((im, i) => {
+          const style = { "--ar": aspectOf(im), ...(widths ? { "--w": `${widths[i]}px` } : null) } as CSSProperties;
+          return im.kind === "video" ? (
+            <li key={im.id} className="gallery__item" style={style}>
+              <VideoTile im={im} modelName={modelNames[im.model] ?? im.model} isNew={isNew(im)} onOpen={() => onOpen(i)} />
             </li>
           ) : (
-          <li key={im.id} className="gallery__item" style={{ "--ar": aspectOf(im) } as CSSProperties}>
-            {isNew(im) && <NewDot />}
-            <button type="button" className="tile" onClick={() => onOpen(i)} aria-label={`Open ${isNew(im) ? "new " : ""}image${im.initImage ? " (img2img)" : ""}: ${im.prompt}`}>
-              <img src={fileSrc(im.thumbPath || im.path)} alt="" loading="lazy" decoding="async" />
-              {im.initImage && (
-                <span className="tile__badge" title={`From a start image${im.denoise != null ? ` · strength ${im.denoise.toFixed(2)}` : ""}`}>
-                  img2img
+            <li key={im.id} className="gallery__item" style={style}>
+              <button
+                type="button"
+                className="tile"
+                data-item-id={im.id}
+                onClick={() => onOpen(i)}
+                aria-label={`Open ${isNew(im) ? "new " : ""}image${im.initImage ? " (img2img)" : ""}: ${im.prompt}`}
+              >
+                <img src={fileSrc(im.thumbPath || im.path)} alt="" loading="lazy" decoding="async" />
+                <TileBadges isNew={isNew(im)} type={im.initImage ? "img2img" : null} typeTitle={`From a start image${im.denoise != null ? ` · strength ${im.denoise.toFixed(2)}` : ""}`} />
+                <span className="tile__overlay" aria-hidden>
+                  <span className="tile__prompt">{im.prompt}</span>
+                  <span className="tile__meta">
+                    {modelNames[im.model] ?? im.model} · {im.initImage ? `img2img ${im.denoise?.toFixed(2) ?? ""}`.trim() : im.aspectRatio} ·{" "}
+                    {formatRelative(im.createdAt)}
+                  </span>
                 </span>
-              )}
-              <span className="tile__overlay" aria-hidden>
-                <span className="tile__prompt">{im.prompt}</span>
-                <span className="tile__meta">
-                  {modelNames[im.model] ?? im.model} · {im.initImage ? `img2img ${im.denoise?.toFixed(2) ?? ""}`.trim() : im.aspectRatio} ·{" "}
-                  {formatRelative(im.createdAt)}
-                </span>
-              </span>
-            </button>
-          </li>
-          ),
-        )}
+              </button>
+            </li>
+          );
+        })}
       </ul>
       <div ref={sentinel} className="gallery__sentinel" aria-hidden />
       {loading && (
@@ -268,25 +331,41 @@ export function Gallery({
   );
 }
 
-function NewDot() {
+/**
+ * The tile's badges in one flex row (UI-023): New and the type (img2img / i2v) on the left, the
+ * video's length on the right; on a narrow tile they wrap instead of covering each other.
+ */
+function TileBadges({ isNew, type, typeTitle, children }: { isNew: boolean; type: string | null; typeTitle?: string; children?: React.ReactNode }) {
+  if (!isNew && !type && !children) return null;
   return (
-    <span className="tile__new" title="New since you opened the app" aria-hidden>
-      New
+    <span className="tile__badges" aria-hidden>
+      {isNew && (
+        <span className="tile__new" title="New since you opened the app">
+          New
+        </span>
+      )}
+      {type && (
+        <span className="tile__badge" title={typeTitle}>
+          {type}
+        </span>
+      )}
+      {children}
     </span>
   );
 }
 
 /** Video tile: poster + play/duration badge; plays muted on hover (poster + note if it can't). */
-function VideoTile({ im, modelName, onOpen }: { im: ImageRecord; modelName: string; onOpen: () => void }) {
+function VideoTile({ im, modelName, isNew, onOpen }: { im: ImageRecord; modelName: string; isNew: boolean; onOpen: () => void }) {
   const [hover, setHover] = useState(false);
   const [failed, setFailed] = useState(() => unplayable(im.path));
   const poster = im.posterPath ? fileSrc(im.posterPath) : "";
   const length = formatClipLength(im.durationS);
-  const label = `Open video${im.initImage ? " (from a start image)" : ""}${length ? `, ${length}` : ""}${im.hasAudio ? ", with sound" : ""}: ${im.prompt}`;
+  const label = `Open ${isNew ? "new " : ""}video${im.initImage ? " (from a start image)" : ""}${length ? `, ${length}` : ""}${im.hasAudio ? ", with sound" : ""}: ${im.prompt}`;
   return (
     <button
       type="button"
       className="tile tile--video"
+      data-item-id={im.id}
       onClick={() => {
         // Stop the hover preview: left looping behind the lightbox it kept a second
         // video decoding and re-blurred the dialog backdrop every frame.
@@ -304,12 +383,13 @@ function VideoTile({ im, modelName, onOpen }: { im: ImageRecord; modelName: stri
         <video className="tile__video" src={fileSrc(im.path)} poster={poster || undefined} muted loop playsInline autoPlay preload="none" onError={() => setFailed(true)} />
       )}
       {hover && failed && <span className="tile__unavailable">{PREVIEW_UNAVAILABLE}</span>}
-      {im.initImage && <span className="tile__badge">i2v</span>}
-      <span className="tile__video-badge" aria-hidden>
-        <Icon name="play" size={11} />
-        {length && <span className="mono">{length}</span>}
-        {im.hasAudio && <Icon name="volume" size={12} />}
-      </span>
+      <TileBadges isNew={isNew} type={im.initImage ? "i2v" : null} typeTitle="From a start image">
+        <span className="tile__video-badge">
+          <Icon name="play" size={11} />
+          {length && <span className="mono">{length}</span>}
+          {im.hasAudio && <Icon name="volume" size={12} className="tile__audio" />}
+        </span>
+      </TileBadges>
       <span className="tile__overlay" aria-hidden>
         <span className="tile__prompt">{im.prompt}</span>
         <span className="tile__meta">

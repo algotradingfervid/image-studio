@@ -101,6 +101,21 @@ pub fn plan_delete(
     }
 }
 
+/// LoRA entries as (entry id, file on the volume). Returns the id of another entry that
+/// uses the same file as `target_id`, if any: deleting `target_id` then removes only its
+/// record and keeps the file (UI-011). Each model has its own LoRA folder, so the same
+/// link added for two models is two files and never shares one.
+pub fn lora_file_shared_with<'a>(
+    target_id: &str,
+    entries: &'a [(String, FileKey)],
+) -> Option<&'a str> {
+    let (_, k) = entries.iter().find(|(id, _)| id == target_id)?;
+    entries
+        .iter()
+        .find(|(id, other)| id != target_id && other == k)
+        .map(|(id, _)| id.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +238,32 @@ mod tests {
         );
         assert!(p2.kept_files.is_empty());
         assert!(deleted_names(&p2).contains(&"ae.safetensors".to_string()));
+    }
+
+    fn lora(id: &str, folder: &str, filename: &str) -> (String, FileKey) {
+        (id.into(), (folder.into(), filename.into()))
+    }
+
+    #[test]
+    fn lora_same_link_for_two_models_is_two_files() {
+        // UI-011: one link added for FLUX.2 and for Chroma lives in two model folders.
+        let entries = vec![
+            lora("a", "loras/flux2", "sdxl_pixel_art.safetensors"),
+            lora("b", "loras/chroma", "sdxl_pixel_art.safetensors"),
+        ];
+        assert_eq!(lora_file_shared_with("a", &entries), None);
+        assert_eq!(lora_file_shared_with("b", &entries), None);
+    }
+
+    #[test]
+    fn lora_file_used_by_another_entry_is_kept() {
+        let entries = vec![
+            lora("a", "loras/flux2", "x.safetensors"),
+            lora("b", "loras/flux2", "x.safetensors"),
+            lora("c", "loras/flux2", "y.safetensors"),
+        ];
+        assert_eq!(lora_file_shared_with("a", &entries), Some("b"));
+        assert_eq!(lora_file_shared_with("c", &entries), None);
+        assert_eq!(lora_file_shared_with("missing", &entries), None);
     }
 }

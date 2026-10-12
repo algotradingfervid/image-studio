@@ -55,6 +55,19 @@ export function useToast(): ToastApi {
   return v;
 }
 
+/** Most toasts shown at once; older ones give way (UI-020). */
+const MAX_SHOWN = 3;
+
+/**
+ * How long a toast stays (UI-022): reading time at ~4 words a second plus a margin, at least
+ * 6 s, at least 10 s with an action (Undo, Unlock) and for errors.
+ */
+function lifetime(t: { kind: ToastKind; title: string; message?: string; actions?: ToastAction[] }): number {
+  const words = `${t.title} ${t.message ?? ""}`.trim().split(/\s+/).length;
+  const read = 2000 + words * 250;
+  return Math.max(read, t.actions?.length || t.kind === "error" ? 10_000 : 6000);
+}
+
 function msg(e: unknown): string | undefined {
   if (e == null) return undefined;
   if (typeof e === "string") return e;
@@ -96,15 +109,19 @@ function useTopModal(): HTMLElement | null {
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const next = useRef(1);
-  const timers = useRef(new Map<number, number>());
+  /** Auto-hide timers: the handle while counting, and the time left (kept while paused). */
+  const timers = useRef(new Map<number, { handle: number | null; left: number; since: number }>());
+  /** Toasts under the pointer or holding focus: their timers wait (UI-022). */
+  const held = useRef(new Set<number>());
   const keys = useRef(new Map<string, number>());
   const host = useTopModal();
 
   const dismiss = useCallback((id: number) => {
     setToasts((t) => t.filter((x) => x.id !== id));
     const h = timers.current.get(id);
-    if (h) window.clearTimeout(h);
+    if (h?.handle) window.clearTimeout(h.handle);
     timers.current.delete(id);
+    held.current.delete(id);
     for (const [k, v] of keys.current) if (v === id) keys.current.delete(k);
   }, []);
 
@@ -114,22 +131,41 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       const old = o.key ? keys.current.get(o.key) : undefined;
       if (old != null) {
         const h = timers.current.get(old);
-        if (h) window.clearTimeout(h);
+        if (h?.handle) window.clearTimeout(h.handle);
         timers.current.delete(old);
       }
       // Same key: update that toast in place (no re-entry animation), e.g. a countdown.
       const id = old ?? next.current++;
       if (o.key) keys.current.set(o.key, id);
       const t: Toast = { id, kind, title: o.title, message: o.message, actions: o.actions, key: o.key };
-      setToasts((list) => (list.some((x) => x.id === id) ? list.map((x) => (x.id === id ? t : x)) : [...list.slice(-4), t]));
+      setToasts((list) => (list.some((x) => x.id === id) ? list.map((x) => (x.id === id ? t : x)) : [...list.slice(-(MAX_SHOWN - 1)), t]));
       if (!o.sticky) {
-        const ms = o.durationMs ?? (kind === "error" ? 9000 : o.actions?.length ? 8000 : 4500);
-        timers.current.set(id, window.setTimeout(() => dismiss(id), ms));
+        const ms = Math.max(o.durationMs ?? 0, lifetime(t));
+        const paused = held.current.has(id);
+        timers.current.set(id, { handle: paused ? null : window.setTimeout(() => dismiss(id), ms), left: ms, since: Date.now() });
       }
       return id;
     },
     [dismiss],
   );
+
+  // Hover or focus inside a toast holds its timer; leaving restarts it with the time it had left.
+  const hold = useCallback((id: number, on: boolean) => {
+    const t = timers.current.get(id);
+    if (on) {
+      held.current.add(id);
+      if (t?.handle) {
+        window.clearTimeout(t.handle);
+        timers.current.set(id, { handle: null, left: Math.max(0, t.left - (Date.now() - t.since)), since: Date.now() });
+      }
+    } else {
+      held.current.delete(id);
+      if (t && !t.handle) {
+        const left = Math.max(t.left, 2000);
+        timers.current.set(id, { handle: window.setTimeout(() => dismiss(id), left), left, since: Date.now() });
+      }
+    }
+  }, [dismiss]);
 
   const push = useCallback((kind: ToastKind, title: string, message?: string) => void notify({ kind, title, message }), [notify]);
 
@@ -160,7 +196,15 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   const layer = (
     <div className="toasts" aria-live="polite" aria-relevant="additions">
       {toasts.map((t) => (
-        <div key={t.id} className={`toast toast--${t.kind}`} role={t.kind === "error" ? "alert" : "status"}>
+        <div
+          key={t.id}
+          className={`toast toast--${t.kind}`}
+          role={t.kind === "error" ? "alert" : "status"}
+          onMouseEnter={() => hold(t.id, true)}
+          onMouseLeave={(e) => !e.currentTarget.contains(document.activeElement) && hold(t.id, false)}
+          onFocus={() => hold(t.id, true)}
+          onBlur={(e) => !e.currentTarget.contains(e.relatedTarget as Node | null) && !e.currentTarget.matches(":hover") && hold(t.id, false)}
+        >
           <Icon name={t.kind === "error" ? "alert" : t.kind === "success" ? "check" : "info"} className="toast__icon" />
           <div className="toast__body">
             <div className="toast__title">{t.title}</div>

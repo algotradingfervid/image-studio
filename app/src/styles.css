@@ -12,16 +12,26 @@
   --line: rgba(255, 238, 214, 0.07);
   --line-2: rgba(255, 238, 214, 0.12);
   --line-3: rgba(255, 238, 214, 0.2);
+  /* Form-control edges (inputs, selects, range track, switch): >= 3:1 on --panel-2 and darker (UI-003). */
+  --field-line: #756d62;
+  --field-line-hover: #8f877b;
 
   --text: #f2ede5;
   --text-2: #b9b1a5;
-  --text-3: #857d72;
+  /* Muted text: >= 4.9:1 on every surface up to --panel-3 and the accent-glow cards (UI-001). */
+  --text-3: #9a9286;
 
   --accent: #ff8c42;
   --accent-hi: #ffad6e;
   --accent-ink: #1d0f04;
   --accent-soft: rgba(255, 140, 66, 0.13);
   --accent-line: rgba(255, 140, 66, 0.42);
+  /* Selected and focused controls: solid accent (>= 6.5:1 on every surface), drawn 2px thick so the
+     state reads by weight as well as hue (UI-004, UI-015). --accent-line is decoration only. */
+  --selected-line: var(--accent);
+  --selected-ring: 0 0 0 1px var(--selected-line) inset; /* with a 1px --selected-line border: a 2px edge */
+  --selected-bar: 0 -2px 0 var(--selected-line) inset; /* tabs: a 2px underline */
+  --focus-ring: 0 0 0 1px var(--accent) inset; /* text fields, with border-color: var(--accent) */
 
   --ok: #74d39e;
   --ok-soft: rgba(116, 211, 158, 0.12);
@@ -252,7 +262,7 @@ kbd {
 .tab.is-active {
   background: var(--panel-3);
   color: var(--text);
-  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.06) inset, 0 1px 3px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--selected-bar), 0 1px 0 rgba(255, 255, 255, 0.06) inset, 0 1px 3px rgba(0, 0, 0, 0.4);
 }
 
 .tab.is-active .icon {
@@ -279,8 +289,15 @@ kbd {
   font-weight: 500;
 }
 
-.screen {
+/* <main>: holds the three tab panels in the last row; the open one fills it. */
+.screens {
   grid-row: 4;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.screen {
   min-height: 0;
   overflow: hidden;
   display: flex;
@@ -574,7 +591,7 @@ kbd {
   height: 34px;
   padding: 0 11px;
   border-radius: var(--r);
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--field-line);
   background: var(--bg-raise);
   color: var(--text);
   transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
@@ -584,16 +601,20 @@ kbd {
   color: var(--text-3);
 }
 
-.input:hover:not(:disabled) {
-  border-color: var(--line-3);
+.input:hover:not(:disabled, :focus) {
+  border-color: var(--field-line-hover);
 }
 
+/* Text entry shows its ring on any focus (a click into a field is still where typing goes): a 2px solid
+   accent edge drawn inside the box, so scrolling panels can't clip it (UI-004). No transition, so the
+   ring is there the moment focus lands. */
 .input:focus,
 .input:focus-visible {
   outline: none;
-  border-color: var(--accent-line);
-  box-shadow: 0 0 0 3px var(--accent-soft);
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring), 0 0 0 3px var(--accent-soft);
   border-radius: var(--r);
+  transition: none;
 }
 
 .input:disabled {
@@ -786,7 +807,8 @@ kbd {
 
 .chip.is-selected {
   background: var(--accent-soft);
-  border-color: var(--accent-line);
+  border-color: var(--selected-line);
+  box-shadow: var(--selected-ring);
   color: var(--accent-hi);
 }
 
@@ -864,7 +886,7 @@ kbd {
 .segmented > button.is-selected {
   background: var(--panel-3);
   color: var(--accent-hi);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 0 0 1px var(--accent-line) inset;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 0 0 2px var(--selected-line) inset;
 }
 
 .switch {
@@ -889,7 +911,7 @@ kbd {
   height: 18px;
   border-radius: 999px;
   background: var(--panel-3);
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--field-line);
   position: relative;
   transition: background 0.18s var(--ease);
 }
@@ -933,7 +955,7 @@ input[type="range"] {
 input[type="range"]::-webkit-slider-runnable-track {
   height: 4px;
   border-radius: 4px;
-  background: linear-gradient(90deg, var(--accent-line), var(--panel-3));
+  background: var(--field-line);
 }
 
 input[type="range"]::-webkit-slider-thumb {
@@ -1278,9 +1300,9 @@ input[type="range"]:focus-visible {
 }
 
 .model-card.is-selected {
-  border-color: var(--accent-line);
+  border-color: var(--selected-line);
   background: linear-gradient(160deg, rgba(255, 140, 66, 0.12), rgba(255, 140, 66, 0.02) 70%), var(--panel);
-  box-shadow: 0 0 0 1px var(--accent-line) inset, 0 6px 22px rgba(255, 140, 66, 0.08);
+  box-shadow: var(--selected-ring), 0 6px 22px rgba(255, 140, 66, 0.08);
 }
 
 .model-card__glyph {
@@ -1312,7 +1334,7 @@ input[type="range"]:focus-visible {
 }
 
 .model-card.is-missing.is-selected .model-card__glyph {
-  border-color: var(--accent-line);
+  border-color: var(--selected-line);
   color: var(--accent);
 }
 
@@ -1974,7 +1996,8 @@ input[type="range"]:focus-visible {
 }
 
 .stage--pending {
-  opacity: 0.55;
+  /* No dimming: --text-3 is already the quietest readable tone; the hollow dot marks the state (UI-002). */
+  color: var(--text-3);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -3306,7 +3329,7 @@ input[type="range"]:focus-visible {
 .mode-switch > button.is-selected {
   background: var(--panel-3);
   color: var(--text);
-  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.06) inset, 0 1px 3px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--selected-bar), 0 1px 0 rgba(255, 255, 255, 0.06) inset, 0 1px 3px rgba(0, 0, 0, 0.4);
 }
 
 .mode-switch > button.is-selected .icon {
@@ -3651,7 +3674,7 @@ input[type="range"]:focus-visible {
 .gallery-tab.is-active {
   background: var(--panel-3);
   color: var(--text);
-  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.06) inset, 0 1px 3px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--selected-bar), 0 1px 0 rgba(255, 255, 255, 0.06) inset, 0 1px 3px rgba(0, 0, 0, 0.4);
 }
 
 .gallery-tab.is-active .icon {
@@ -4103,11 +4126,6 @@ input[type="range"]:focus-visible {
     display: none;
   }
 
-  .toolbar:has(.vault-pill) .gpu-pills--dual .gpu-pill__btn:has(> .icon) {
-    font-size: 0;
-    gap: 0;
-    padding: 0 7px;
-  }
   .toolbar:has(.vault-pill):has(.gpu-pills--dual) .brand__name {
     display: none;
   }
@@ -4133,26 +4151,12 @@ input[type="range"]:focus-visible {
     display: none;
   }
 
-  /* Two pills: Stop / Start keep their icon and accessible name, the word moves out. */
-  .gpu-pills--dual .gpu-pill__btn:has(> .icon) {
-    font-size: 0;
-    gap: 0;
-    padding: 0 7px;
-  }
+  /* Start / Stop keep their words at every width (UI-016); styles/jobs.css drops the icon instead. */
 
   .vault-pill__more {
     display: none;
   }
 
-  /* Beside two GPU pills the open-lock icon and Lock button carry it alone. */
-  .toolbar:has(.gpu-pills--dual) .vault-pill__text {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
-  }
 
   .canvas {
     padding: 16px 16px 24px;
@@ -4227,22 +4231,9 @@ input[type="range"]:focus-visible {
   }
 }
 
-/* Busy GPU pills or the vault pill need the tab labels' room: tabs go icon-only,
-   keeping their names for assistive tech and in the tooltip. */
+/* Tabs keep their labels at every width and in every GPU / vault state (UI-016); the pills
+   shorten instead (styles/jobs.css). */
 @media (max-width: 900px) {
-  .toolbar:has(.gpu-pill--running, .gpu-pill--starting, .gpu-pill--error, .gpu-pill--stopping, .vault-pill) .tab {
-    padding: 0 10px;
-  }
-
-  .toolbar:has(.gpu-pill--running, .gpu-pill--starting, .gpu-pill--error, .gpu-pill--stopping, .vault-pill) .tab__label {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
-  }
-
   .settings .field-row {
     grid-template-columns: minmax(0, 1fr);
   }

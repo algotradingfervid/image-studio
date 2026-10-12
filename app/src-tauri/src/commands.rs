@@ -726,6 +726,23 @@ pub async fn vault_change_password(
     .map_err(|e| e.to_string())?
 }
 
+/// Erases the vault for good (UI-059, the way out of a forgotten password):
+/// every item, blob, the key material and the vault itself. Works locked or
+/// unlocked, needs no password and reveals nothing. `confirm` is the word the
+/// user typed and must be "erase".
+#[tauri::command]
+pub async fn vault_erase(core: CoreState<'_>, confirm: String) -> Res<VaultStatus> {
+    let c = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        c.vault.erase(&confirm)?;
+        crate::alog!("vault", "vault erased");
+        c.emit_vault();
+        Ok::<_, String>(c.vault.status())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Auto-lock after `minutes` without interaction (1–240); persisted in
 /// settings.json. Only while the vault is unlocked.
 #[tauri::command]

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import * as api from "../../api";
 import { isTaskActive, type DeletePreview, type GpuProfile, type ModelView } from "../../api";
 import { Dialog, ProgressBar } from "../../components/Dialog";
@@ -11,21 +11,36 @@ import { LoraLibrary } from "./LoraLibrary";
 import "../../styles/gpu-settings.css";
 
 // ---------------------------------------------------------------------------
-// "Install in Models →" (UX-026): another screen asks Models to bring a model's card into view.
+// "Install in Models →" (UX-026) and "Open LoRA library" (UI-037): another screen asks Models
+// to bring a section into view.
 
 let pendingFocus: string | null = null;
 const FOCUS_EVENT = "models:focus-model";
+/** `requestModelFocus` target for the LoRA library section. */
+export const LORA_LIBRARY_TARGET = "lora-library";
+/** How long the arrival highlight stays on the target (UI-037). */
+const ARRIVAL_MS = 2000;
 
 /**
- * Call right before switching to the Models tab: Models scrolls that model's card into view,
- * pulses its border and focuses its Download (or Cancel) button, and offers "Back to Create".
+ * Call right before switching to the Models tab. `target` is a model id or `LORA_LIBRARY_TARGET`.
+ * A model: Models scrolls its card into view, highlights it for ~2 s and focuses its Download
+ * (or Cancel/Delete) button with a visible ring. The LoRA library: Models scrolls its heading to
+ * the top, focuses it and announces "LoRA library". Both offer "Back to Create".
  */
-export function requestModelFocus(modelId: string) {
-  pendingFocus = modelId;
+export function requestModelFocus(target: string) {
+  pendingFocus = target;
   window.dispatchEvent(new CustomEvent(FOCUS_EVENT));
 }
 
 const cardId = (id: string) => `model-card-${id}`;
+
+/** Restarts the arrival highlight on `el` (a class, so reduced motion can swap the animation). */
+function highlight(el: HTMLElement) {
+  el.classList.remove("is-arrived");
+  void el.offsetWidth;
+  el.classList.add("is-arrived");
+  window.setTimeout(() => el.classList.remove("is-arrived"), ARRIVAL_MS);
+}
 
 /** The repo page of a Hugging Face file URL ("huggingface.co/org/repo"), for the licence hint. */
 function hfRepo(url: string | undefined): string | null {
@@ -54,9 +69,10 @@ export function ModelsScreen({ active }: { active: boolean }) {
     return () => window.clearInterval(h);
   }, []);
 
-  // Bring a requested model's card into view once the tab shows and the models are loaded.
+  // Bring a requested model's card (or the LoRA library) into view once the tab shows and the models are loaded.
   const [focusWant, setFocusWant] = useState<string | null>(pendingFocus);
   const [cameFromCreate, setCameFromCreate] = useState(false);
+  const [arrival, setArrival] = useState("");
   useEffect(() => {
     const on = () => setFocusWant(pendingFocus);
     window.addEventListener(FOCUS_EVENT, on);
@@ -65,14 +81,21 @@ export function ModelsScreen({ active }: { active: boolean }) {
   useEffect(() => {
     if (!active || !focusWant || !lib.models.length) return;
     const t = window.setTimeout(() => {
-      const el = document.getElementById(cardId(focusWant));
+      const library = focusWant === LORA_LIBRARY_TARGET;
+      const el = document.getElementById(library ? "lora-library" : cardId(focusWant));
       if (!el) return;
-      el.scrollIntoView({ behavior: "smooth", block: "center" });
-      el.classList.remove("is-pulsing");
-      void el.offsetWidth;
-      el.classList.add("is-pulsing");
-      window.setTimeout(() => el.classList.remove("is-pulsing"), 1600);
-      el.querySelector<HTMLButtonElement>("[data-focus-target]")?.focus({ preventScroll: true });
+      if (library) {
+        // The heading goes to the top (under the section nav's scroll margin) and takes focus.
+        const heading = document.getElementById("lora-title");
+        heading?.scrollIntoView({ behavior: "smooth", block: "start" });
+        heading?.focus({ preventScroll: true, focusVisible: true });
+        setArrival("LoRA library");
+      } else {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        el.querySelector<HTMLButtonElement>("[data-focus-target]")?.focus({ preventScroll: true, focusVisible: true });
+        setArrival(el.querySelector("h2")?.textContent ?? "");
+      }
+      highlight(el);
       pendingFocus = null;
       setFocusWant(null);
       setCameFromCreate(true);
@@ -80,14 +103,50 @@ export function ModelsScreen({ active }: { active: boolean }) {
     return () => window.clearTimeout(t);
   }, [active, focusWant, lib.models.length]);
   useEffect(() => {
-    if (!active) setCameFromCreate(false);
+    if (!active) {
+      setCameFromCreate(false);
+      setArrival("");
+    }
   }, [active]);
+
+  // Section nav: the section in view is marked current (UI-038). `.page` is the scroller.
+  const pageRef = useRef<HTMLDivElement>(null);
+  const [current, setCurrent] = useState<string>(SECTIONS[0].id);
+  useEffect(() => {
+    const page = pageRef.current;
+    if (!page || !active) return;
+    let raf = 0;
+    const update = () => {
+      raf = 0;
+      const top = page.getBoundingClientRect().top + 80;
+      let at: string = SECTIONS[0].id;
+      for (const s of SECTIONS) {
+        const h = document.getElementById(s.id);
+        if (h && h.getBoundingClientRect().top <= top) at = s.id;
+      }
+      // At the very bottom the last section is current even if its heading can't reach the top.
+      if (page.scrollTop + page.clientHeight >= page.scrollHeight - 4) at = SECTIONS[SECTIONS.length - 1].id;
+      setCurrent(at);
+    };
+    const onScroll = () => {
+      if (!raf) raf = requestAnimationFrame(update);
+    };
+    update();
+    page.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      page.removeEventListener("scroll", onScroll);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [active, lib.models.length, lib.loras.length]);
 
   const videoVolume = lib.videoModels.find((m) => m.volume)?.volume ?? lib.settings?.videoVolumeNames?.[0] ?? "image-studio-video";
 
   return (
-    <div className="page">
+    <div className="page models-page" ref={pageRef}>
       <div className="page__inner">
+        <p className="visually-hidden" aria-live="polite">
+          {arrival}
+        </p>
         <header className="page__head">
           <div>
             <h1 className="page__title">Models</h1>
@@ -99,9 +158,15 @@ export function ModelsScreen({ active }: { active: boolean }) {
             </button>
           )}
         </header>
-        <nav className="section-nav" aria-label="Models sections">
+        <nav className="section-nav section-nav--models" aria-label="Models sections">
           {SECTIONS.map((s) => (
-            <button key={s.id} type="button" className="section-nav__link" onClick={() => document.getElementById(s.id)?.scrollIntoView({ behavior: "smooth", block: "start" })}>
+            <button
+              key={s.id}
+              type="button"
+              className={`section-nav__link ${current === s.id ? "is-current" : ""}`}
+              aria-current={current === s.id ? "true" : undefined}
+              onClick={() => document.getElementById(s.id)?.scrollIntoView({ behavior: "smooth", block: "start" })}
+            >
               {s.label}
             </button>
           ))}
@@ -192,8 +257,13 @@ function VolumeCard({ profile }: { profile: GpuProfile }) {
           </p>
         </div>
         <div className="volume__actions">
-          <span className="hint" title={checked ? checked.toLocaleString() : undefined}>
-            Last checked {formatRelative(status?.checkedAt)}
+          {/* While refreshing: which stage the wait is in, like the model cards (UI-076). */}
+          <span className="hint" title={checked ? checked.toLocaleString() : undefined} aria-live="polite">
+            {refreshing
+              ? pg.state?.status === "starting"
+                ? `Starting the ${isVideo ? "video " : ""}GPU${pg.state.phase ? ` · ${pg.state.phase}` : ""}…`
+                : "Listing the volume…"
+              : `Last checked ${formatRelative(status?.checkedAt)}`}
           </span>
           <button type="button" className="btn" onClick={() => void refresh()} disabled={refreshing} aria-describedby={noteId}>
             <Icon name={pg.needsStart && !refreshing ? "bolt" : "refresh"} className={refreshing ? "spin" : ""} />
@@ -228,6 +298,19 @@ function ModelCard({ model: m, all, profile }: { model: ModelView; all: ModelVie
   const task = isTaskActive(m.task) ? m.task : null;
   const [starting, setStarting] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const deleteRef = useRef<HTMLButtonElement>(null);
+  // Files this download has finished: the worker reports one file at a time, so a file is done
+  // once the next one starts; the status cache only learns it after the task (UI-052).
+  const done = useRef<{ taskId: string; files: Set<string>; last: string | null }>({ taskId: "", files: new Set(), last: null });
+  if (task?.kind === "download") {
+    if (done.current.taskId !== task.taskId) done.current = { taskId: task.taskId, files: new Set(), last: null };
+    if (task.file && task.file !== done.current.last) {
+      if (done.current.last) done.current.files.add(done.current.last);
+      done.current.last = task.file;
+    }
+  }
+  const downloading = task?.kind === "download" ? task : null;
+  const isPresent = (f: (typeof m.files)[number]) => f.present || (!!downloading && done.current.files.has(f.filename));
   const missingBytes = m.totalBytes - m.presentBytes;
   const others = installedIds(all, m.id);
   const sharedInstalled = (f: (typeof m.files)[number]) => (f.sharedWith ?? []).filter((id) => others.has(id));
@@ -237,7 +320,7 @@ function ModelCard({ model: m, all, profile }: { model: ModelView; all: ModelVie
   const keptShared = m.installed ? [] : m.files.filter((f) => f.present && sharedInstalled(f).length > 0);
   const gated = m.files.some((f) => f.gated);
   const deleting = task?.kind === "delete";
-  const state = deleting ? "deleting" : m.installed ? "installed" : ownPresent.length > 0 ? "partial" : "missing";
+  const state = deleting ? "deleting" : downloading ? "downloading" : m.installed ? "installed" : ownPresent.length > 0 ? "partial" : "missing";
   const presentCount = m.files.filter((f) => f.present).length;
   const volumeName = isVideo ? (m.volume ?? lib.settings?.videoVolumeNames?.[0] ?? "the video volume") : (lib.settings?.volumeNames?.[0] ?? "the image volume");
   const vol = (isVideo ? lib.videoStatus : lib.status)?.volume;
@@ -280,12 +363,16 @@ function ModelCard({ model: m, all, profile }: { model: ModelView; all: ModelVie
             <h2 id={`m-${m.id}`} className="card__title">
               {m.name}
             </h2>
-            <span className={`badge ${state === "installed" ? "badge--ok" : state === "partial" || state === "deleting" ? "badge--warn" : "badge--muted"}`}>
+            <span className={`badge ${state === "installed" ? "badge--ok" : state === "partial" || state === "deleting" || state === "downloading" ? "badge--warn" : "badge--muted"}`}>
               {state === "installed"
                 ? "Installed"
                 : state === "deleting"
                   ? "Deleting…"
-                  : state === "partial"
+                  : state === "downloading"
+                    ? downloading!.status === "queued"
+                      ? "Queued…"
+                      : `Downloading… ${Math.round(pct(downloading!.bytes, downloading!.totalBytes))}%`
+                    : state === "partial"
                     ? `${presentCount} of ${m.files.length} files`
                     : "Not installed"}
             </span>
@@ -324,19 +411,27 @@ function ModelCard({ model: m, all, profile }: { model: ModelView; all: ModelVie
         <div className="model-panel__actions">
           {task ? (
             task.kind === "download" || task.status === "queued" ? (
-              <button type="button" className="btn btn--ghost" onClick={cancel} data-focus-target>
-                <Icon name="stop" /> {task.kind === "delete" ? "Cancel delete" : "Cancel"}
+              <button type="button" className="btn btn--outline" onClick={cancel} data-focus-target>
+                <Icon name="stop" /> {task.kind === "delete" ? "Cancel delete" : "Cancel download"}
               </button>
             ) : null
           ) : (
             <>
               {!m.installed && (
-                <button type="button" className="btn btn--primary" onClick={download} disabled={starting} data-focus-target>
+                // Outlined, not filled: the filled accent is kept for the form being filled in (UI-074).
+                <button type="button" className="btn btn--accent-outline" onClick={download} disabled={starting} data-focus-target>
                   <Icon name="download" /> {starting ? "Starting…" : `Download ${formatBytes(missingBytes)}`}
                 </button>
               )}
               {(m.installed || ownPresent.length > 0) && (
-                <button type="button" className="btn btn--ghost btn--danger-text" onClick={() => setDeleteOpen(true)} data-focus-target={m.installed ? "" : undefined}>
+                <button
+                  ref={deleteRef}
+                  type="button"
+                  className="btn btn--ghost btn--danger-text"
+                  onClick={() => setDeleteOpen(true)}
+                  aria-label={`Delete ${m.name}`}
+                  data-focus-target={m.installed ? "" : undefined}
+                >
                   <Icon name="trash" /> Delete
                 </button>
               )}
@@ -374,8 +469,11 @@ function ModelCard({ model: m, all, profile }: { model: ModelView; all: ModelVie
                   : "Downloading"}
                 {task.file ? <span className="mono hint"> · {task.file}</span> : null}
               </span>
+              {/* No numbers while the bar is indeterminate (UI-076). */}
               <span className="mono">
-                {formatBytes(task.bytes)} / {formatBytes(task.totalBytes)} · {Math.round(pct(task.bytes, task.totalBytes))}%
+                {task.status === "queued"
+                  ? formatBytes(task.totalBytes)
+                  : `${formatBytes(task.bytes)} / ${formatBytes(task.totalBytes)} · ${Math.round(pct(task.bytes, task.totalBytes))}%`}
               </span>
             </div>
             <ProgressBar label={`${m.name} download`} value={pct(task.bytes, task.totalBytes)} indeterminate={task.status === "queued"} />
@@ -385,11 +483,16 @@ function ModelCard({ model: m, all, profile }: { model: ModelView; all: ModelVie
       <ul className="file-list" aria-label={`${m.name} files`}>
         {m.files.map((f) => {
           const shared = sharedInstalled(f).map(nameOf);
-          const isCurrent = task?.kind === "download" && task?.file === f.filename;
+          const isCurrent = !!downloading && downloading.file === f.filename && downloading.status !== "queued";
+          const present = isPresent(f);
           return (
-            <li key={f.filename} className={`file-row ${f.present ? "is-present" : ""}`}>
-              <span className={`file-row__state ${isCurrent ? "is-active" : ""}`} aria-label={f.present ? "Present" : isCurrent ? "Downloading" : "Missing"}>
-                <Icon name={f.present ? "check" : isCurrent ? "download" : "x"} size={13} />
+            <li key={f.filename} className={`file-row ${present ? "is-present" : ""}`}>
+              <span
+                className={`file-row__state ${isCurrent ? "is-active" : ""}`}
+                role="img"
+                aria-label={present ? "Present" : isCurrent ? "Downloading" : "Missing"}
+              >
+                <Icon name={present ? "check" : isCurrent ? "download" : "x"} size={13} />
               </span>
               <span className="tag tag--folder">{f.folder}</span>
               <span className="file-row__name mono" title={f.url}>
@@ -414,12 +517,25 @@ function ModelCard({ model: m, all, profile }: { model: ModelView; all: ModelVie
         </p>
       )}
 
-      <DeleteDialog model={m} profile={profile} open={deleteOpen} onClose={() => setDeleteOpen(false)} />
+      <DeleteDialog model={m} profile={profile} open={deleteOpen} onClose={() => setDeleteOpen(false)} openerRef={deleteRef} />
     </article>
   );
 }
 
-function DeleteDialog({ model: m, profile, open, onClose }: { model: ModelView; profile: GpuProfile; open: boolean; onClose: () => void }) {
+function DeleteDialog({
+  model: m,
+  profile,
+  open,
+  onClose,
+  openerRef,
+}: {
+  model: ModelView;
+  profile: GpuProfile;
+  open: boolean;
+  onClose: () => void;
+  /** The card's Delete button: focus goes back there when this dialog hands over to the GPU start confirm. */
+  openerRef: RefObject<HTMLButtonElement | null>;
+}) {
   const lib = useLibrary();
   const gpu = useGpu();
   const pg = gpu.profiles[profile];
@@ -452,11 +568,24 @@ function DeleteDialog({ model: m, profile, open, onClose }: { model: ModelView; 
   const loras = lib.loras.filter((l) => l.modelId === m.id);
   const otherVideoInstalled = lib.videoModels.some((v) => v.id !== m.id && v.installed);
   const lastVideo = isVideo && m.installed && !otherVideoInstalled;
+  // What a later "Download" costs: every file that is missing after this delete (kept shared files excluded, UI-053).
+  const reinstallBytes = preview ? m.files.filter((f) => !f.present || preview.deleteFiles.includes(f.filename)).reduce((a, f) => a + f.sizeBytes, 0) : 0;
 
   const confirm = async () => {
-    // The start confirmation opens over this dialog; Cancel there leaves this one open and deletes nothing.
-    const details = [`Deletes ${filesWord} (${formatBytes(preview?.freedBytes ?? 0)}) of ${m.name}; the GPU stops again when that's done.`];
-    if (!(await gpu.confirmStart(`delete ${m.name}`, profile, { details, confirmLabel: `Start GPU & delete ${filesWord}` }))) return;
+    if (startsGpu) {
+      // One modal at a time (UI-019): this dialog hands over to the GPU start confirm, which
+      // repeats the summary and commits the delete. Cancel there deletes nothing and focus
+      // returns to the card's Delete button.
+      onClose();
+      // Let this dialog close first (the page behind a modal is inert, so focus can't move there earlier):
+      // the GPU confirm then remembers the card's Delete as its opener.
+      await new Promise<void>((r) => requestAnimationFrame(() => r()));
+      openerRef.current?.focus();
+      const details = [`Deletes ${filesWord} of ${m.name} and frees ${formatBytes(preview?.freedBytes ?? 0)}; the GPU stops again when that's done.`];
+      if (preview?.keptFiles.length) details.push(`Keeps ${preview.keptFiles.map((k) => k.filename).join(", ")} (shared with another model).`);
+      if (loras.length) details.push(`LoRA${loras.length === 1 ? "" : "s"} ${loras.map((l) => l.name).join(", ")} won't work until ${m.name} is reinstalled.`);
+      if (!(await gpu.confirmStart(`delete ${m.name}`, profile, { details, confirmLabel: `Start GPU & delete ${filesWord}`, danger: true }))) return;
+    }
     setBusy(true);
     try {
       const r = await api.deleteModel(m.id);
@@ -491,7 +620,7 @@ function DeleteDialog({ model: m, profile, open, onClose }: { model: ModelView; 
             Cancel
           </button>
           <button type="button" className="btn btn--danger" onClick={confirm} disabled={!preview || !!nothing || busy}>
-            <Icon name="trash" /> {busy ? "Deleting…" : preview ? `Delete ${m.name} (${filesWord})` : "Delete"}
+            <Icon name="trash" /> {busy ? "Deleting…" : preview ? `Delete ${m.name} (${filesWord})${startsGpu ? "…" : ""}` : "Delete"}
           </button>
         </>
       }
@@ -558,7 +687,7 @@ function DeleteDialog({ model: m, profile, open, onClose }: { model: ModelView; 
           {nothing && <p className="hint">Nothing to delete: every file is shared with another installed model.</p>}
           {!nothing && (
             <p className="hint">
-              Re-installing later downloads {formatBytes(m.totalBytes)} on the {isVideo ? "video" : "Images"} GPU ({pg.costLabel}).
+              Re-installing later downloads {formatBytes(reinstallBytes)} on the {isVideo ? "video" : "Images"} GPU ({pg.costLabel}).
             </p>
           )}
         </div>
