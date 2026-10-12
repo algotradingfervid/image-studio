@@ -102,6 +102,7 @@ fn harness(server: &MockServer, config: Option<&str>) -> Harness {
         pod_proxy_template: format!("{}/proxy/{{podId}}", server.uri()),
         pod_poll_interval: Duration::from_millis(10),
         pod_start_timeout: Duration::from_secs(5),
+        gpu_wait_timeout: Duration::from_millis(300),
         pod_stop_timeout: Duration::from_secs(2),
         rest_timeout: Duration::from_secs(1),
         clock,

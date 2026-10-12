@@ -1087,7 +1087,7 @@ async fn create_pod(core: &Arc<Core>, p: Profile, rest: &RestClient, epoch: u64)
     let token = core.settings.pod_token()?;
     let key = core.settings.runpod_api_key();
     let key = key.as_deref().filter(|_| core.settings.pass_api_key_to_pod());
-    let (pod, placed_gpu) = match create_with_fallback(core, p, rest, &vol, &token, key).await {
+    let (pod, placed_gpu) = match create_with_fallback(core, p, rest, &vol, &token, key, epoch).await {
         Ok(x) => x,
         Err(CreateError {
             message,
@@ -1167,10 +1167,20 @@ struct CreateError {
     gpu: String,
 }
 
-/// Tries each GPU type in priority order. Per the createPod docs, `400`
-/// (cross-field rule or no capacity) and `403` (pool not accessible) mean
-/// "try the next candidate" (no pod was created); anything else stops and
-/// is ambiguous.
+/// Attempts per GPU type in one round before moving to the next choice.
+pub const GPU_ATTEMPTS_PER_ROUND: u32 = 2;
+/// Phase shown while every GPU of the list is full and the start retries.
+pub const PHASE_WAITING_GPU: &str = "Waiting for a GPU";
+
+/// Tries the GPU types in priority order, each up to
+/// `GPU_ATTEMPTS_PER_ROUND` times (2 × `pod_poll_interval` apart, 6 s in
+/// production). When none has capacity, waits 10 × `pod_poll_interval`
+/// (30 s) and starts a new round from the top of the list, so a preferred
+/// GPU that frees up is still taken first; gives up after
+/// `gpu_wait_timeout` (10 min). Per the createPod docs, `400` (cross-field
+/// rule or no capacity) means "retry / try the next candidate" and `403`
+/// (pool not accessible) "try the next candidate" (no pod was created);
+/// anything else stops and is ambiguous. A Stop (epoch change) ends the wait.
 async fn create_with_fallback(
     core: &Core,
     p: Profile,
@@ -1178,50 +1188,89 @@ async fn create_with_fallback(
     vol: &VolumeInfo,
     token: &str,
     api_key: Option<&str>,
+    epoch: u64,
 ) -> Result<(Value, String), CreateError> {
     let gpus = core.settings.gpu_types_for(p);
     let image = core.settings.pod_image();
     let worker_ref = core.settings.worker_ref();
     let prefetch = prefetch_models(core, p);
     crate::alog!("pod", "image {image}, WORKER_REF {worker_ref}, PREFETCH_MODELS {prefetch:?}");
+    let attempt_gap = core.cfg.pod_poll_interval * 2;
+    let round_gap = core.cfg.pod_poll_interval * 10;
+    let deadline = tokio::time::Instant::now() + core.cfg.gpu_wait_timeout;
+    let stopped = || CreateError {
+        message: "superseded by a newer start/stop".into(),
+        ambiguous: false,
+        gpu: String::new(),
+    };
     let mut last = String::new();
-    for gpu in &gpus {
-        let body = create_payload_for(
-            p,
-            vol,
-            gpu,
-            token,
-            core.settings.idle_minutes(),
-            api_key,
-            &image,
-            &worker_ref,
-            &prefetch,
-        );
-        match rest.create_pod(&body).await {
-            Ok(pod) if pod_str(&pod, "id").is_some() => return Ok((pod, gpu.clone())),
-            Ok(_) => {
-                return Err(CreateError {
-                    message: "RunPod did not return a pod id".into(),
-                    ambiguous: true,
-                    gpu: gpu.clone(),
-                })
-            }
-            Err(e) if matches!(e.status, Some(400 | 403)) => {
-                crate::alog!("pod", "{gpu} not placeable in {}: {}", vol.data_center, e.message);
-                last = e.message;
-            }
-            Err(e) => {
-                return Err(CreateError {
-                    message: e.message,
-                    ambiguous: true,
-                    gpu: gpu.clone(),
-                })
+    let mut round = 1u32;
+    loop {
+        for gpu in &gpus {
+            let body = create_payload_for(
+                p,
+                vol,
+                gpu,
+                token,
+                core.settings.idle_minutes(),
+                api_key,
+                &image,
+                &worker_ref,
+                &prefetch,
+            );
+            for attempt in 1..=GPU_ATTEMPTS_PER_ROUND {
+                if !is_current(core, p, epoch) {
+                    return Err(stopped());
+                }
+                match rest.create_pod(&body).await {
+                    Ok(pod) if pod_str(&pod, "id").is_some() => return Ok((pod, gpu.clone())),
+                    Ok(_) => {
+                        return Err(CreateError {
+                            message: "RunPod did not return a pod id".into(),
+                            ambiguous: true,
+                            gpu: gpu.clone(),
+                        })
+                    }
+                    Err(e) if matches!(e.status, Some(400 | 403)) => {
+                        crate::alog!("pod", "{gpu} not placeable in {} (round {round}, attempt {attempt}): {}",
+                            vol.data_center, e.message);
+                        last = e.message;
+                        // 403: this pool is not accessible; retrying it is pointless.
+                        if e.status == Some(403) {
+                            break;
+                        }
+                        if attempt < GPU_ATTEMPTS_PER_ROUND {
+                            tokio::time::sleep(attempt_gap).await;
+                        }
+                    }
+                    Err(e) => {
+                        return Err(CreateError {
+                            message: e.message,
+                            ambiguous: true,
+                            gpu: gpu.clone(),
+                        })
+                    }
+                }
             }
         }
+        if tokio::time::Instant::now() + round_gap >= deadline {
+            break;
+        }
+        crate::alog!("pod", "no GPU free in {} after round {round}; retrying in {:?}", vol.data_center, round_gap);
+        // One fixed text, so the job card's timer shows the whole wait.
+        set_state(core, p, Some(epoch), |s| {
+            s.phase = Some(format!("{PHASE_WAITING_GPU} (none free in {}, retrying)", vol.data_center));
+        });
+        tokio::time::sleep(round_gap).await;
+        if !is_current(core, p, epoch) {
+            return Err(stopped());
+        }
+        round += 1;
     }
+    let mins = core.cfg.gpu_wait_timeout.as_secs().div_ceil(60);
     Err(CreateError {
         message: format!(
-            "No GPU is available in {} right now (tried {}; only hosts with CUDA {MIN_CUDA_VERSION} or newer qualify, gpu.minCudaVersion). Last error: {last}. Try again in a few minutes.",
+            "No GPU is available in {} right now (tried {} for {mins} min, {round} rounds; only hosts with CUDA {MIN_CUDA_VERSION} or newer qualify, gpu.minCudaVersion). Last error: {last}. Try again later.",
             vol.data_center,
             gpus.join(", ")
         ),

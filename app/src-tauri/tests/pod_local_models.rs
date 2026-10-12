@@ -43,6 +43,7 @@ fn core(server_uri: &str, dir: &tempfile::TempDir) -> Arc<Core> {
         pod_proxy_template: format!("{server_uri}/proxy/{{podId}}"),
         pod_poll_interval: Duration::from_millis(10),
         pod_start_timeout: Duration::from_secs(5),
+        gpu_wait_timeout: Duration::from_millis(300),
         pod_stop_timeout: Duration::from_secs(2),
         rest_timeout: Duration::from_secs(1),
         clock,

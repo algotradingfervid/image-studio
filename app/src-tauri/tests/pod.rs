@@ -71,6 +71,7 @@ fn harness(server: &MockServer, pod_token: Option<&str>, start_timeout: Duration
         pod_proxy_template: format!("{}/proxy/{{podId}}", server.uri()),
         pod_poll_interval: Duration::from_millis(10),
         pod_start_timeout: start_timeout,
+        gpu_wait_timeout: Duration::from_secs(2),
         pod_stop_timeout: Duration::from_secs(2),
         rest_timeout: REST_TIMEOUT,
         clock,
@@ -334,11 +335,11 @@ async fn start_falls_back_to_next_gpu_on_capacity_error() {
     Mock::given(method("POST"))
         .and(path("/v2/pods"))
         .respond_with(seq(vec![
-            ResponseTemplate::new(400).set_body_json(json!({"title": "Bad Request", "status": 400,
-                "detail": "There are no longer any instances available with the requested specifications."})),
+            no_capacity(),
+            no_capacity(),
             ResponseTemplate::new(201).set_body_json(created.clone()),
         ]))
-        .expect(2)
+        .expect(3)
         .mount(&server)
         .await;
     let mut running = created.clone();
@@ -365,10 +366,137 @@ async fn start_falls_back_to_next_gpu_on_capacity_error() {
         gpus,
         vec![
             "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+            "NVIDIA RTX PRO 6000 Blackwell Server Edition",
             "NVIDIA RTX PRO 4500 Blackwell"
         ]
     );
     server.verify().await;
+}
+
+fn no_capacity() -> ResponseTemplate {
+    ResponseTemplate::new(400).set_body_json(json!({"title": "Bad Request", "status": 400,
+        "detail": "There are no longer any instances available with the requested specifications."}))
+}
+
+/// `POST /v2/pods`: 400 (no capacity) for the first `full` creates, then 201.
+struct FullFor(usize, AtomicUsize);
+impl Respond for FullFor {
+    fn respond(&self, r: &Request) -> ResponseTemplate {
+        if self.1.fetch_add(1, Ordering::SeqCst) < self.0 {
+            return no_capacity();
+        }
+        let mut p = pod_json("pod1", "PROVISIONING");
+        p["gpu"]["id"] = r.body_json::<Value>().unwrap()["gpu"]["id"].clone();
+        ResponseTemplate::new(201).set_body_json(p)
+    }
+}
+
+async fn create_gpus(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "POST")
+        .map(|r| r.body_json::<Value>().unwrap()["gpu"]["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn start_retries_the_preferred_gpu_before_the_next_choice() {
+    let server = MockServer::start().await;
+    mount_volumes(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/v2/pods"))
+        .respond_with(FullFor(1, AtomicUsize::new(0)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/pod1"))
+        .respond_with(ok(pod_json("pod1", "RUNNING")))
+        .mount(&server)
+        .await;
+    mount_ready_pod_server(&server, "pod1").await;
+    let h = harness(&server, Some("t"), Duration::from_secs(5));
+    pod::start(&h.core).unwrap();
+    let s = wait_for(&h.core, GpuStatus::Running).await;
+    assert_eq!(s.gpu_type.as_deref(), Some("NVIDIA RTX PRO 6000 Blackwell Server Edition"));
+    assert_eq!(create_gpus(&server).await, vec!["NVIDIA RTX PRO 6000 Blackwell Server Edition"; 2]);
+}
+
+#[tokio::test]
+async fn start_waits_for_a_gpu_and_starts_a_new_round_from_the_top() {
+    let server = MockServer::start().await;
+    mount_volumes(&server).await;
+    // Round 1: all 4 image GPUs full twice each (8 creates); round 2 opens with the first choice.
+    Mock::given(method("POST"))
+        .and(path("/v2/pods"))
+        .respond_with(FullFor(8, AtomicUsize::new(0)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/pod1"))
+        .respond_with(ok(pod_json("pod1", "RUNNING")))
+        .mount(&server)
+        .await;
+    mount_ready_pod_server(&server, "pod1").await;
+    let h = harness(&server, Some("t"), Duration::from_secs(5));
+    pod::start(&h.core).unwrap();
+    let s = wait_for(&h.core, GpuStatus::Running).await;
+    assert_eq!(s.error, None);
+    let gpus = create_gpus(&server).await;
+    assert_eq!(gpus.len(), 9);
+    assert_eq!(gpus[8], "NVIDIA RTX PRO 6000 Blackwell Server Edition", "a new round starts at the top");
+    assert_eq!(gpus[2], "NVIDIA RTX PRO 4500 Blackwell", "two attempts, then the next choice");
+    let phases: Vec<String> = h.sink.gpu.lock().unwrap().iter().filter_map(|g| g.phase.clone()).collect();
+    assert!(
+        phases.iter().any(|p| p == "Waiting for a GPU (none free in EU-RO-1, retrying)"),
+        "{phases:?}"
+    );
+}
+
+#[tokio::test]
+async fn start_gives_up_after_the_gpu_wait_timeout() {
+    let server = MockServer::start().await;
+    mount_volumes(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/v2/pods"))
+        .respond_with(no_capacity())
+        .mount(&server)
+        .await;
+    let h = harness(&server, Some("t"), Duration::from_secs(5));
+    pod::start(&h.core).unwrap();
+    let s = wait_for(&h.core, GpuStatus::Error).await;
+    let e = s.error.unwrap();
+    assert!(e.contains("No GPU is available in EU-RO-1"), "{e}");
+    let n = create_gpus(&server).await.len();
+    assert!(n >= 16 && n % 8 == 0, "whole rounds of 4 GPUs × 2 attempts, at least 2: {n}");
+    assert!(e.contains(&format!("{} rounds", n / 8)), "{e}");
+}
+
+#[tokio::test]
+async fn stop_ends_the_wait_for_a_gpu() {
+    let server = MockServer::start().await;
+    mount_volumes(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/v2/pods"))
+        .respond_with(no_capacity())
+        .mount(&server)
+        .await;
+    let h = harness(&server, Some("t"), Duration::from_secs(5));
+    pod::start(&h.core).unwrap();
+    for _ in 0..200 {
+        if pod::state(&h.core).phase.as_deref().is_some_and(|p| p.starts_with("Waiting for a GPU")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let s = pod::stop(&h.core, StopReason::User).await.unwrap();
+    assert_eq!(s.status, GpuStatus::Stopped);
+    let n = create_gpus(&server).await.len();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(create_gpus(&server).await.len(), n, "no creates after Stop");
+    assert_eq!(pod::state(&h.core).status, GpuStatus::Stopped);
 }
 
 #[tokio::test]
