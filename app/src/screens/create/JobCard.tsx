@@ -341,6 +341,8 @@ export function JobCard({
     : `${num != null ? `Job ${num}, ` : ""}${heading || (video ? "Video" : "Generation")}, ${stateWord}`;
   const valueText = caption ? caption.left : bar?.indeterminate ? title : undefined;
   const toVault = job.destination === "vault";
+  // A story render (it carries a label): its takes live in the story, never in the Vault tab.
+  const storyJob = !!job.label;
   // The vault was erased after this job: its outputs are gone, there is nothing to unlock (UI-059).
   const erased = toVault && vault.status != null && !vault.exists;
   // A click that lands just after the card or the list changed under the pointer is ignored (UI-056).
@@ -487,13 +489,15 @@ export function JobCard({
                 : job.completed > 0
                   ? erased
                     ? `${job.completed === 1 ? `The ${noun}` : `${job.completed} ${noun}s`} went with the erased vault`
-                    : `${job.completed} ${noun}${job.completed === 1 ? "" : "s"} sealed in the vault`
+                    : storyJob
+                      ? "Saved to the story"
+                      : `${job.completed} ${noun}${job.completed === 1 ? "" : "s"} sealed in the vault`
                   : "Nothing was saved"}
               {!active && job.completed > 0 && !erased && (
                 <>
                   {" · "}
                   <button type="button" className="link-btn" onClick={vault.requestUnlock}>
-                    Unlock to view
+                    {storyJob ? "Unlock the vault to view it in Stories" : "Unlock to view"}
                   </button>
                 </>
               )}
@@ -503,7 +507,7 @@ export function JobCard({
           <p className="job-card__prompt" title={promptLine}>
             <strong>{heading}</strong>
             {prompt ? ` · ${prompt}` : ""}
-            {toVault && !prompt && !active && job.completed > 0 && outputs.length === 0 && (
+            {toVault && !storyJob && !prompt && !active && job.completed > 0 && outputs.length === 0 && (
               <>
                 {" · "}
                 <button type="button" className="link-btn" onClick={() => showVaultTab()}>

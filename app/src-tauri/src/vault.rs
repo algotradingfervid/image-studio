@@ -1171,6 +1171,11 @@ impl Vault {
         }
     }
 
+    /// Whether a sealed blob is still on disk (no key needed).
+    pub fn blob_exists(&self, id: &str) -> bool {
+        uuid::Uuid::parse_str(id).is_ok() && self.blob_path(id).is_file()
+    }
+
     pub fn delete_blob(&self, id: &str) -> Result<(), String> {
         if uuid::Uuid::parse_str(id).is_err() {
             return Err("Invalid vault blob id".into());

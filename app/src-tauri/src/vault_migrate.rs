@@ -121,6 +121,16 @@ fn seal_path(core: &Core, path: &str) -> Result<BlobRef, String> {
     seal_verified(core, &bytes, &ext_of(path, &bytes))
 }
 
+/// A start image or reference of a job output. A `vault:` blob that is gone
+/// (a character edit collected the old reference while the take rendered) is
+/// dropped so the take never carries a dangling reference.
+fn output_attachment(core: &Core, path: &str) -> Result<Option<BlobRef>, String> {
+    if let Some(b) = BlobRef::parse(path) {
+        return Ok(core.vault.blob_exists(&b.id).then_some(b));
+    }
+    seal_path(core, path).map(Some)
+}
+
 /// A start image or reference of a record being sealed. When the file is
 /// gone because it was another gallery item that already moved into the
 /// vault (image→video from the gallery reads that item's file in place),
@@ -180,13 +190,13 @@ pub fn seal_output(
     };
     let thumb = thumb_for(core, &template.kind, media);
     let init = match &template.init_image {
-        Some(p) => Some(seal_path(core, p)?),
+        Some(p) => output_attachment(core, p)?,
         None => None,
     };
     let refs = template
         .references
         .iter()
-        .map(|p| seal_path(core, p))
+        .filter_map(|p| output_attachment(core, p).transpose())
         .collect::<Result<Vec<_>, _>>()?;
     let item = item_from_record(template, id, media_ref, poster_ref, thumb, init, refs, None);
     core.vault.put_item(&item)?;

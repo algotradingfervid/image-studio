@@ -1140,7 +1140,8 @@ fn save_video(
         // locked the shot cannot have been removed (spec §3.4), so no check.
         if core.vault.is_unlocked() {
             if let Some(shot_id) = rec.shot_id.as_deref() {
-                if crate::stories::repo::get_shot(core, shot_id)?.is_none() {
+                let lookup = crate::stories::repo::get_shot(core, shot_id).map(|s| s.is_some());
+                if sealed_take_orphaned(lookup, || core.vault.is_unlocked())? {
                     core.vault.delete_item(&saved.id)?;
                     return Err("The shot was removed while it rendered; its take was discarded".into());
                 }
@@ -1182,6 +1183,29 @@ fn save_video(
         }
     }
     Ok(rec)
+}
+
+/// Whether a sealed story take's shot is really gone. `lookup` is the shot
+/// lookup (Ok(true) = found). A vault story's shot reads as missing (or the
+/// lookup fails) once the vault locks, so a lock landing between the caller's
+/// `is_unlocked()` and the lookup must not count as a removed shot: when the
+/// vault is locked now, the take is kept (it attaches on unlock, like a take
+/// that lands while locked).
+fn sealed_take_orphaned(
+    lookup: Result<bool, String>,
+    still_unlocked: impl FnOnce() -> bool,
+) -> Result<bool, String> {
+    match lookup {
+        Ok(true) => Ok(false),
+        Ok(false) => Ok(still_unlocked()),
+        Err(e) => {
+            if still_unlocked() {
+                Err(e)
+            } else {
+                Ok(false)
+            }
+        }
+    }
 }
 
 fn save_output(
@@ -1408,6 +1432,20 @@ async fn run_job(core: Arc<Core>, id: String, client: RunpodClient, plan: Plan, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sealed_take_is_discarded_only_when_its_shot_is_gone_and_the_vault_still_unlocked() {
+        // Shot found: kept, the lock state is not even asked.
+        assert_eq!(sealed_take_orphaned(Ok(true), || panic!("not asked")), Ok(false));
+        // Shot missing while still unlocked: really removed.
+        assert_eq!(sealed_take_orphaned(Ok(false), || true), Ok(true));
+        // Shot "missing" because the vault locked after the caller's check: kept.
+        assert_eq!(sealed_take_orphaned(Ok(false), || false), Ok(false));
+        // The lookup failed because the vault locked meanwhile: kept, no error.
+        assert_eq!(sealed_take_orphaned(Err("VAULT_LOCKED: locked".into()), || false), Ok(false));
+        // Any other failure while unlocked still surfaces.
+        assert_eq!(sealed_take_orphaned(Err("disk".into()), || true), Err("disk".into()));
+    }
 
     #[tokio::test]
     async fn tickets_submit_in_queue_order_whatever_the_wake_order() {

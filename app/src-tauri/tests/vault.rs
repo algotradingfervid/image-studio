@@ -861,6 +861,17 @@ fn unlock_loads_story_docs_and_lock_wipes_them() {
     take.story_id = Some(story.id.clone());
     take.shot_id = Some("sh1".into());
     vault_migrate::seal_output(&h.core, &take, &mp4(4), Some(&jpeg(4))).unwrap();
+    // A reference blob collected while the take rendered (a character edit)
+    // is dropped from the landed take; a live one is kept.
+    let live = v.seal_blob(&jpeg(5), "jpg").unwrap();
+    let gone = v.seal_blob(&jpeg(6), "jpg").unwrap();
+    v.delete_blob(&gone.id).unwrap();
+    let mut take2 = take.clone();
+    take2.references = vec![live.path(), gone.path()];
+    let landed = vault_migrate::seal_output(&h.core, &take2, &mp4(5), Some(&jpeg(5))).unwrap();
+    assert_eq!(landed.references, vec![live.path()]);
+    assert_eq!(v.item(&landed.id).unwrap().references.iter().map(|b| b.id.clone()).collect::<Vec<_>>(), vec![live.id.clone()]);
+    v.delete_item(&landed.id).unwrap();
     v.lock();
     assert!(v.story_doc(&story.id).unwrap_err().starts_with("VAULT_LOCKED"));
     assert!(v.story_file_exists(&story.id));
