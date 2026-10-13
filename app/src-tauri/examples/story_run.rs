@@ -387,7 +387,7 @@ fn ensure_story(core: &Core, cast: &[Character]) -> Result<String, String> {
         updated_at: now,
     };
     render::check_story(&story)?;
-    render::check_cast_exists(core, &story.cast)?;
+    app_lib::stories::repo::check_cast(core, &story)?;
     store::save_story(&core.db.lock().unwrap(), &story)?;
     println!("{} created story {}", ts(), story.id);
     Ok(story.id)

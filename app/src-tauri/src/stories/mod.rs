@@ -5,6 +5,7 @@ pub mod compile;
 pub mod ffmpeg;
 pub mod planner;
 pub mod render;
+pub mod repo;
 pub mod store;
 pub mod validate;
 

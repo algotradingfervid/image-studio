@@ -799,6 +799,8 @@ pub fn export_vault_item(core: CoreState<'_>, id: String, dest: String) -> Res<(
 #[tauri::command]
 pub fn delete_vault_item(core: CoreState<'_>, id: String) -> Res<()> {
     core.vault.touch();
+    // A story's take or film: the story forgets it before it goes.
+    stories::repo::clear_image_refs(&core, &id)?;
     core.vault.delete_item(&id)?;
     core.emit_vault();
     Ok(())
@@ -848,13 +850,15 @@ fn rendered((shot_id, job_id): (String, String)) -> RenderedShot {
     RenderedShot { shot_id, job_id }
 }
 
+/// General characters, plus the vault's while it is unlocked.
 #[tauri::command]
 pub fn list_characters(core: CoreState<'_>) -> Res<Vec<Character>> {
-    let cs = stories::store::list_characters(&core.db.lock().unwrap())?;
+    let cs = stories::repo::list_characters(&core)?;
     Ok(render::with_ref_paths(&core.cfg.references_dir(), cs))
 }
 
-/// New when `id` is empty (id and timestamps assigned); else an update.
+/// New when `id` is empty (id and timestamps assigned; `vault` picks the
+/// store); else an update, in the store the character already has.
 #[tauri::command]
 pub fn save_character(core: CoreState<'_>, character: Character) -> Res<Character> {
     let mut c = character;
@@ -863,31 +867,31 @@ pub fn save_character(core: CoreState<'_>, character: Character) -> Res<Characte
     c.ref_paths = Vec::new(); // display only: not stored
     stories::store::check_character(&c)?;
     let now = crate::state::now_rfc3339();
-    let db = core.db.lock().unwrap();
     if c.id.is_empty() {
         c.id = uuid::Uuid::new_v4().to_string();
         c.created_at = now.clone();
-    } else if let Some(old) = stories::store::get_character(&db, &c.id)? {
+    } else if let Some(old) = stories::repo::get_character(&core, &c.id)? {
         c.created_at = old.created_at;
     } else if c.created_at.is_empty() {
         c.created_at = now.clone();
     }
     c.updated_at = now;
-    stories::store::save_character(&db, &c)?;
-    drop(db);
+    let c = stories::repo::save_character(&core, &c)?;
     Ok(render::with_ref_paths(&core.cfg.references_dir(), vec![c]).remove(0))
 }
 
 #[tauri::command]
 pub fn delete_character(core: CoreState<'_>, id: String) -> Res<()> {
-    stories::store::delete_character(&core.db.lock().unwrap(), &id)
+    stories::repo::delete_character(&core, &id)
 }
 
+/// General stories, plus the vault's while it is unlocked.
 #[tauri::command]
 pub fn list_stories(core: CoreState<'_>) -> Res<Vec<Story>> {
-    stories::store::list_stories(&core.db.lock().unwrap())
+    stories::repo::list_stories(&core)
 }
 
+/// `destination` ("general", default, or "vault") fixes where the story lives.
 #[tauri::command]
 pub fn create_story(
     core: CoreState<'_>,
@@ -896,6 +900,7 @@ pub fn create_story(
     aspect: String,
     style: String,
     cast: Vec<String>,
+    destination: Option<String>,
 ) -> Res<StoryView> {
     let now = crate::state::now_rfc3339();
     let story = Story {
@@ -910,13 +915,13 @@ pub fn create_story(
         voices: vec![],
         status: "draft".into(),
         result_image_id: None,
-        vault: false,
+        vault: Destination::parse(destination.as_deref())? == Destination::Vault,
         created_at: now.clone(),
         updated_at: now,
     };
     render::check_story(&story)?;
-    render::check_cast_exists(&core, &story.cast)?;
-    stories::store::save_story(&core.db.lock().unwrap(), &story)?;
+    stories::repo::check_cast(&core, &story)?;
+    stories::repo::save_story(&core, &story)?;
     render::story_view(&core, &story.id)
 }
 
@@ -964,7 +969,7 @@ pub async fn render_story(core: CoreState<'_>, story_id: String) -> Res<RenderAl
 #[tauri::command]
 pub async fn approve_take(core: CoreState<'_>, shot_id: String, take_id: String) -> Res<ApproveResult> {
     let queued = render::approve_take(&core, &shot_id, &take_id)?.map(rendered);
-    let story_id = stories::store::get_shot(&core.db.lock().unwrap(), &shot_id)?
+    let story_id = stories::repo::get_shot(&core, &shot_id)?
         .ok_or("That shot no longer exists")?
         .story_id;
     Ok(ApproveResult { view: render::story_view(&core, &story_id)?, queued })

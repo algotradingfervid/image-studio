@@ -48,9 +48,21 @@ pub fn mentions_minor(text: &str) -> bool {
     }) || w.windows(2).any(|p| minor_age(&p[0]) && p[1] == "yo")
 }
 
+/// Two cast members with the same name (case-insensitive) — the planner and
+/// the prompts refer to characters by name. Name uniqueness is per store, so a
+/// General and a vault character may share one.
+pub fn duplicate_cast_name(cast: &[Character]) -> Option<String> {
+    cast.iter().enumerate().find_map(|(i, a)| {
+        cast[..i]
+            .iter()
+            .find(|b| b.name.eq_ignore_ascii_case(&a.name))
+            .map(|b| format!("Two cast members are both named {}. Rename one.", b.name))
+    })
+}
+
 /// Story-level checks that must pass before planning or rendering: a brief,
-/// a cast, adults only, consent for real people, no minors in the brief, style
-/// or character descriptions.
+/// a cast with distinct names, adults only, consent for real people, no minors
+/// in the brief, style or character descriptions.
 pub fn preflight(story: &Story, cast: &[Character]) -> Vec<Issue> {
     let mut out = Vec::new();
     let story_issue = |out: &mut Vec<Issue>, m: String| out.push(Issue { shot: None, message: m });
@@ -59,6 +71,9 @@ pub fn preflight(story: &Story, cast: &[Character]) -> Vec<Issue> {
     }
     if story.cast.is_empty() || cast.is_empty() {
         story_issue(&mut out, "Add at least one character to the cast first".into());
+    }
+    if let Some(m) = duplicate_cast_name(cast) {
+        story_issue(&mut out, m);
     }
     for c in cast {
         if !c.adult {

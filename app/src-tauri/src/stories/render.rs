@@ -1,7 +1,7 @@
 //! Shot and story rendering: queues video jobs and links takes to shots.
 
 use super::{
-    compile::compile_shot, ffmpeg, planner, resolution_for, resolve_llm_model, store,
+    compile::compile_shot, ffmpeg, planner, repo, resolution_for, resolve_llm_model, store,
     validate::{preflight, validate},
     Character, Issue, Shot, Story, StoryPatch, StoryView,
 };
@@ -17,9 +17,8 @@ const VIDEO_MODEL: &str = "h3ref";
 const FPS: f64 = 24.0;
 
 fn cast_of(core: &Core, ids: &[String]) -> Result<Vec<Character>, String> {
-    let db = core.db.lock().unwrap();
     ids.iter()
-        .map(|id| store::get_character(&db, id)?.ok_or_else(|| "A cast character no longer exists".to_string()))
+        .map(|id| repo::get_character(core, id)?.ok_or_else(|| "A cast character no longer exists".to_string()))
         .collect()
 }
 
@@ -49,16 +48,12 @@ pub fn with_ref_paths(refs_dir: &Path, cs: Vec<Character>) -> Vec<Character> {
 /// The story with its cast (cast order), shots, takes (newest first) and every
 /// validation / compile issue.
 pub fn story_view(core: &Core, story_id: &str) -> Result<StoryView, String> {
-    let (story, shots, takes, result) = {
-        let db = core.db.lock().unwrap();
-        let story = store::get_story(&db, story_id)?.ok_or("That story no longer exists")?;
-        let shots = store::list_shots(&db, story_id)?;
-        let takes = db.list_takes(story_id)?;
-        let result = match story.result_image_id.as_deref() {
-            Some(id) => db.get_image(id)?,
-            None => None,
-        };
-        (story, shots, takes, result)
+    let story = repo::get_story(core, story_id)?.ok_or("That story no longer exists")?;
+    let shots = repo::list_shots(core, story_id)?;
+    let takes = repo::list_takes(core, &story)?;
+    let result = match story.result_image_id.as_deref() {
+        Some(id) => repo::get_take(core, id)?,
+        None => None,
     };
     let cast = cast_of(core, &story.cast)?;
     // A fresh draft has no shots yet; it only gets the story-level issues.
@@ -113,7 +108,12 @@ fn issue_text(i: &Issue) -> String {
 }
 
 /// The job card label of a shot render: "Story: {title or brief start} · shot N".
-fn job_label(story: &Story, position: u32) -> String {
+/// A vault story's label names nothing of it ("Vault story · shot N"): job
+/// cards stay visible while the vault is locked.
+pub fn job_label(story: &Story, position: u32) -> String {
+    if story.vault {
+        return format!("Vault story · shot {position}");
+    }
     const MAX: usize = 40;
     let title = story.title.trim();
     let name = if !title.is_empty() {
@@ -134,10 +134,7 @@ fn job_label(story: &Story, position: u32) -> String {
 /// Queues one H3 Character job for the shot; returns the job id. Refused
 /// while an earlier render of the shot is still running.
 pub fn render_shot(core: &Arc<Core>, shot_id: &str) -> Result<String, String> {
-    let shot = {
-        let db = core.db.lock().unwrap();
-        store::get_shot(&db, shot_id)?.ok_or("That shot no longer exists")?
-    };
+    let shot = repo::get_shot(core, shot_id)?.ok_or("That shot no longer exists")?;
     let busy = || format!("Shot {} is already rendering", shot.position);
     if is_rendering(core, shot_id) {
         return Err(busy());
@@ -181,7 +178,7 @@ pub fn render_shot(core: &Arc<Core>, shot_id: &str) -> Result<String, String> {
         fps: FPS,
         resolution: resolution_for(&view.story.aspect)?.into(),
         audio: true,
-        destination: Destination::General,
+        destination: if view.story.vault { Destination::Vault } else { Destination::General },
         story_take: Some((shot.story_id.clone(), shot.id.clone())),
         label: Some(job_label(&view.story, shot.position)),
         ..Default::default()
@@ -238,16 +235,12 @@ pub struct RenderAll {
 /// Approves `take_id` for the shot. When the next shot continues this one and
 /// has no takes yet, it is rendered now; returns its (shot_id, job_id).
 pub fn approve_take(core: &Arc<Core>, shot_id: &str, take_id: &str) -> Result<Option<(String, String)>, String> {
-    let shot = {
-        let db = core.db.lock().unwrap();
-        let shot = store::get_shot(&db, shot_id)?.ok_or("That shot no longer exists")?;
-        let take = db.get_image(take_id)?.ok_or("That take no longer exists")?;
-        if take.shot_id.as_deref() != Some(shot_id) {
-            return Err("That take belongs to another shot".into());
-        }
-        store::set_approved(&db, shot_id, Some(take_id))?;
-        shot
-    };
+    let shot = repo::get_shot(core, shot_id)?.ok_or("That shot no longer exists")?;
+    let take = repo::get_take(core, take_id)?.ok_or("That take no longer exists")?;
+    if take.shot_id.as_deref() != Some(shot_id) {
+        return Err("That take belongs to another shot".into());
+    }
+    repo::set_approved(core, shot_id, Some(take_id))?;
     let view = story_view(core, &shot.story_id)?;
     let Some(next) = view.shots.iter().find(|s| s.position == shot.position + 1) else {
         return Ok(None);
@@ -334,17 +327,15 @@ pub fn assemble_story(core: &Core, story_id: &str) -> Result<ImageRecord, String
                 "seed": t.map(|t| t.seed), "prompt": t.map(|t| &t.prompt)})
         }).collect::<Vec<_>>(),
     });
-    let db = core.db.lock().unwrap();
-    if let Err(e) = db
-        .insert_image(&rec)
-        .and_then(|_| store::set_result(&db, story_id, &id, &sidecar.to_string()))
-    {
-        let _ = db.delete_image(&id);
+    let inserted = core.db.lock().unwrap().insert_image(&rec);
+    if let Err(e) = inserted.and_then(|_| repo::set_result(core, story_id, &id, &sidecar)) {
+        let _ = core.db.lock().unwrap().delete_image(&id);
         core.cfg.remove_record_files(&rec);
         return Err(e);
     }
     // The new result is recorded; now the previous one goes.
     if let Some(old) = view.story.result_image_id.as_deref() {
+        let db = core.db.lock().unwrap();
         if let Some(o) = db.get_image(old)? {
             core.cfg.delete_record(&db, &o)?;
         }
@@ -352,11 +343,17 @@ pub fn assemble_story(core: &Core, story_id: &str) -> Result<ImageRecord, String
     Ok(rec)
 }
 
-/// Deletes records and the files the app wrote for them.
+/// Deletes records and the files the app wrote for them. A sealed record
+/// (a vault story's take or film) is a vault item: it goes with its unshared
+/// blobs, and the story forgets it.
 pub fn delete_records(core: &Core, recs: &[crate::db::ImageRecord]) -> Result<(), String> {
-    let db = core.db.lock().unwrap();
     for rec in recs {
-        core.cfg.delete_record(&db, rec)?;
+        if rec.vault {
+            core.vault.delete_item(&rec.id)?;
+            repo::clear_image_refs(core, &rec.id)?;
+        } else {
+            core.cfg.delete_record(&core.db.lock().unwrap(), rec)?;
+        }
     }
     Ok(())
 }
@@ -366,14 +363,14 @@ pub fn delete_records(core: &Core, recs: &[crate::db::ImageRecord]) -> Result<()
 pub fn store_shots(core: &Core, story_id: &str, shots: &[Shot]) -> Result<(), String> {
     let orphans: Vec<ImageRecord> = {
         let mut renders = core.story_renders.lock().unwrap();
-        let gone: Vec<Shot> = store::list_shots(&core.db.lock().unwrap(), story_id)?
+        let story = repo::get_story(core, story_id)?.ok_or("That story no longer exists")?;
+        let gone: Vec<Shot> = repo::list_shots(core, story_id)?
             .into_iter()
             .filter(|old| !shots.iter().any(|s| s.id == old.id))
             .collect();
         refuse_rendering(core, &mut renders, &gone)?;
-        let db = core.db.lock().unwrap();
-        store::replace_shots(&db, story_id, shots)?;
-        db.list_takes(story_id)?
+        repo::replace_shots(core, story_id, shots)?;
+        repo::list_takes(core, &story)?
             .into_iter()
             .filter(|t| !shots.iter().any(|s| t.shot_id.as_deref() == Some(s.id.as_str())))
             .collect()
@@ -383,37 +380,20 @@ pub fn store_shots(core: &Core, story_id: &str, shots: &[Shot]) -> Result<(), St
 
 /// Saves the edited shot list in the given order (see `store::merge_shots`).
 pub fn save_shots(core: &Core, story_id: &str, shots: Vec<Shot>) -> Result<StoryView, String> {
-    let existing = {
-        let db = core.db.lock().unwrap();
-        store::get_story(&db, story_id)?.ok_or("That story no longer exists")?;
-        store::list_shots(&db, story_id)?
-    };
+    repo::get_story(core, story_id)?.ok_or("That story no longer exists")?;
+    let existing = repo::list_shots(core, story_id)?;
     let merged = store::merge_shots(story_id, &existing, shots);
     store_shots(core, story_id, &merged)?;
     story_view(core, story_id)
 }
 
-/// Every cast id must be a saved character.
-pub fn check_cast_exists(core: &Core, cast: &[String]) -> Result<(), String> {
-    let db = core.db.lock().unwrap();
-    for id in cast {
-        if store::get_character(&db, id)?.is_none() {
-            return Err("A cast character no longer exists".into());
-        }
-    }
-    Ok(())
-}
-
 /// Writes only the fields `patch` sets (title, brief, target, aspect, style,
 /// cast, voices), validated like a new story. The aspect can't change once
-/// the story has takes (they would no longer assemble).
+/// the story has takes (they would no longer assemble). The story's store
+/// never changes.
 pub fn update_story(core: &Core, id: &str, patch: StoryPatch) -> Result<StoryView, String> {
-    let (mut s, has_takes) = {
-        let db = core.db.lock().unwrap();
-        let s = store::get_story(&db, id)?.ok_or("That story no longer exists")?;
-        let has_takes = !db.list_takes(id)?.is_empty();
-        (s, has_takes)
-    };
+    let mut s = repo::get_story(core, id)?.ok_or("That story no longer exists")?;
+    let has_takes = !repo::list_takes(core, &s)?.is_empty();
     if let Some(aspect) = patch.aspect {
         if aspect != s.aspect && has_takes {
             return Err("Change the aspect before rendering; this story already has takes".into());
@@ -440,8 +420,8 @@ pub fn update_story(core: &Core, id: &str, patch: StoryPatch) -> Result<StoryVie
     s.voices = super::cast_voices(&s.cast, voices);
     s.updated_at = crate::state::now_rfc3339();
     check_story(&s)?;
-    check_cast_exists(core, &s.cast)?;
-    store::save_story(&core.db.lock().unwrap(), &s)?;
+    repo::check_cast(core, &s)?;
+    repo::save_story(core, &s)?;
     story_view(core, id)
 }
 
@@ -449,19 +429,22 @@ pub fn update_story(core: &Core, id: &str, patch: StoryPatch) -> Result<StoryVie
 /// while one of its shots is rendering.
 pub fn delete_story(core: &Core, id: &str) -> Result<(), String> {
     let mut renders = core.story_renders.lock().unwrap();
-    let shots = store::list_shots(&core.db.lock().unwrap(), id)?;
+    let shots = repo::list_shots(core, id)?;
     refuse_rendering(core, &mut renders, &shots)?;
-    let recs: Vec<ImageRecord> = {
-        let db = core.db.lock().unwrap();
-        let story = store::get_story(&db, id)?;
-        let mut recs = db.list_takes(id)?;
-        if let Some(r) = story.and_then(|s| s.result_image_id) {
-            recs.extend(db.get_image(&r)?);
+    // A General story's takes and film are files to delete here; a vault
+    // story's are items that go with its doc (`repo::delete_story`).
+    let recs: Vec<ImageRecord> = match repo::get_story(core, id)? {
+        Some(s) if !s.vault => {
+            let mut recs = repo::list_takes(core, &s)?;
+            if let Some(r) = s.result_image_id.as_deref() {
+                recs.extend(repo::get_take(core, r)?);
+            }
+            recs
         }
-        recs
+        _ => vec![],
     };
     delete_records(core, &recs)?;
-    store::delete_story(&core.db.lock().unwrap(), id)
+    repo::delete_story(core, id)
 }
 
 /// Brief, cast, target and aspect checks for saving a story.
@@ -498,7 +481,7 @@ pub async fn plan_story(core: &Arc<Core>, story_id: &str) -> Result<StoryView, S
     // The shots first: refused, with nothing changed, if a render started meanwhile.
     store_shots(core, story_id, &out.shots)?;
     // Built on the story as stored now, not as it was when planning began.
-    let mut story = store::get_story(&core.db.lock().unwrap(), story_id)?.ok_or("That story no longer exists")?;
+    let mut story = repo::get_story(core, story_id)?.ok_or("That story no longer exists")?;
     if !out.title.trim().is_empty() {
         story.title = out.title.trim().to_string();
     }
@@ -506,6 +489,6 @@ pub async fn plan_story(core: &Arc<Core>, story_id: &str) -> Result<StoryView, S
     story.voices = out.voices;
     story.status = "planned".into();
     story.updated_at = crate::state::now_rfc3339();
-    store::save_story(&core.db.lock().unwrap(), &story)?;
+    repo::save_story(core, &story)?;
     story_view(core, story_id)
 }

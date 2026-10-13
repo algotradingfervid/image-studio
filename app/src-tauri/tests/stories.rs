@@ -983,3 +983,302 @@ fn characters_list_with_display_paths_and_edits_keep_id() {
     let back = app_lib::stories::store::get_character(&db, "c1").unwrap().unwrap();
     assert_eq!((back.name.as_str(), back.created_at.as_str()), ("Mara K", "t"));
 }
+
+// ----- repo: one router over SQLite and the vault -----
+
+mod repo_tests {
+    use super::{mara, st};
+    use app_lib::db::Db;
+    use app_lib::registry::Registry;
+    use app_lib::settings::{MemoryStore, Settings};
+    use app_lib::state::{Core, CoreConfig};
+    use app_lib::stories::repo::{self, Home};
+    use app_lib::stories::{render, Character, Shot, Story, StoryPatch};
+    use app_lib::vault::{KdfParams, VaultItem};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    const PW: &[u8] = b"a long enough password";
+
+    fn core_with_vault() -> (tempfile::TempDir, Arc<Core>) {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings::new(Arc::new(MemoryStore::default()), HashMap::new(), dir.path().join("settings.json"));
+        let sink = Arc::new(super::render_harness::Collect::default());
+        let cfg = CoreConfig::production(dir.path().to_path_buf());
+        let core = Core::new(Registry::embedded(), Db::open_in_memory().unwrap(), settings, sink, cfg).unwrap();
+        core.vault.create(PW, KdfParams::fast()).unwrap();
+        (dir, core)
+    }
+
+    fn uuid() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    fn character_in(home: Home, name: &str) -> Character {
+        let vault = home == Home::Vault;
+        let ref_ids = if vault { vec![format!("vault://localhost/{}.png", uuid())] } else { vec!["r1".into()] };
+        Character { id: uuid(), name: name.into(), ref_ids, vault, ..mara() }
+    }
+
+    fn story_in(home: Home, title: &str) -> Story {
+        Story { id: uuid(), title: title.into(), cast: vec![], vault: home == Home::Vault, ..st(10) }
+    }
+
+    fn story_with_cast(cast: &[&str]) -> Story {
+        Story { cast: cast.iter().map(|c| c.to_string()).collect(), ..st(10) }
+    }
+
+    fn shot(story_id: &str, position: u32) -> Shot {
+        Shot {
+            id: uuid(), story_id: story_id.into(), position, duration_s: 8, characters: vec![], setting: "roof".into(),
+            camera: "wide".into(), action: "walks".into(), dialogue: vec![], sound: String::new(), continuity: "cut".into(),
+            approved_take_id: None,
+        }
+    }
+
+    /// A sealed take (or film when `shot_id` is None) of a vault story.
+    fn vault_take(core: &Core, story_id: &str, shot_id: Option<&str>) -> VaultItem {
+        let media = core.vault.seal_blob(b"not really an mp4", "mp4").unwrap();
+        let item = VaultItem {
+            id: uuid(), kind: "video".into(), model: "h3ref".into(), prompt: "p".into(), negative_prompt: String::new(),
+            aspect_ratio: "16:9".into(), width: 16, height: 9, seed: 1, steps: 0, cfg: 0.0, loras: vec![],
+            created_at: "2026-01-01T00:00:00Z".into(), duration_ms: None, runpod: Default::default(), denoise: None,
+            duration_s: Some(8.0), fps: Some(24.0), has_audio: Some(true), media, poster: None, thumb: None, init_image: None,
+            references: vec![], source_id: None, added_at: String::new(), story_id: Some(story_id.into()),
+            shot_id: shot_id.map(String::from),
+        };
+        core.vault.put_item(&item).unwrap();
+        item
+    }
+
+    #[test]
+    fn stories_route_to_their_store_and_vault_ones_vanish_while_locked() {
+        let (_d, core) = core_with_vault();
+        let general = repo::save_story(&core, &story_in(Home::General, "The Reel Returns")).unwrap();
+        let vault = repo::save_story(&core, &story_in(Home::Vault, "Light Packing")).unwrap();
+        assert_eq!(repo::list_stories(&core).unwrap().len(), 2);
+        assert!(repo::get_story(&core, &vault.id).unwrap().unwrap().vault);
+        core.vault.lock();
+        let titles: Vec<String> = repo::list_stories(&core).unwrap().into_iter().map(|s| s.title).collect();
+        assert_eq!(titles, vec!["The Reel Returns"]);
+        assert_eq!(repo::get_story(&core, &vault.id).unwrap_err(), "VAULT_LOCKED: Unlock the vault to open this story");
+        assert_eq!(repo::get_story(&core, "nope").unwrap(), None);
+        assert!(repo::get_story(&core, &general.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn general_story_rejects_vault_character_on_create_and_update() {
+        let (_d, core) = core_with_vault();
+        let mara = repo::save_character(&core, &character_in(Home::General, "Mara")).unwrap();
+        let secret = repo::save_character(&core, &character_in(Home::Vault, "Ivo")).unwrap();
+        let mut s = story_in(Home::General, "G");
+        s.cast = vec![secret.id.clone()];
+        assert_eq!(repo::check_cast(&core, &s).unwrap_err(), "A General story can't use a vault character. Create the story as a vault story.");
+        s.cast = vec![mara.id.clone()];
+        let s = repo::save_story(&core, &s).unwrap();
+        let e = render::update_story(&core, &s.id, StoryPatch { cast: Some(vec![mara.id.clone(), secret.id.clone()]), ..Default::default() }).unwrap_err();
+        assert!(e.contains("can't use a vault character"), "{e}");
+        let mut v = story_in(Home::Vault, "V");
+        v.cast = vec![mara.id.clone(), secret.id.clone()];
+        repo::check_cast(&core, &v).unwrap(); // a vault story may use General characters
+    }
+
+    #[test]
+    fn deleting_a_general_character_waits_for_the_locked_vault() {
+        let (_d, core) = core_with_vault();
+        let mara = repo::save_character(&core, &character_in(Home::General, "Mara")).unwrap();
+        core.vault.lock();
+        assert_eq!(repo::delete_character(&core, &mara.id).unwrap_err(), "Unlock the vault first: a vault story may use this character");
+        core.vault.unlock(PW).unwrap();
+        repo::delete_character(&core, &mara.id).unwrap();
+    }
+
+    #[test]
+    fn vault_story_job_label_has_no_title_and_cast_names_must_differ() {
+        let mut s = story_in(Home::Vault, "Light Packing");
+        assert_eq!(render::job_label(&s, 2), "Vault story · shot 2");
+        s.vault = false;
+        assert_eq!(render::job_label(&s, 2), "Story: Light Packing · shot 2");
+        let (a, b) = (Character { id: "a".into(), ..mara() }, Character { id: "b".into(), ..mara() });
+        let issues = app_lib::stories::validate::preflight(&story_with_cast(&["a", "b"]), &[a, b]);
+        assert!(issues.iter().any(|i| i.message == "Two cast members are both named Mara. Rename one."));
+    }
+
+    #[test]
+    fn cast_names_differ_case_insensitively_in_check_cast() {
+        let (_d, core) = core_with_vault();
+        let a = repo::save_character(&core, &character_in(Home::General, "Mara")).unwrap();
+        let b = repo::save_character(&core, &character_in(Home::Vault, "mara")).unwrap();
+        let mut v = story_in(Home::Vault, "V");
+        v.cast = vec![a.id.clone(), b.id.clone()];
+        assert_eq!(repo::check_cast(&core, &v).unwrap_err(), "Two cast members are both named Mara. Rename one.");
+        let mut g = story_in(Home::General, "G");
+        g.cast = vec!["missing".into()];
+        assert_eq!(repo::check_cast(&core, &g).unwrap_err(), "A cast character no longer exists");
+    }
+
+    #[test]
+    fn characters_route_to_their_store_refs_must_match_and_the_store_is_fixed() {
+        let (_d, core) = core_with_vault();
+        let mara = repo::save_character(&core, &character_in(Home::General, "Mara")).unwrap();
+        let ivo = repo::save_character(&core, &character_in(Home::Vault, "Ivo")).unwrap();
+        assert!(!mara.vault && ivo.vault);
+        let names: Vec<String> = repo::list_characters(&core).unwrap().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["Ivo", "Mara"]);
+        // Refs in the wrong store.
+        let mut wrong = character_in(Home::Vault, "Zed");
+        wrong.ref_ids = vec!["r9".into()];
+        assert_eq!(repo::save_character(&core, &wrong).unwrap_err(), "Reference images must be in the same place as the character");
+        let mut wrong = character_in(Home::General, "Zed");
+        wrong.ref_ids = vec![format!("vault://localhost/{}.png", uuid())];
+        assert_eq!(repo::save_character(&core, &wrong).unwrap_err(), "Reference images must be in the same place as the character");
+        // The store is fixed: a request flipping `vault` keeps the character where it is.
+        let mut moved = ivo.clone();
+        moved.vault = false;
+        moved.ref_ids = vec!["r1".into()];
+        assert_eq!(repo::save_character(&core, &moved).unwrap_err(), "Reference images must be in the same place as the character");
+        let mut renamed = ivo.clone();
+        renamed.vault = false;
+        renamed.description = "changed".into();
+        let saved = repo::save_character(&core, &renamed).unwrap();
+        assert!(saved.vault);
+        assert_eq!(core.vault.character(&ivo.id).unwrap().description, "changed");
+        assert!(app_lib::stories::store::get_character(&core.db.lock().unwrap(), &ivo.id).unwrap().is_none());
+        // Names are unique per store (case-insensitive).
+        let e = repo::save_character(&core, &character_in(Home::Vault, "ivo")).unwrap_err();
+        assert_eq!(e, "A character named ivo already exists");
+        repo::save_character(&core, &character_in(Home::General, "ivo")).unwrap();
+        // Locked: General only, and vault characters can't be read, created or edited.
+        core.vault.lock();
+        let names: Vec<String> = repo::list_characters(&core).unwrap().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["ivo", "Mara"]);
+        assert_eq!(repo::get_character(&core, &ivo.id).unwrap_err(), "VAULT_LOCKED: Unlock the vault to open this character");
+        assert_eq!(repo::get_character(&core, "nope").unwrap(), None);
+        assert_eq!(repo::character_home(&core, &ivo.id).unwrap(), Some(Home::Vault));
+        assert_eq!(repo::character_home(&core, &mara.id).unwrap(), Some(Home::General));
+        assert_eq!(
+            repo::save_character(&core, &character_in(Home::Vault, "New")).unwrap_err(),
+            "VAULT_LOCKED: Unlock the vault to create a vault character"
+        );
+        assert!(repo::save_character(&core, &renamed).unwrap_err().starts_with("VAULT_LOCKED"));
+    }
+
+    #[test]
+    fn vault_story_shots_takes_and_deletion_go_through_the_doc() {
+        let (_d, core) = core_with_vault();
+        let s = repo::save_story(&core, &story_in(Home::Vault, "Light Packing")).unwrap();
+        assert_eq!(repo::story_home(&core, &s.id).unwrap(), Some(Home::Vault));
+        let (a, b) = (shot(&s.id, 1), shot(&s.id, 2));
+        repo::replace_shots(&core, &s.id, &[b.clone(), a.clone()]).unwrap();
+        let ids: Vec<String> = repo::list_shots(&core, &s.id).unwrap().into_iter().map(|x| x.id).collect();
+        assert_eq!(ids, vec![a.id.clone(), b.id.clone()]);
+        assert_eq!(repo::get_shot(&core, &b.id).unwrap().unwrap().position, 2);
+        let mut a2 = a.clone();
+        a2.action = "runs".into();
+        repo::update_shot(&core, &a2).unwrap();
+        assert_eq!(repo::get_shot(&core, &a.id).unwrap().unwrap().action, "runs");
+        assert!(repo::update_shot(&core, &shot(&s.id, 9)).is_err());
+
+        let take = vault_take(&core, &s.id, Some(&a.id));
+        let film = vault_take(&core, &s.id, None);
+        let takes = repo::list_takes(&core, &s).unwrap();
+        assert_eq!(takes.len(), 1);
+        assert!(takes[0].vault && takes[0].id == take.id);
+        assert_eq!(repo::get_take(&core, &film.id).unwrap().unwrap().shot_id, None);
+        repo::set_approved(&core, &a.id, Some(&take.id)).unwrap();
+        assert_eq!(repo::get_shot(&core, &a.id).unwrap().unwrap().approved_take_id.as_deref(), Some(take.id.as_str()));
+        repo::set_result(&core, &s.id, &film.id, &serde_json::json!({"k": "v"})).unwrap();
+        let st = repo::get_story(&core, &s.id).unwrap().unwrap();
+        assert_eq!((st.status.as_str(), st.result_image_id.as_deref()), ("assembled", Some(film.id.as_str())));
+        assert_eq!(core.vault.story_doc(&s.id).unwrap().sidecar, Some(serde_json::json!({"k": "v"})));
+
+        // A deleted take or film: the approval and the result are forgotten.
+        repo::clear_image_refs(&core, &take.id).unwrap();
+        assert_eq!(repo::get_shot(&core, &a.id).unwrap().unwrap().approved_take_id, None);
+        repo::clear_image_refs(&core, &film.id).unwrap();
+        let st = repo::get_story(&core, &s.id).unwrap().unwrap();
+        assert_eq!((st.status.as_str(), st.result_image_id), ("planned", None));
+
+        // Locked: shots and the story are unreadable; nothing is written.
+        core.vault.lock();
+        assert_eq!(repo::list_shots(&core, &s.id).unwrap_err(), "VAULT_LOCKED: Unlock the vault to open this story");
+        assert_eq!(repo::get_shot(&core, &a.id).unwrap(), None);
+        assert_eq!(repo::list_takes(&core, &s).unwrap_err(), "VAULT_LOCKED: Unlock the vault to open this story");
+        assert!(repo::replace_shots(&core, &s.id, &[]).unwrap_err().starts_with("VAULT_LOCKED"));
+        assert!(repo::delete_story(&core, &s.id).unwrap_err().starts_with("VAULT_LOCKED"));
+        assert!(core.vault.story_file_exists(&s.id));
+        core.vault.unlock(PW).unwrap();
+
+        // Deleting the story deletes its takes and film with it.
+        repo::delete_story(&core, &s.id).unwrap();
+        assert_eq!(repo::get_story(&core, &s.id).unwrap(), None);
+        assert!(core.vault.items_for_story(&s.id).unwrap().is_empty());
+        assert!(core.vault.item(&take.id).is_err() && core.vault.item(&film.id).is_err());
+        assert!(core.vault.open_blob(&take.media.id).is_err());
+        assert!(repo::list_shots(&core, &s.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn dropping_a_vault_shot_discards_its_sealed_take_and_its_approval() {
+        let (_d, core) = core_with_vault();
+        let s = repo::save_story(&core, &story_in(Home::Vault, "Light Packing")).unwrap();
+        let (a, b) = (shot(&s.id, 1), shot(&s.id, 2));
+        repo::replace_shots(&core, &s.id, &[a.clone(), b.clone()]).unwrap();
+        let take_a = vault_take(&core, &s.id, Some(&a.id));
+        let take_b = vault_take(&core, &s.id, Some(&b.id));
+        repo::set_approved(&core, &a.id, Some(&take_a.id)).unwrap();
+        // Shot a goes: its take and the take's blob go with it; shot b keeps its take.
+        render::store_shots(&core, &s.id, &[Shot { position: 1, ..b.clone() }]).unwrap();
+        assert!(core.vault.item(&take_a.id).is_err());
+        assert!(core.vault.open_blob(&take_a.media.id).is_err());
+        assert!(core.vault.item(&take_b.id).is_ok());
+        let takes = repo::list_takes(&core, &s).unwrap();
+        assert_eq!(takes.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), vec![take_b.id.as_str()]);
+        assert_eq!(repo::get_shot(&core, &a.id).unwrap(), None);
+        // Editing shots while locked changes nothing.
+        core.vault.lock();
+        assert_eq!(render::save_shots(&core, &s.id, vec![]).unwrap_err(), "VAULT_LOCKED: Unlock the vault to open this story");
+        core.vault.unlock(PW).unwrap();
+        assert_eq!(repo::list_shots(&core, &s.id).unwrap().len(), 1);
+        assert!(core.vault.item(&take_b.id).is_ok());
+    }
+
+    #[test]
+    fn a_vault_story_needs_a_vault_and_an_update_keeps_its_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings::new(Arc::new(MemoryStore::default()), HashMap::new(), dir.path().join("settings.json"));
+        let sink = Arc::new(super::render_harness::Collect::default());
+        let core = Core::new(Registry::embedded(), Db::open_in_memory().unwrap(), settings, sink, CoreConfig::production(dir.path().to_path_buf())).unwrap();
+        assert_eq!(
+            repo::save_story(&core, &story_in(Home::Vault, "V")).unwrap_err(),
+            "NO_VAULT: Create the vault first (Gallery → Vault)"
+        );
+        assert_eq!(
+            repo::save_character(&core, &character_in(Home::Vault, "Ivo")).unwrap_err(),
+            "NO_VAULT: Create the vault first (Gallery → Vault)"
+        );
+        core.vault.create(PW, KdfParams::fast()).unwrap();
+        core.vault.lock();
+        assert_eq!(
+            repo::save_story(&core, &story_in(Home::Vault, "V")).unwrap_err(),
+            "VAULT_LOCKED: Unlock the vault to create a vault story"
+        );
+        core.vault.unlock(PW).unwrap();
+        let mara = repo::save_character(&core, &character_in(Home::General, "Mara")).unwrap();
+        let mut v = story_in(Home::Vault, "V");
+        v.cast = vec![mara.id.clone()];
+        let v = repo::save_story(&core, &v).unwrap();
+        // The store is fixed: a save that says General keeps the story in the vault.
+        let mut flipped = v.clone();
+        flipped.vault = false;
+        flipped.title = "V2".into();
+        let saved = repo::save_story(&core, &flipped).unwrap();
+        assert!(saved.vault);
+        assert!(app_lib::stories::store::get_story(&core.db.lock().unwrap(), &v.id).unwrap().is_none());
+        let view = render::update_story(&core, &v.id, StoryPatch { title: Some("V3".into()), ..Default::default() }).unwrap();
+        assert!(view.story.vault && view.story.title == "V3");
+        assert_eq!(repo::list_stories(&core).unwrap()[0].title, "V3");
+        // A General character used by a vault story can't go.
+        assert_eq!(repo::delete_character(&core, &mara.id).unwrap_err(), "Mara is used by story \"V3\"");
+    }
+}
