@@ -276,6 +276,9 @@ pub struct VideoRequest {
     /// Where the output goes (spec v6); default general.
     #[serde(default)]
     pub destination: Destination,
+    /// Stories (set in Rust only): (story_id, shot_id) recorded on the saved take.
+    #[serde(skip)]
+    pub story_take: Option<(String, String)>,
 }
 
 /// A whole number as an integer JSON value, else a float.
@@ -437,12 +440,8 @@ fn build_video_plan(core: &Core, req: &VideoRequest) -> Result<Plan, String> {
         "t2v"
     };
     if mode == "r2v" {
-        if has_init {
-            return Err(format!(
-                "{} does not take a start image; add character references instead",
-                model.name
-            ));
-        }
+        // An r2v start image is optional (a story shot that continues the
+        // previous one starts on its last frame).
         if req.reference_ids.is_empty() {
             return Err("Add at least one character reference image".into());
         }
@@ -613,8 +612,8 @@ fn build_video_plan(core: &Core, req: &VideoRequest) -> Result<Plan, String> {
         poster_path: None,
         vault: false,
         thumb_path: None,
-        story_id: None,
-        shot_id: None,
+        story_id: req.story_take.as_ref().map(|t| t.0.clone()),
+        shot_id: req.story_take.as_ref().map(|t| t.1.clone()),
     };
     Ok(Plan {
         kind: JobKind::Video,
