@@ -5,6 +5,9 @@ use std::time::Duration;
 pub const LM_STUDIO_HINT: &str = "Could not reach the local LLM. Start LM Studio's server (Developer → Start server, or `lms server start`) and load a model.";
 const MAX_ATTEMPTS: u32 = 3;
 const TEMPERATURE: f64 = 0.6;
+const MAX_TOKENS: u32 = 6000; // a runaway think block fails in seconds, not minutes
+/// Qwen3-style templates in LM Studio ignore `enable_thinking=false`; an empty think block as an assistant prefill really turns thinking off.
+const THINK_PREFILL: &str = "<think>\n\n</think>\n\n";
 const TIMEOUT: Duration = Duration::from_secs(600); // a 27B model can take minutes
 
 #[derive(Debug, Clone)]
@@ -38,18 +41,25 @@ Characters you may use (exact names, no others; every character is an adult, 18 
 
 Hard limits:
 - Total length about {target_s} seconds; each shot 5 to 15 seconds (duration_s, whole seconds).
+  Vary shot lengths between 5 and 15 seconds to fit each beat (a reaction or insert is short, a
+  long exchange or movement is long); do not give every shot the same length.
 - At most 2 characters per shot. Dialogue only from characters in that shot.
 - At most 2.5 spoken words per second of shot, and the last line must end at least 1 second before
   the shot ends.
-- continuity: "cut" (new framing or place) or "continues" (picks up exactly where the previous shot
-  ended, same characters, same place); the first shot is "cut".
+- continuity: "cut" (new framing, place or time) or "continues". Use "continues" whenever a shot
+  shows the same characters in the same place at the exact moment the previous shot ended (the
+  action simply carries on); the first shot is "cut".
+- Spread the dialogue across the shots so the story is carried by speech wherever the brief implies
+  it: give most shots at least one line, not all of it in one shot, while staying within 2.5 spoken
+  words per second. A shot may be silent only for a deliberate beat.
 - Never describe anyone as under 18. Never describe a character's face, hair, body or clothing;
   that is fixed elsewhere.
 
 How to write each field:
-- voices (once for the whole film): for every character who speaks anywhere, one phrase describing
-  the voice: gender, age range, pitch, timbre, pace, accent if any. Example: "a low, steady female
-  voice with a calm pace". It is reused word for word in every shot.
+- voices (once for the whole film): for every character who speaks anywhere, invent a distinct voice
+  from that character's description and role, one phrase giving gender, age range, pitch, timbre,
+  pace, accent if any. The two voices must clearly differ from each other. The voices in the
+  example below are placeholders; never copy them. The phrase is reused word for word in every shot.
 - setting: one or two sentences: the place, time of day, light source and quality, weather, and two
   or three concrete props or background details. No characters here.
 - camera: one sentence: shot size, where each character stands in the frame, and exactly ONE camera
@@ -60,8 +70,9 @@ How to write each field:
   small amplitude at slow speed."
 - action: 3 to 6 sentences, 50 to 120 words, in the order things happen, covering the whole shot:
   starting positions and what each character is doing, the main action, small physical details
-  (hands, gaze, props, weather on them), and the final held state at the end of the shot. Refer to
-  characters by name. Do not put spoken words in action. The first sentence of action is the opening
+  (hands, gaze, props, weather on them). The last sentence must describe the held final pose: every
+  character's position and gaze, motionless, that stays until the cut (no action still in motion).
+  Refer to characters by name. Do not put spoken words in action. The first sentence of action is the opening
   state before anyone speaks.
 - dialogue: each line is what is said, word for word, with no quotation marks, no stage directions
   and ending with . ? or !; delivery is a short phrase for what the speaker does while saying it and
@@ -75,8 +86,8 @@ Reply with JSON only, in this shape:
 
 /// Research §3b example (two characters); `{A}`/`{B}` are the first two cast names.
 const EXAMPLE_TWO: &str = r#"{"title": "Light Packing", "logline": "Two old partners decide on a rooftop to run tonight.",
- "voices": [{"name": "{A}", "voice": "a low, steady female voice with a calm pace"},
-            {"name": "{B}", "voice": "a deep, slightly hoarse male voice with a slow pace"}],
+ "voices": [{"name": "{A}", "voice": "<invent a voice for {A}: gender, age range, pitch, timbre, pace>"},
+            {"name": "{B}", "voice": "<invent a different voice for {B}: gender, age range, pitch, timbre, pace>"}],
  "shots": [{"duration_s": 10, "characters": ["{A}", "{B}"], "continuity": "cut",
    "setting": "A flat rooftop at night, wet concrete shining under a single sodium lamp, a rusted water tank behind them and the city's lights spread out below in a light drizzle.",
    "camera": "A medium two-shot frames {A} on the left and {B} on the right at the rooftop's edge; the camera pushes in with small amplitude at slow speed.",
@@ -87,7 +98,7 @@ const EXAMPLE_TWO: &str = r#"{"title": "Light Packing", "logline": "Two old part
 
 /// The same example for a one-character cast (no second character to copy).
 const EXAMPLE_ONE: &str = r#"{"title": "Light Packing", "logline": "A woman decides on a rooftop to leave tonight.",
- "voices": [{"name": "{A}", "voice": "a low, steady female voice with a calm pace"}],
+ "voices": [{"name": "{A}", "voice": "<invent a voice for {A}: gender, age range, pitch, timbre, pace>"}],
  "shots": [{"duration_s": 10, "characters": ["{A}"], "continuity": "cut",
    "setting": "A flat rooftop at night, wet concrete shining under a single sodium lamp, a rusted water tank behind her and the city's lights spread out below in a light drizzle.",
    "camera": "A medium shot frames {A} in the center at the rooftop's edge; the camera pushes in with small amplitude at slow speed.",
@@ -194,7 +205,10 @@ async fn chat(http: &reqwest::Client, base_url: &str, body: &Value) -> Result<Re
     if status >= 400 {
         return Ok(Err(v.to_string()));
     }
-    Ok(v.pointer("/choices/0/message/content").and_then(Value::as_str).map(String::from)
+    // Some servers put the whole answer in `reasoning_content` and leave `content` empty.
+    let field = |k: &str| v.pointer(&format!("/choices/0/message/{k}")).and_then(Value::as_str).filter(|s| !s.trim().is_empty());
+    Ok(field("content").or_else(|| field("reasoning_content")).map(String::from)
+        .or_else(|| v.pointer("/choices/0/message/content").and_then(Value::as_str).map(String::from))
         .ok_or_else(|| "The planner returned no message".to_string()))
 }
 
@@ -208,7 +222,9 @@ pub async fn plan(base_url: &str, model: &str, story: &Story, cast: &[Character]
     let mut attempt = 0;
     while attempt < MAX_ATTEMPTS {
         attempt += 1;
-        let mut body = json!({"model": model, "messages": messages, "temperature": TEMPERATURE,
+        let mut sent = messages.clone();
+        sent.push(json!({"role": "assistant", "content": THINK_PREFILL}));
+        let mut body = json!({"model": model, "messages": sent, "temperature": TEMPERATURE, "max_tokens": MAX_TOKENS,
             "chat_template_kwargs": {"enable_thinking": false}});
         if structured {
             body["response_format"] = json!({"type": "json_schema", "json_schema": {"name": "story_plan", "strict": true, "schema": schema()}});

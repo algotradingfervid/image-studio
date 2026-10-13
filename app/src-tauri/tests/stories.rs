@@ -82,7 +82,8 @@ async fn repair_loop_sends_errors_back_then_succeeds() {
     assert_eq!(out.attempts, 2);
     assert!(out.issues.is_empty());
     let second: serde_json::Value = s.received_requests().await.unwrap()[1].body_json().unwrap();
-    let last = second["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string();
+    let msgs = second["messages"].as_array().unwrap();
+    let last = msgs[msgs.len() - 2]["content"].as_str().unwrap().to_string();
     assert!(last.contains("5–15"), "{last}");
 }
 
@@ -901,4 +902,55 @@ async fn deleting_an_approved_take_or_the_result_clears_the_links() {
     h.core.cfg.delete_record(&db, &result).unwrap();
     let s = store::get_story(&db, &story_id).unwrap().unwrap();
     assert_eq!((s.result_image_id, s.status.as_str()), (None, "planned"));
+}
+
+const PREFILL: &str = "<think>\n\n</think>\n\n";
+
+#[tokio::test]
+async fn every_request_ends_with_empty_think_prefill_and_sets_max_tokens() {
+    let s = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/v1/chat/completions"))
+        .respond_with(Seq(vec![reply(&good_plan(3)), reply(&good_plan(10))], AtomicUsize::new(0))).mount(&s).await;
+    let out = planner::plan(&format!("{}/v1", s.uri()), "m", &st(10), &[mara()]).await.unwrap();
+    assert_eq!(out.attempts, 2);
+    let reqs = s.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 2);
+    for r in &reqs {
+        let b: serde_json::Value = r.body_json().unwrap();
+        let last = b["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["role"], "assistant");
+        assert_eq!(last["content"], PREFILL);
+        assert_eq!(b["max_tokens"], 6000);
+        assert_eq!(b["chat_template_kwargs"]["enable_thinking"], false);
+    }
+    // The repair follow-up keeps the user's fix request before the prefill.
+    let b: serde_json::Value = reqs[1].body_json().unwrap();
+    let m = b["messages"].as_array().unwrap();
+    assert_eq!(m[m.len() - 2]["role"], "user");
+    assert!(m[m.len() - 2]["content"].as_str().unwrap().contains("5–15"));
+    assert_eq!(m.iter().filter(|x| x["content"] == PREFILL).count(), 1);
+}
+
+#[tokio::test]
+async fn empty_content_falls_back_to_reasoning_content() {
+    let s = MockServer::start().await;
+    let t = ResponseTemplate::new(200).set_body_json(json!({"choices": [{"message": {"role": "assistant", "content": "  \n",
+        "reasoning_content": good_plan(10)}}]}));
+    Mock::given(method("POST")).and(path("/v1/chat/completions")).respond_with(t).mount(&s).await;
+    let out = planner::plan(&format!("{}/v1", s.uri()), "m", &st(10), &[mara()]).await.unwrap();
+    assert!(out.issues.is_empty(), "{:?}", out.issues);
+    assert_eq!(out.shots.len(), 1);
+}
+
+#[test]
+fn prompt_tuning_rules_are_present_and_example_voices_are_not_copyable() {
+    let ivo = Character { id: "c2".into(), name: "Ivo".into(), ..mara() };
+    let p = planner::system_prompt(&st(10), &[mara(), ivo]);
+    assert!(!p.contains("low, steady female voice"), "{p}");
+    assert!(!p.contains("deep, slightly hoarse"), "{p}");
+    assert!(p.contains("invent a distinct voice"), "{p}");
+    assert!(p.contains("Vary shot lengths"), "{p}");
+    assert!(p.contains("same characters in the same place at the exact moment"), "{p}");
+    assert!(p.contains("Spread the dialogue across the shots"), "{p}");
+    assert!(p.contains("held final pose"), "{p}");
 }
