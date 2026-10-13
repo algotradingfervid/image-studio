@@ -8,23 +8,38 @@ pub const TOTAL_TOLERANCE: f64 = 0.15;
 pub const MAX_REFS_PER_SHOT: usize = 6;
 
 const MINOR_TERMS: &[&str] = &[
-    "child", "children", "kid", "kids", "minor", "minors", "teen", "teens", "teenage", "teenager",
-    "schoolgirl", "schoolboy", "underage", "preteen", "toddler", "infant", "baby", "loli", "shota",
+    "child", "children", "kid", "kids", "teen", "teens", "teenage", "teenager", "teenagers",
+    "schoolgirl", "schoolgirls", "schoolboy", "schoolboys", "underage", "preteen", "preteens",
+    "toddler", "toddlers", "infant", "infants", "loli", "shota",
+];
+
+const NUMBER_WORDS: &[&str] = &[
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven",
+    "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
 ];
 
 fn words(text: &str) -> Vec<String> {
     text.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(String::from).collect()
 }
 
-/// True when `text` describes someone under 18 (term list, or "N years old" / "N-year-old" / "N yo" with N < 18).
+/// An age under 18 written as digits or as a number word (one..seventeen).
+fn minor_age(token: &str) -> bool {
+    token.parse::<u32>().map(|n| n < 18).unwrap_or_else(|_| NUMBER_WORDS.contains(&token))
+}
+
+/// True when `text` describes someone under 18: a term from the list, or an explicit age phrase
+/// ("N year(s) old", "N-year-old", "N yr(s) old", "N yo", "Nyo") with N under 18 in digits or words.
 pub fn mentions_minor(text: &str) -> bool {
     let w = words(text);
     if w.iter().any(|x| MINOR_TERMS.contains(&x.as_str())) {
         return true;
     }
-    w.windows(2).any(|p| {
-        p[0].parse::<u32>().is_ok_and(|n| n < 18) && matches!(p[1].as_str(), "year" | "years" | "yo" | "yr" | "yrs")
-    })
+    if w.iter().any(|x| x.strip_suffix("yo").is_some_and(|n| !n.is_empty() && minor_age(n))) {
+        return true;
+    }
+    w.windows(3).any(|p| {
+        minor_age(&p[0]) && matches!(p[1].as_str(), "year" | "years" | "yr" | "yrs") && p[2] == "old"
+    }) || w.windows(2).any(|p| minor_age(&p[0]) && p[1] == "yo")
 }
 
 pub fn validate(story: &Story, shots: &[Shot], cast: &[Character]) -> Vec<Issue> {
@@ -165,6 +180,14 @@ mod tests {
     s.action = "a schoolgirl runs".into();
     let i = validate(&story(8, &["c1"]), &[s], &[ch("c1","Mara")]);
     assert!(i.iter().any(|x| x.message.contains("adults")));
+}
+#[test] fn minor_detection_variants() {
+    for t in ["16yo", "sixteen years old", "a sixteen-year-old", "teenagers at a party", "schoolgirls", "a 15-year-old boy", "she is 16 years old"] {
+        assert!(mentions_minor(t), "{t}");
+    }
+    for t in ["15 years later", "10 years ago", "a minor injury", "hey baby", "she is 30 years old", "a 40yo man"] {
+        assert!(!mentions_minor(t), "{t}");
+    }
 }
 #[test] fn consent_and_adult_gate() {
     let mut real = ch("c1","Mara"); real.source = "real_person".into(); real.consent = false;

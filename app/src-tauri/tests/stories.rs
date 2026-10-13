@@ -66,6 +66,7 @@ async fn falls_back_when_json_schema_is_rejected() {
             reply(&good_plan(10))], AtomicUsize::new(0))).mount(&s).await;
     let out = planner::plan(&format!("{}/v1", s.uri()), "m", &st(10), &[mara()]).await.unwrap();
     assert!(out.issues.is_empty());
+    assert_eq!(out.attempts, 1);
     let second: serde_json::Value = s.received_requests().await.unwrap()[1].body_json().unwrap();
     assert!(second.get("response_format").is_none());
 }
@@ -89,4 +90,23 @@ async fn unknown_character_name_becomes_issue() {
 async fn unreachable_server_gives_lm_studio_hint() {
     let e = planner::plan("http://127.0.0.1:9/v1", "m", &st(10), &[mara()]).await.unwrap_err();
     assert!(e.contains("LM Studio"), "{e}");
+}
+
+#[tokio::test]
+async fn unusable_first_attempt_does_not_beat_later_plan_with_shots() {
+    let s = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/v1/chat/completions"))
+        .respond_with(Seq(vec![reply("sorry, no json here"), reply(&good_plan(3))], AtomicUsize::new(0))).mount(&s).await;
+    let out = planner::plan(&format!("{}/v1", s.uri()), "m", &st(10), &[mara()]).await.unwrap();
+    assert_eq!(out.attempts, 3);
+    assert_eq!(out.shots.len(), 1);
+    assert!(!out.issues.is_empty());
+}
+
+#[tokio::test]
+async fn all_unparseable_replies_error() {
+    let s = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/v1/chat/completions")).respond_with(reply("no json")).mount(&s).await;
+    let e = planner::plan(&format!("{}/v1", s.uri()), "m", &st(10), &[mara()]).await.unwrap_err();
+    assert!(e.contains("nothing usable"), "{e}");
 }

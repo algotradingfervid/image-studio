@@ -105,6 +105,7 @@ pub async fn plan(base_url: &str, model: &str, story: &Story, cast: &[Character]
                             json!({"role": "user", "content": user_prompt(story)})];
     let mut structured = true;
     let mut best: Option<PlanOutcome> = None;
+    let mut last_issue = String::new();
     let mut attempt = 0;
     while attempt < MAX_ATTEMPTS {
         attempt += 1;
@@ -134,11 +135,15 @@ pub async fn plan(base_url: &str, model: &str, story: &Story, cast: &[Character]
             Some(n) => format!("Shot {n}: {}", i.message), None => i.message.clone() }).collect();
         messages.push(json!({"role": "assistant", "content": content}));
         messages.push(json!({"role": "user", "content": format!("Fix these problems and reply with the full corrected JSON only:\n{}", errors.join("\n"))}));
-        if best.as_ref().is_none_or(|b| outcome.issues.len() <= b.issues.len() && !outcome.shots.is_empty()) {
+        last_issue = outcome.issues.first().map(|i| i.message.clone()).unwrap_or_default();
+        // Plans with shots beat plans without; among those, fewest issues wins (ties go to the later attempt).
+        let better = !outcome.shots.is_empty()
+            && best.as_ref().is_none_or(|b| outcome.issues.len() <= b.issues.len());
+        if better {
             best = Some(outcome);
         }
     }
-    let mut out = best.ok_or("The planner produced nothing usable")?;
+    let mut out = best.ok_or_else(|| format!("The planner produced nothing usable: {last_issue}"))?;
     out.attempts = attempt;
     Ok(out)
 }
