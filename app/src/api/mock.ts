@@ -10,7 +10,7 @@
 // "Try again / Quit anyway").
 // Video (spec v5): ?videoRunning (a re-adopted video pod is already running), ?noVideoModels
 // (list_models has no video models, like a build without `videoModels`), ?videoInstalled (every
-// video model's files are present; default: MiniMax H3 installed, LTX-2.5 not). Video records'
+// video model's files are present; default: MiniMax H3 and H3 Character installed, LTX-2.5 not). Video records'
 // `path` is `mock-video://<id>.mp4`, which the browser can't load, so the UI shows the poster.
 //
 // Vault (spec v6): by default no vault exists (first use: "Create vault" migrates the gallery).
@@ -22,7 +22,15 @@
 // GPU-start audit (for walking the "confirm before a paid GPU start" flows): `window.mockStats`
 // counts every pod start per profile and every command that would start a stopped pod
 // (generate, generate_video, download_model, delete_model, add_lora, delete_lora,
-// refresh_status, start_gpu); `window.mockStats.reset()` zeroes it.
+// refresh_status, start_gpu, and the Stories render_shot, render_story, approve_take);
+// `window.mockStats.reset()` zeroes it.
+//
+// Stories (spec 2026-10-13): characters, stories and shots live in memory. ?storyDemo seeds two
+// characters (Mara, Ivo) with placeholder reference images; ?llm=down makes the local LLM
+// (LM Studio) unreachable, so plan_story and llm_status show the "start LM Studio" hint. plan_story
+// returns a canned plan after 1.5 s (a brief containing "invalid" gets a 3 s first shot, to see
+// validation errors). Shot renders run as normal h3ref video jobs; their takes stay out of the
+// gallery, and the assembled story video goes into it.
 //
 // Quit flow: a browser tab can't intercept closing with an in-app dialog, so call
 // `window.mockQuit()` from the console to simulate ⌘Q (`quit-requested` when a pod
@@ -33,6 +41,14 @@ import type { Backend, Unlisten } from "./backend";
 import { hashString, placeholderImage } from "./placeholder";
 import type {
   AddLoraInput,
+  ApproveResult,
+  Character,
+  LlmStatus,
+  RenderedShot,
+  Shot,
+  Story,
+  StoryIssue,
+  StoryView,
   ConnectionTest,
   KeyCheck,
   KeyTestReport,
@@ -185,7 +201,7 @@ const present = new Set<string>();
 for (const id of ["chroma", "zimage", "qwen"]) {
   for (const f of models.find((m) => m.id === id)!.files) present.add(f.filename);
 }
-for (const m of videoModels) if (m.id === "h3" || params.has("videoInstalled")) for (const f of m.files) present.add(f.filename);
+for (const m of videoModels) if (m.id === "h3" || m.id === "h3ref" || params.has("videoInstalled")) for (const f of m.files) present.add(f.filename);
 /** LoRA files on the image volume, keyed like the core's (folder loras/<modelId>, filename): the same
  * file added for two models is two files, so deleting one entry never removes the other's (UI-011). */
 const loraFiles = new Set<string>();
@@ -310,7 +326,19 @@ function setGpu(p: GpuProfile, patch: Partial<GpuState>) {
 }
 
 /** See the header: what a Cancel in the start confirmation must never produce. */
-const GPU_START_COMMANDS = new Set(["generate", "generate_video", "download_model", "delete_model", "add_lora", "delete_lora", "refresh_status", "start_gpu"]);
+const GPU_START_COMMANDS = new Set([
+  "generate",
+  "generate_video",
+  "download_model",
+  "delete_model",
+  "add_lora",
+  "delete_lora",
+  "refresh_status",
+  "start_gpu",
+  "render_shot",
+  "render_story",
+  "approve_take",
+]);
 const mockStats = {
   gpuStarts: { image: 0, video: 0 } as Record<GpuProfile, number>,
   commands: [] as string[],
@@ -1236,7 +1264,8 @@ async function runVideoStages(job: Job, input: GenerateVideoInput, steps: number
   return hold(400);
 }
 
-async function runVideoJob(jobId: string, input: GenerateVideoInput) {
+/** `take`: a Stories shot render — the record is tagged and kept out of the gallery (`takes`). */
+async function runVideoJob(jobId: string, input: GenerateVideoInput, take?: { storyId: string; shotId: string }) {
   const m = videoModels.find((x) => x.id === input.model)!;
   const steps = input.steps || m.defaults.steps || 30;
   const cfg = input.cfg ?? m.defaults.cfg ?? 5;
@@ -1304,7 +1333,11 @@ async function runVideoJob(jobId: string, input: GenerateVideoInput) {
     initImage: initPath,
     references: (input.referenceIds ?? []).map((id) => refs.get(id) ?? "").filter(Boolean),
   });
-  saveOutput(rec, destination);
+  if (take) {
+    rec.storyId = take.storyId;
+    rec.shotId = take.shotId;
+    takes.unshift(rec);
+  } else saveOutput(rec, destination);
   job.images = [rec];
   job.completed = 1;
   emit("job-update", job);
@@ -1315,6 +1348,451 @@ async function runVideoJob(jobId: string, input: GenerateVideoInput) {
 // ---------- commands ----------
 
 type Handler = (args: Record<string, unknown>) => unknown | Promise<unknown>;
+
+// ---------- stories (spec 2026-10-13) ----------
+
+const STORY_MODEL = "h3ref";
+const STORY_FPS = 24;
+const MIN_SHOT_S = 5;
+const MAX_SHOT_S = 15;
+const MAX_CAST_PER_SHOT = 2;
+const WORDS_PER_S = 2.5;
+const TOTAL_TOLERANCE = 0.15;
+const MAX_REFS_PER_SHOT = 6;
+const MAX_PROMPT_CHARS = 7000;
+const LLM_DEFAULT_URL = "http://localhost:1234/v1";
+const LLM_DEFAULT_MODEL = "qwen3.8-27b-uncensored-optiq";
+const LM_STUDIO_HINT =
+  "Could not reach the local LLM. Start LM Studio's server (Developer → Start server, or `lms server start`) and load a model.";
+const STORY_RESOLUTION: Record<string, string> = { "16:9": "1344x768", "9:16": "768x1344", "1:1": "768x768" };
+
+const characters = new Map<string, Character>();
+const stories = new Map<string, Story>();
+const shots = new Map<string, Shot>();
+/** Story takes: video records with storyId + shotId, never in `images` (the gallery). */
+const takes: ImageRecord[] = [];
+const llm = { baseUrl: LLM_DEFAULT_URL, model: LLM_DEFAULT_MODEL };
+const llmDown = params.get("llm") === "down";
+
+const nowIso = () => new Date().toISOString();
+
+// Mirror of stories/validate.rs.
+const MINOR_TERMS = new Set([
+  "child", "children", "kid", "kids", "minor", "minors", "teen", "teens", "teenage", "teenager",
+  "schoolgirl", "schoolboy", "underage", "preteen", "toddler", "infant", "baby", "loli", "shota",
+]);
+const words = (text: string) => text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+function mentionsMinor(text: string): boolean {
+  const w = words(text);
+  if (w.some((x) => MINOR_TERMS.has(x))) return true;
+  return w.some((x, i) => /^\d+$/.test(x) && Number(x) < 18 && ["year", "years", "yo", "yr", "yrs"].includes(w[i + 1] ?? ""));
+}
+
+function validateStory(story: Story, list: Shot[], cast: Character[]): StoryIssue[] {
+  const out: StoryIssue[] = [];
+  const name = (id: string) => cast.find((c) => c.id === id)?.name ?? id;
+  const storyIssue = (message: string) => out.push({ shot: null, message });
+  for (const c of cast) {
+    if (!c.adult) storyIssue(`${c.name} is not confirmed as an adult (18+)`);
+    if (c.source === "real_person" && !c.consent) storyIssue(`${c.name} is a real person without a consent tick`);
+    if (mentionsMinor(c.description)) storyIssue(`${c.name}'s description must describe an adult; stories use adults only`);
+  }
+  if (mentionsMinor(story.brief) || mentionsMinor(story.style)) storyIssue("The brief must describe adults only");
+  if (!list.length) {
+    storyIssue("The story has no shots");
+    return out;
+  }
+  const total = list.reduce((n, s) => n + s.durationS, 0);
+  if (total < story.targetS * (1 - TOTAL_TOLERANCE) || total > story.targetS * (1 + TOTAL_TOLERANCE))
+    storyIssue(`Shots add up to ${total} s; the target is ${story.targetS} s (±15 %)`);
+  list.forEach((s, i) => {
+    const push = (message: string) => out.push({ shot: s.position, message });
+    if (!(s.durationS >= MIN_SHOT_S && s.durationS <= MAX_SHOT_S)) push(`Duration ${s.durationS} s is outside 5–15 s`);
+    if (s.characters.length > MAX_CAST_PER_SHOT) push(`${s.characters.length} characters; at most 2 per shot`);
+    for (const c of s.characters) if (!story.cast.includes(c)) push(`${name(c)} is not in the cast`);
+    const wordsTotal = s.dialogue.reduce((n, d) => n + words(d.line).length, 0);
+    const maxWords = Math.floor(WORDS_PER_S * s.durationS);
+    if (wordsTotal > maxWords) push(`Dialogue has ${wordsTotal} words; at most ${maxWords} fit in ${s.durationS} s`);
+    for (const d of s.dialogue) if (!s.characters.includes(d.speaker)) push(`${name(d.speaker)} speaks but is not in this shot`);
+    if ([s.action, s.setting, s.camera].some(mentionsMinor) || s.dialogue.some((d) => mentionsMinor(d.line)))
+      push("Stories use adults only; remove the reference to a minor");
+    if (s.continuity === "continues") {
+      if (i === 0) push("The first shot cannot continue a previous shot");
+      else if (!s.characters.some((c) => list[i - 1].characters.includes(c))) push("Continues the previous shot but shares no character with it");
+    }
+    const nRefs = s.characters.reduce((n, id) => n + (cast.find((c) => c.id === id)?.refIds.length ?? 0), 0);
+    if (nRefs > MAX_REFS_PER_SHOT) push(`${nRefs} reference images; at most 6 reference images per shot`);
+  });
+  return out;
+}
+
+// Mirror of stories/compile.rs (H3 five-block prompt, references in cast order).
+const trimDot = (s: string) => s.trim().replace(/\.+$/, "");
+function compileShot(story: Story, shot: Shot, cast: Character[]): { prompt: string; refIds: string[] } {
+  const chars = story.cast.filter((id) => shot.characters.includes(id)).map((id) => cast.find((c) => c.id === id)).filter((c): c is Character => !!c);
+  const lines = ["ROLES:"];
+  const refIds: string[] = [];
+  for (const c of chars) {
+    const first = refIds.length + 1;
+    refIds.push(...c.refIds);
+    const tags = c.refIds.map((_, k) => `<Picture ${first + k}>`);
+    const [verb, these] = tags.length === 1 ? ["is", "this picture"] : ["are", "these pictures"];
+    lines.push(`${tags.join(", ")} ${verb} ${c.name}: ${trimDot(c.description)}. Keep ${c.name}'s face, hair, body and clothing identical to ${these}.`);
+  }
+  const name = (id: string) => cast.find((c) => c.id === id)?.name ?? id;
+  lines.push(`SHOT (${shot.durationS} s, ${story.aspect}, ${shot.camera.trim()}): ${trimDot(shot.setting)}.`);
+  lines.push(shot.action.trim());
+  for (const d of shot.dialogue) lines.push(`${name(d.speaker)} says: "${d.line.trim()}"`);
+  lines.push(`LOOK: ${story.style.trim() ? trimDot(story.style) : "natural cinematic look"}.`);
+  lines.push("SOUND: natural ambient sound of the setting. Dialogue is spoken aloud and lip-synced to the speaker.");
+  lines.push("LIMITS: Hold identity and clothing from the pictures. No subtitles, no on-screen text, no watermark, no extra people, no face morphing.");
+  const prompt = lines.join("\n");
+  if ([...prompt].length > MAX_PROMPT_CHARS)
+    throw new Error(`Shot ${shot.position} compiles to ${[...prompt].length} characters; H3 takes at most 7,000`);
+  return { prompt, refIds };
+}
+
+function getStoryOr(id: string): Story {
+  const st = stories.get(id);
+  if (!st) throw new Error("That story no longer exists");
+  return st;
+}
+const storyShots = (storyId: string) => [...shots.values()].filter((s) => s.storyId === storyId).sort((a, b) => a.position - b.position);
+const castOf = (story: Story): Character[] =>
+  story.cast.map((id) => {
+    const c = characters.get(id);
+    if (!c) throw new Error("A cast character no longer exists");
+    return c;
+  });
+
+function storyView(storyId: string): StoryView {
+  const story = getStoryOr(storyId);
+  const list = storyShots(storyId);
+  const cast = castOf(story);
+  const issues = list.length ? validateStory(story, list, cast) : [];
+  for (const s of list) {
+    try {
+      compileShot(story, s, cast);
+    } catch (e) {
+      issues.push({ shot: s.position, message: e instanceof Error ? e.message : String(e) });
+    }
+  }
+  return { story, cast, shots: list, takes: takes.filter((t) => t.storyId === storyId), issues };
+}
+
+/** Plan / render refuse a cast that breaks the adult or consent rule (the Rust command checks the same). */
+function checkCast(story: Story) {
+  if (!story.cast.length) throw new Error("Add at least one character to the cast first");
+  for (const c of castOf(story)) {
+    if (!c.adult) throw new Error(`${c.name} is not confirmed as an adult (18+)`);
+    if (c.source === "real_person" && !c.consent) throw new Error(`${c.name} is a real person without a consent tick`);
+  }
+}
+
+function checkCharacter(c: Character) {
+  const name = (c.name ?? "").trim();
+  if (!name) throw new Error("Give the character a name");
+  if ([...name].length > 40) throw new Error("The name is at most 40 characters");
+  if ([...(c.description ?? "")].length > 200) throw new Error("The description is at most 200 characters");
+  if (!c.description?.trim()) throw new Error("Describe the character in one line");
+  if (!c.refIds?.length || c.refIds.length > 3) throw new Error("Add 1–3 reference images");
+  if (c.refIds.some((id) => !refs.has(id))) throw new Error("A reference image is missing; please add it again");
+  if (!c.adult) throw new Error(`${name} is not confirmed as an adult (18+)`);
+  if (c.source === "real_person" && !c.consent) throw new Error(`${name} is a real person without a consent tick`);
+  if (mentionsMinor(c.description)) throw new Error(`${name}'s description must describe an adult; stories use adults only`);
+}
+
+function checkStoryFields(f: { brief: string; targetS: number; aspect: string; style: string; cast: string[] }) {
+  if (!Number.isInteger(f.targetS) || f.targetS < 30 || f.targetS > 180) throw new Error("The target length must be 30 s to 3 min");
+  if (!STORY_RESOLUTION[f.aspect]) throw new Error(`Unknown aspect ${f.aspect}`);
+  if ([...(f.style ?? "")].length > 300) throw new Error("The style line is at most 300 characters");
+  if (f.cast.length > 2) throw new Error("A story has at most 2 characters");
+  for (const id of f.cast) if (!characters.has(id)) throw new Error("A cast character no longer exists");
+}
+
+const issueText = (i: StoryIssue) => (i.shot != null ? `Shot ${i.shot}: ${i.message}` : i.message);
+
+/** The canned planner output: shot durations sum to the target, shot 1 cuts, shot 2 continues. */
+function cannedPlan(story: Story): { title: string; logline: string; shots: Shot[] } {
+  const cast = castOf(story);
+  const [a, b] = cast;
+  const n = Math.max(4, Math.ceil(story.targetS / MAX_SHOT_S));
+  const base = Math.floor(story.targetS / n);
+  const extra = story.targetS - base * n;
+  const durations = Array.from({ length: n }, (_, i) => base + (i < extra ? 1 : 0));
+  if (story.brief.toLowerCase().includes("invalid")) durations[0] = 3;
+  const settings = ["rooftop at night, city lights below", "narrow stairwell, flickering light", "empty train platform at dawn", "small diner booth, rain on the window"];
+  const cameras = ["wide shot, slow push-in", "medium close-up, handheld", "over-the-shoulder, static", "low angle, slow dolly left"];
+  const lines = ["We leave tonight.", "Are you sure about this?", "I have never been more sure.", "Then let's not waste the dark."];
+  const list: Shot[] = durations.map((d, i) => {
+    const pair = b && i % 2 === 1 ? [a.id, b.id] : [a.id];
+    const speaker = pair[i % pair.length];
+    const who = cast.find((c) => c.id === speaker)!.name;
+    return {
+      id: uid("shot"),
+      storyId: story.id,
+      position: i + 1,
+      durationS: d,
+      characters: pair,
+      setting: settings[i % settings.length],
+      camera: cameras[i % cameras.length],
+      action: `${who} moves through the scene, looking around and reacting the whole time; the camera keeps moving with ${i === 0 ? "the opening" : "the action"}.`,
+      dialogue: [{ speaker, line: lines[i % lines.length] }],
+      continuity: i === 1 ? "continues" : "cut",
+      approvedTakeId: null,
+    };
+  });
+  // Shot 2 continues shot 1, so it must share a character with it (it always has `a`).
+  const brief = story.brief.trim();
+  const title = brief ? brief.split(/[.!?\n]/)[0].slice(0, 48).trim() : "Untitled story";
+  return { title, logline: `${cast.map((c) => c.name).join(" and ")} — ${brief.slice(0, 120) || "a short story"}`, shots: list };
+}
+
+function requireH3ref() {
+  requireConfigured();
+  const m = videoModels.find((x) => x.id === STORY_MODEL);
+  if (!m) throw new Error(`Unknown video model ${STORY_MODEL}`);
+  const missing = m.files.filter((f) => !present.has(f.filename)).map((f) => f.filename);
+  if (missing.length) throw new Error(`MODEL_NOT_INSTALLED: ${missing.join(", ")}`);
+}
+
+function renderShotInternal(shotId: string): string {
+  const shot = shots.get(shotId);
+  if (!shot) throw new Error("That shot no longer exists");
+  const view = storyView(shot.storyId);
+  checkCast(view.story);
+  if (view.issues.length) throw new Error(issueText(view.issues[0]));
+  const compiled = compileShot(view.story, shot, view.cast);
+  if (!compiled.refIds.length) throw new Error(`Shot ${shot.position} has no character with reference images`);
+  let initImageId: string | undefined;
+  if (shot.continuity === "continues") {
+    const prev = view.shots.find((s) => s.position + 1 === shot.position);
+    if (!prev) throw new Error("The previous shot is missing");
+    if (!prev.approvedTakeId) throw new Error(`Approve shot ${prev.position} first`);
+    const take = takes.find((t) => t.id === prev.approvedTakeId);
+    if (!take) throw new Error("The approved take's video is missing");
+    // The core extracts the take's last frame with ffmpeg; the mock uses its poster.
+    initImageId = uid("ref");
+    refs.set(initImageId, take.posterPath ?? take.path);
+  }
+  requireH3ref();
+  const input: GenerateVideoInput = {
+    model: STORY_MODEL,
+    prompt: compiled.prompt,
+    referenceIds: compiled.refIds,
+    initImageId,
+    durationS: shot.durationS,
+    fps: STORY_FPS,
+    resolution: STORY_RESOLUTION[view.story.aspect],
+    audio: true,
+    destination: "general",
+  };
+  const jobId = uid("job");
+  void runVideoJob(jobId, input, { storyId: shot.storyId, shotId: shot.id });
+  return jobId;
+}
+
+const shotHasTakes = (shotId: string) => takes.some((t) => t.shotId === shotId);
+
+function llmStatusNow(): LlmStatus {
+  const models = llmDown ? [] : [LLM_DEFAULT_MODEL, "qwen3-8b"];
+  const model = models.length && !models.includes(llm.model) ? models[0] : llm.model;
+  return { baseUrl: llm.baseUrl, model, reachable: !llmDown, models, error: llmDown ? LM_STUDIO_HINT : null };
+}
+
+function removeRecord(list: ImageRecord[], id: string) {
+  const i = list.findIndex((x) => x.id === id);
+  if (i >= 0) list.splice(i, 1);
+}
+
+if (params.has("storyDemo")) {
+  const demo: [string, string, string][] = [
+    ["Mara", "woman in her 30s, short black hair, green bomber jacket", "Portrait of Mara, short black hair, green bomber jacket"],
+    ["Ivo", "man in his 40s, grey beard, navy wool coat", "Portrait of Ivo, grey beard, navy wool coat"],
+  ];
+  for (const [name, description, prompt] of demo) {
+    const refIds = [0, 1].map((k) => {
+      const id = uid("ref");
+      refs.set(id, placeholderImage({ width: 768, height: 1024, seed: hashString(name) + k, prompt, label: name }));
+      return id;
+    });
+    const id = uid("char");
+    characters.set(id, { id, name, description, source: "generated", consent: false, adult: true, refIds, createdAt: nowIso(), updatedAt: nowIso() });
+  }
+}
+
+const storyCommands: Record<string, Handler> = {
+  list_characters: () => [...characters.values()].sort((a, b) => a.name.localeCompare(b.name)),
+  save_character: (a) => {
+    const c = a.character as Character;
+    checkCharacter(c);
+    const name = c.name.trim();
+    const clash = [...characters.values()].find((x) => x.id !== c.id && x.name.toLowerCase() === name.toLowerCase());
+    if (clash) throw new Error(`A character named ${name} already exists`);
+    const old = c.id ? characters.get(c.id) : undefined;
+    const saved: Character = {
+      ...c,
+      id: old?.id ?? uid("char"),
+      name,
+      description: c.description.trim(),
+      consent: c.source === "real_person" && c.consent,
+      createdAt: old?.createdAt ?? nowIso(),
+      updatedAt: nowIso(),
+    };
+    characters.set(saved.id, saved);
+    return saved;
+  },
+  delete_character: (a) => {
+    const id = String(a.id);
+    const c = characters.get(id);
+    if (!c) return;
+    const user = [...stories.values()].find((s) => s.cast.includes(id));
+    if (user) throw new Error(`${c.name} is used by story "${user.title || user.brief.slice(0, 40)}"`);
+    characters.delete(id);
+  },
+  list_stories: () => [...stories.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
+  create_story: (a) => {
+    const f = { brief: String(a.brief ?? ""), targetS: Number(a.targetS), aspect: String(a.aspect ?? ""), style: String(a.style ?? ""), cast: (a.cast as string[]) ?? [] };
+    checkStoryFields(f);
+    const story: Story = {
+      id: uid("story"),
+      title: "",
+      logline: "",
+      ...f,
+      aspect: f.aspect as Story["aspect"],
+      status: "draft",
+      resultImageId: null,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    };
+    stories.set(story.id, story);
+    return storyView(story.id);
+  },
+  update_story: (a) => {
+    const s = a.story as Story;
+    const old = getStoryOr(s.id);
+    checkStoryFields(s);
+    stories.set(s.id, { ...old, title: s.title, brief: s.brief, targetS: s.targetS, aspect: s.aspect, style: s.style, cast: s.cast, updatedAt: nowIso() });
+    return storyView(s.id);
+  },
+  delete_story: (a) => {
+    const id = String(a.id);
+    const story = stories.get(id);
+    if (!story) return;
+    for (const s of storyShots(id)) shots.delete(s.id);
+    for (const t of takes.filter((t) => t.storyId === id)) removeRecord(takes, t.id);
+    if (story.resultImageId) removeRecord(images, story.resultImageId);
+    stories.delete(id);
+  },
+  get_story: (a) => storyView(String(a.id)),
+  plan_story: async (a) => {
+    const story = getStoryOr(String(a.id));
+    checkCast(story);
+    if (!story.brief.trim()) throw new Error("Write a brief first");
+    await sleep(1500);
+    if (llmDown) throw new Error(LM_STUDIO_HINT);
+    const plan = cannedPlan(story);
+    for (const s of storyShots(story.id)) shots.delete(s.id);
+    for (const s of plan.shots) shots.set(s.id, s);
+    stories.set(story.id, { ...story, title: plan.title, logline: plan.logline, status: "planned", updatedAt: nowIso() });
+    return storyView(story.id);
+  },
+  save_shots: (a) => {
+    const storyId = String(a.storyId);
+    const story = getStoryOr(storyId);
+    const incoming = (a.shots as Shot[]) ?? [];
+    const keep = new Set<string>();
+    const text = (s: Shot) => JSON.stringify([s.durationS, s.characters, s.setting, s.camera, s.action, s.dialogue, s.continuity]);
+    incoming.forEach((s, i) => {
+      const old = s.id ? shots.get(s.id) : undefined;
+      const id = old && old.storyId === storyId ? old.id : uid("shot");
+      const next: Shot = { ...s, id, storyId, position: i + 1 };
+      // Edited text: the approved take no longer matches the shot.
+      if (old && text(old) !== text(next)) next.approvedTakeId = null;
+      if (!old) next.approvedTakeId = null;
+      shots.set(id, next);
+      keep.add(id);
+    });
+    for (const s of storyShots(storyId)) {
+      if (keep.has(s.id)) continue;
+      shots.delete(s.id);
+      for (const t of takes.filter((t) => t.shotId === s.id)) removeRecord(takes, t.id);
+    }
+    stories.set(storyId, { ...story, updatedAt: nowIso() });
+    return storyView(storyId);
+  },
+  render_shot: (a) => ({ jobId: renderShotInternal(String(a.shotId)) }),
+  render_story: (a) => {
+    const view = storyView(String(a.storyId));
+    const out: RenderedShot[] = [];
+    for (const s of view.shots) {
+      const prevOk = s.continuity === "cut" || view.shots.some((p) => p.position + 1 === s.position && p.approvedTakeId);
+      if (!shotHasTakes(s.id) && prevOk) out.push({ shotId: s.id, jobId: renderShotInternal(s.id) });
+    }
+    return out;
+  },
+  approve_take: (a): ApproveResult => {
+    const shotId = String(a.shotId);
+    const takeId = String(a.takeId);
+    const take = takes.find((t) => t.id === takeId);
+    if (!take) throw new Error("That take no longer exists");
+    if (take.shotId !== shotId) throw new Error("That take belongs to another shot");
+    const shot = shots.get(shotId);
+    if (!shot) throw new Error("That shot no longer exists");
+    shots.set(shotId, { ...shot, approvedTakeId: takeId });
+    let queued: RenderedShot | null = null;
+    const next = storyShots(shot.storyId).find((s) => s.position === shot.position + 1);
+    if (next && next.continuity === "continues" && !shotHasTakes(next.id)) queued = { shotId: next.id, jobId: renderShotInternal(next.id) };
+    return { view: storyView(shot.storyId), queued };
+  },
+  assemble_story: async (a) => {
+    const storyId = String(a.storyId);
+    const view = storyView(storyId);
+    if (!view.shots.length) throw new Error("The story has no shots");
+    const approved = view.shots.map((s) => {
+      if (!s.approvedTakeId) throw new Error(`Approve a take for shot ${s.position} first`);
+      const t = takes.find((x) => x.id === s.approvedTakeId);
+      if (!t) throw new Error("The approved take's video is missing");
+      return t;
+    });
+    await sleep(1500); // ffmpeg concat + loudnorm
+    const first = approved[0];
+    const rec = makeVideo({
+      model: STORY_MODEL,
+      prompt: `Story: ${view.story.title || view.story.brief}`,
+      negativePrompt: "",
+      resolution: STORY_RESOLUTION[view.story.aspect],
+      durationS: view.shots.reduce((n, s) => n + s.durationS, 0),
+      fps: STORY_FPS,
+      audio: true,
+      seed: 0,
+      steps: 0,
+      cfg: 0,
+      createdAt: Date.now(),
+      delayMs: 0,
+      executionMs: 0,
+    });
+    rec.storyId = storyId;
+    rec.posterPath = first.posterPath ?? rec.posterPath;
+    if (view.story.resultImageId) removeRecord(images, view.story.resultImageId);
+    images.unshift(rec);
+    stories.set(storyId, { ...view.story, status: "assembled", resultImageId: rec.id, updatedAt: nowIso() });
+    return storyView(storyId);
+  },
+  llm_status: async () => {
+    await sleep(300);
+    return llmStatusNow();
+  },
+  save_llm_settings: async (a) => {
+    const url = typeof a.baseUrl === "string" ? a.baseUrl.trim().replace(/\/+$/, "") : "";
+    const model = typeof a.model === "string" ? a.model.trim() : "";
+    if (url && !/^https?:\/\/\S+$/.test(url)) throw new Error("The planner URL must start with http:// or https://");
+    llm.baseUrl = url || LLM_DEFAULT_URL;
+    llm.model = model || LLM_DEFAULT_MODEL;
+    await sleep(300);
+    return llmStatusNow();
+  },
+};
 
 const commands: Record<string, Handler> = {
   get_settings: () => ({ ...settings, vaultAutoLockMinutes: vault.autoLockMinutes, settingsPath: "~/Library/Application Support/com.naren.imagestudio/settings.json" }),
@@ -1777,6 +2255,7 @@ const commands: Record<string, Handler> = {
     if (!im) throw new Error("Image not found");
     downloadRecord(im, String(a.destPath));
   },
+  ...storyCommands,
 };
 
 /** Mock refs: a vault ref's refId is a vault:// URL (like the core); its thumbPath stays displayable. */
