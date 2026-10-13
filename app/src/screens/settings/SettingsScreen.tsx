@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import * as api from "../../api";
-import type { ConnectionTest, KeyCheck, KeyTestReport } from "../../api";
+import type { ConnectionTest, KeyCheck, KeyTestReport, LlmStatus } from "../../api";
 import { Icon } from "../../components/Icon";
 import { shortGpuName } from "../../lib/format";
 import { useLibrary } from "../../state/library";
@@ -435,10 +435,164 @@ function VaultSettings() {
   );
 }
 
+const LLM_URL_PLACEHOLDER = "http://localhost:1234/v1";
+
+/** Stories planner (spec 2026-10-13 §4): the local LLM (LM Studio, OpenAI-compatible) that writes shot lists. */
+function StoriesPlannerSettings() {
+  const toast = useToast();
+  const [status, setStatus] = useState<LlmStatus | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [url, setUrl] = useState("");
+  const [model, setModel] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const apply = (st: LlmStatus) => {
+    setStatus(st);
+    setUrl(st.baseUrl);
+    setModel(st.model);
+  };
+
+  const check = async (fill: boolean) => {
+    setChecking(true);
+    setError(null);
+    try {
+      const st = await api.llmStatus();
+      if (fill) apply(st);
+      else setStatus(st);
+    } catch (err) {
+      setError(api.errorMessage(err));
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  useEffect(() => {
+    void check(true);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const dirty = !!status && (url.trim() !== status.baseUrl || model.trim() !== status.model);
+  const listed = !!status?.reachable && status.models.length > 0;
+  const options = listed ? (status!.models.includes(model) || !model ? status!.models : [model, ...status!.models]) : [];
+
+  const save = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!dirty || saving) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const st = await api.saveLlmSettings(url.trim() || null, model.trim() || null);
+      apply(st);
+      toast.success("Stories planner saved", st.reachable ? `Plans are written by ${st.model}.` : "Saved, but the local LLM isn't reachable yet.");
+    } catch (err) {
+      setError(api.errorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section id="set-stories" className="card settings vault-settings" aria-labelledby="stories-settings-title">
+      <h2 id="stories-settings-title" className="card__title">
+        <Icon name="video" /> Stories planner
+        {status && (
+          <span className={`badge ${status.reachable ? "badge--ok" : "badge--warn"} vault-settings__state`}>
+            {status.reachable ? "Connected" : "Not reachable"}
+          </span>
+        )}
+      </h2>
+      <p className="hint">Stories plans its shot lists with a local LLM on this Mac (LM Studio or any OpenAI-compatible server). Nothing is sent to the cloud.</p>
+      {!status && !error ? (
+        <p className="hint">Checking the local LLM…</p>
+      ) : (
+        <form onSubmit={save} aria-label="Stories planner">
+          <div className="field">
+            <label className="field__label" htmlFor="llm-url">
+              Server URL
+            </label>
+            <input
+              id="llm-url"
+              className="input mono"
+              type="text"
+              inputMode="url"
+              spellCheck={false}
+              placeholder={LLM_URL_PLACEHOLDER}
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              aria-describedby="llm-url-help"
+            />
+            <p id="llm-url-help" className="hint">
+              LM Studio's default is <span className="mono">{LLM_URL_PLACEHOLDER}</span>. Leave empty for the default.
+            </p>
+          </div>
+          <div className="field">
+            <label className="field__label" htmlFor="llm-model">
+              Model
+            </label>
+            {listed ? (
+              <select id="llm-model" className="input select mono" value={model} onChange={(e) => setModel(e.target.value)} aria-describedby="llm-model-help">
+                {options.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                id="llm-model"
+                className="input mono"
+                type="text"
+                spellCheck={false}
+                placeholder="qwen3.8-27b-uncensored-optiq"
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                aria-describedby="llm-model-help"
+              />
+            )}
+            <p id="llm-model-help" className="hint">
+              {listed
+                ? "Models the server lists. If the saved one isn't listed, the first listed model is used."
+                : "Model id as the server lists it. Leave empty for the default."}
+            </p>
+          </div>
+          <div className="vault-settings__row">
+            <p className={`hint vault-settings__grow ${status && !status.reachable ? "hint--error" : ""}`} role="status" aria-live="polite">
+              {checking ? (
+                "Checking…"
+              ) : status?.reachable ? (
+                <>
+                  <Icon name="check" size={12} /> Reachable · {status.models.length} model{status.models.length === 1 ? "" : "s"} loaded
+                </>
+              ) : status ? (
+                <>
+                  <Icon name="alert" size={12} /> {status.error ?? "Could not reach the local LLM."}
+                </>
+              ) : null}
+            </p>
+            <button type="button" className="btn" onClick={() => void check(false)} disabled={checking || saving}>
+              <Icon name="refresh" /> Check again
+            </button>
+            <button type="submit" className="btn" disabled={!dirty || saving}>
+              {saving ? "Saving…" : "Save"}
+            </button>
+          </div>
+          {dirty && <p className="hint">Check again tests the saved server; save to use the new one.</p>}
+        </form>
+      )}
+      {error && (
+        <p className="hint hint--error" role="alert">
+          <Icon name="alert" size={12} /> {error}
+        </p>
+      )}
+    </section>
+  );
+}
+
 const SECTIONS = [
   { id: "set-runpod", label: "RunPod" },
   { id: "set-civitai", label: "Civitai" },
   { id: "set-vault", label: "Vault" },
+  { id: "set-stories", label: "Stories" },
   { id: "set-costs", label: "Costs" },
 ] as const;
 
@@ -975,6 +1129,8 @@ export function SettingsScreen() {
         </section>
 
         <VaultSettings />
+
+        <StoriesPlannerSettings />
 
         <section id="set-costs" className="card note" aria-labelledby="cost-title">
           <h2 id="cost-title" className="card__title">
