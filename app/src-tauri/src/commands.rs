@@ -583,6 +583,7 @@ pub async fn generate_video(
         cfg,
         audio: audio.unwrap_or(false),
         destination: Destination::parse(destination.as_deref())?,
+        story_take: None,
     };
     let job_id = jobs::generate_video(&core, req)?;
     Ok(JobStarted { job_id })
