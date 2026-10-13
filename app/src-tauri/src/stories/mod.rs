@@ -86,6 +86,19 @@ pub struct Story {
     pub updated_at: String,
 }
 
+/// A partial story update: only the fields that are set are written.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StoryPatch {
+    pub title: Option<String>,
+    pub brief: Option<String>,
+    pub target_s: Option<u32>,
+    pub aspect: Option<String>,
+    pub style: Option<String>,
+    pub cast: Option<Vec<String>>,
+    pub voices: Option<Vec<Voice>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Issue {

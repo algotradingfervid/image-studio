@@ -12,7 +12,7 @@ use crate::runpod::Health;
 use crate::settings::{Backend, SavePodSettings, SaveSettings, SettingsView};
 use crate::state::Core;
 use crate::status::{self, LoraView, StatusView};
-use crate::stories::{self, render, Character, Shot, Story, StoryView};
+use crate::stories::{self, render, Character, Shot, Story, StoryPatch, StoryView};
 use crate::tasks::{self, DeletePreview, DeleteResult, Task};
 use crate::vault::{KdfParams, VaultStatus};
 use crate::vault_migrate::{self, MigrateOptions};
@@ -585,6 +585,7 @@ pub async fn generate_video(
         audio: audio.unwrap_or(false),
         destination: Destination::parse(destination.as_deref())?,
         story_take: None,
+        label: None,
     };
     let job_id = jobs::generate_video(&core, req)?;
     Ok(JobStarted { job_id })
@@ -808,6 +809,14 @@ pub struct RenderedShot {
     pub job_id: String,
 }
 
+/// "Render all": the shots queued, and why the others couldn't start.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderAllResult {
+    pub queued: Vec<RenderedShot>,
+    pub error: Option<String>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApproveResult {
@@ -827,17 +836,6 @@ pub struct LlmStatus {
 
 fn rendered((shot_id, job_id): (String, String)) -> RenderedShot {
     RenderedShot { shot_id, job_id }
-}
-
-/// Every cast id must be a saved character.
-fn check_cast_exists(core: &Core, cast: &[String]) -> Res<()> {
-    let db = core.db.lock().unwrap();
-    for id in cast {
-        if stories::store::get_character(&db, id)?.is_none() {
-            return Err("A cast character no longer exists".into());
-        }
-    }
-    Ok(())
 }
 
 #[tauri::command]
@@ -903,44 +901,21 @@ pub fn create_story(
         updated_at: now,
     };
     render::check_story(&story)?;
-    check_cast_exists(&core, &story.cast)?;
+    render::check_cast_exists(&core, &story.cast)?;
     stories::store::save_story(&core.db.lock().unwrap(), &story)?;
     render::story_view(&core, &story.id)
 }
 
-/// Saves the editable fields (title, brief, target, aspect, style, cast, voices).
+/// Saves only the fields the patch sets (title, brief, target, aspect, style, cast, voices).
 #[tauri::command]
-pub fn update_story(core: CoreState<'_>, story: Story) -> Res<StoryView> {
-    let mut s = stories::store::get_story(&core.db.lock().unwrap(), &story.id)?
-        .ok_or("That story no longer exists")?;
-    s.title = story.title.trim().to_string();
-    s.brief = story.brief.trim().to_string();
-    s.target_s = story.target_s;
-    s.aspect = story.aspect;
-    s.style = story.style.trim().to_string();
-    s.cast = story.cast;
-    s.voices = stories::cast_voices(&s.cast, story.voices);
-    s.updated_at = crate::state::now_rfc3339();
-    render::check_story(&s)?;
-    check_cast_exists(&core, &s.cast)?;
-    stories::store::save_story(&core.db.lock().unwrap(), &s)?;
-    render::story_view(&core, &s.id)
+pub fn update_story(core: CoreState<'_>, id: String, patch: StoryPatch) -> Res<StoryView> {
+    render::update_story(&core, &id, patch)
 }
 
-/// Deletes the story, its shots, its takes and its assembled video.
+/// Deletes the story, its shots, its takes and its assembled video (not while a shot renders).
 #[tauri::command]
 pub fn delete_story(core: CoreState<'_>, id: String) -> Res<()> {
-    let recs: Vec<ImageRecord> = {
-        let db = core.db.lock().unwrap();
-        let story = stories::store::get_story(&db, &id)?;
-        let mut recs = db.list_takes(&id)?;
-        if let Some(r) = story.and_then(|s| s.result_image_id) {
-            recs.extend(db.get_image(&r)?);
-        }
-        recs
-    };
-    render::delete_records(&core, &recs)?;
-    stories::store::delete_story(&core.db.lock().unwrap(), &id)
+    render::delete_story(&core, &id)
 }
 
 #[tauri::command]
@@ -957,14 +932,7 @@ pub async fn plan_story(core: CoreState<'_>, id: String) -> Res<StoryView> {
 /// Saves the edited shot list in the given order (see `store::merge_shots`).
 #[tauri::command]
 pub fn save_shots(core: CoreState<'_>, story_id: String, shots: Vec<Shot>) -> Res<StoryView> {
-    let existing = {
-        let db = core.db.lock().unwrap();
-        stories::store::get_story(&db, &story_id)?.ok_or("That story no longer exists")?;
-        stories::store::list_shots(&db, &story_id)?
-    };
-    let merged = stories::store::merge_shots(&story_id, &existing, shots);
-    render::store_shots(&core, &story_id, &merged)?;
-    render::story_view(&core, &story_id)
+    render::save_shots(&core, &story_id, shots)
 }
 
 #[tauri::command]
@@ -974,8 +942,9 @@ pub async fn render_shot(core: CoreState<'_>, shot_id: String) -> Res<JobStarted
 }
 
 #[tauri::command]
-pub async fn render_story(core: CoreState<'_>, story_id: String) -> Res<Vec<RenderedShot>> {
-    Ok(render::render_story(&core, &story_id)?.into_iter().map(rendered).collect())
+pub async fn render_story(core: CoreState<'_>, story_id: String) -> Res<RenderAllResult> {
+    let all = render::render_story(&core, &story_id)?;
+    Ok(RenderAllResult { queued: all.queued.into_iter().map(rendered).collect(), error: all.error })
 }
 
 #[tauri::command]

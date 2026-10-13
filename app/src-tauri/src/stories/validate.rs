@@ -112,6 +112,9 @@ pub fn validate(story: &Story, shots: &[Shot], cast: &[Character]) -> Vec<Issue>
         if !(MIN_SHOT_S..=MAX_SHOT_S).contains(&s.duration_s) {
             push(format!("Duration {} s is outside 5–15 s", s.duration_s));
         }
+        if s.characters.is_empty() {
+            push(format!("Shot {} needs at least one character", s.position));
+        }
         if s.characters.len() > MAX_CAST_PER_SHOT {
             push(format!("{} characters; at most 2 per shot", s.characters.len()));
         }

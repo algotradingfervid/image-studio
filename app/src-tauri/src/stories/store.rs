@@ -371,6 +371,21 @@ pub fn set_approved(db: &Db, shot_id: &str, take_id: Option<&str>) -> Result<(),
     Ok(())
 }
 
+/// Forgets a deleted image record wherever a story points at it: the shots
+/// that approved it lose the approval, and a story whose assembled result it
+/// was goes back to "planned".
+pub fn clear_image_refs(db: &Db, image_id: &str) -> Result<(), String> {
+    let tx = db.conn().unchecked_transaction().map_err(e)?;
+    tx.execute("UPDATE shots SET approved_take_id = NULL WHERE approved_take_id = ?1", [image_id])
+        .map_err(e)?;
+    tx.execute(
+        "UPDATE stories SET result_image_id = NULL, status = 'planned' WHERE result_image_id = ?1",
+        [image_id],
+    )
+    .map_err(e)?;
+    tx.commit().map_err(e)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,6 +500,28 @@ mod tests {
         update_shot(&db, &a).unwrap();
         assert_eq!(get_shot(&db, "a").unwrap(), Some(a));
         assert!(update_shot(&db, &shot("zz", "s1", 2)).is_err());
+    }
+
+    #[test]
+    fn clearing_image_refs_unapproves_shots_and_drops_the_result() {
+        let db = Db::open_in_memory().unwrap();
+        save_story(&db, &story("s1", &[])).unwrap();
+        save_story(&db, &story("s2", &[])).unwrap();
+        replace_shots(&db, "s1", &[shot("a", "s1", 1), shot("b", "s1", 2)]).unwrap();
+        set_approved(&db, "a", Some("take1")).unwrap();
+        set_approved(&db, "b", Some("take2")).unwrap();
+        set_result(&db, "s1", "img1", "{}").unwrap();
+        set_result(&db, "s2", "img2", "{}").unwrap();
+
+        clear_image_refs(&db, "take1").unwrap();
+        assert_eq!(get_shot(&db, "a").unwrap().unwrap().approved_take_id, None);
+        assert_eq!(get_shot(&db, "b").unwrap().unwrap().approved_take_id.as_deref(), Some("take2"));
+
+        clear_image_refs(&db, "img1").unwrap();
+        let s1 = get_story(&db, "s1").unwrap().unwrap();
+        assert_eq!((s1.result_image_id, s1.status.as_str()), (None, "planned"));
+        let s2 = get_story(&db, "s2").unwrap().unwrap();
+        assert_eq!((s2.result_image_id.as_deref(), s2.status.as_str()), (Some("img2"), "assembled"));
     }
 
     #[test]

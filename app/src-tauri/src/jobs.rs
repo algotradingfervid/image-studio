@@ -164,6 +164,10 @@ pub struct Job {
     /// that was starting only for it ("stopping", then "stopped"/"failed").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_release: Option<crate::pod::GpuRelease>,
+    /// Additive (Stories): what the job card shows instead of the model and
+    /// prompt, e.g. "Story: Rooftop · shot 2".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 pub struct JobEntry {
@@ -237,6 +241,7 @@ struct Plan {
     seeds: Vec<u64>,
     record: ImageRecord, // template record; id/path/seed/times filled per image
     timeout_ms: u64,
+    label: Option<String>,
 }
 
 /// `generate_video` request (spec v5).
@@ -279,6 +284,9 @@ pub struct VideoRequest {
     /// Stories (set in Rust only): (story_id, shot_id) recorded on the saved take.
     #[serde(skip)]
     pub story_take: Option<(String, String)>,
+    /// Stories (set in Rust only): the job's label (`Job::label`).
+    #[serde(skip)]
+    pub label: Option<String>,
 }
 
 /// A whole number as an integer JSON value, else a float.
@@ -622,6 +630,7 @@ fn build_video_plan(core: &Core, req: &VideoRequest) -> Result<Plan, String> {
         seeds,
         record,
         timeout_ms: VIDEO_TIMEOUT_MS,
+        label: req.label.clone(),
     })
 }
 
@@ -787,6 +796,7 @@ fn build_plan(core: &Core, req: &GenerateRequest) -> Result<Plan, String> {
         seeds,
         record,
         timeout_ms: GENERATE_TIMEOUT_MS,
+        label: None,
     })
 }
 
@@ -833,6 +843,7 @@ fn start_job(core: &Arc<Core>, plan: Plan) -> Result<String, String> {
         images: vec![],
         error: None,
         gpu_release: None,
+        label: plan.label.clone(),
     };
     let id = job.job_id.clone();
     core.jobs.lock().unwrap().insert(
@@ -1076,7 +1087,16 @@ fn save_video(
     rec.id = id;
     rec.path = path.to_string_lossy().into_owned();
     rec.poster_path = poster_path;
-    core.db.lock().unwrap().insert_image(&rec)?;
+    let db = core.db.lock().unwrap();
+    db.insert_image(&rec)?;
+    // A story take whose shot was removed while it rendered would be
+    // unreachable: it goes again, files included.
+    if let Some(shot_id) = rec.shot_id.as_deref() {
+        if crate::stories::store::get_shot(&db, shot_id)?.is_none() {
+            core.cfg.delete_record(&db, &rec)?;
+            return Err("The shot was removed while it rendered; its take was discarded".into());
+        }
+    }
     Ok(rec)
 }
 
