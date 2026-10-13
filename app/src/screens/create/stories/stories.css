@@ -41,6 +41,18 @@
   text-overflow: ellipsis;
 }
 
+/* A character in the Add menu: add on the name, edit on the trailing icon. */
+.story-cast__menu-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.story-cast__menu-row > .menu__item {
+  flex: 1;
+  min-width: 0;
+}
+
 .story-cast__add {
   position: relative;
   display: flex;

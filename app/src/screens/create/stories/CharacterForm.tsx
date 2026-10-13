@@ -23,8 +23,19 @@ const SOURCES: { id: Source; label: string }[] = [
 /**
  * New character for the Stories cast (spec §3 step 1): name, one-line locked description, 1–3
  * reference images (general gallery only in v1), source, consent for a real person, adult tick.
+ * Given a `character`, it edits that one instead (same id; the next render uses the new references).
  */
-export function CharacterForm({ open, onClose, onSaved }: { open: boolean; onClose: () => void; onSaved: (c: Character) => void }) {
+export function CharacterForm({
+  open,
+  character,
+  onClose,
+  onSaved,
+}: {
+  open: boolean;
+  character?: Character | null;
+  onClose: () => void;
+  onSaved: (c: Character) => void;
+}) {
   const id = useId();
   const toast = useToast();
   const lib = useLibrary();
@@ -43,17 +54,17 @@ export function CharacterForm({ open, onClose, onSaved }: { open: boolean; onClo
   const nameRef = useRef<HTMLInputElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
 
-  // A fresh form each time it opens.
+  // A fresh form each time it opens, seeded from the character being edited.
   useEffect(() => {
     if (!open) return;
-    setName("");
-    setDescription("");
-    setRefs([]);
-    setSource("generated");
-    setConsent(false);
-    setAdult(false);
+    setName(character?.name ?? "");
+    setDescription(character?.description ?? "");
+    setRefs(character ? character.refIds.map((refId, i) => ({ refId, thumbPath: character.refPaths[i] || refId })) : []);
+    setSource(character?.source ?? "generated");
+    setConsent(character?.consent ?? false);
+    setAdult(character?.adult ?? false);
     setError(null);
-  }, [open]);
+  }, [open, character]);
 
   const refsRef = useRef(refs);
   refsRef.current = refs;
@@ -152,14 +163,15 @@ export function CharacterForm({ open, onClose, onSaved }: { open: boolean; onClo
     setError(null);
     try {
       const saved = await api.saveCharacter({
-        id: "",
+        id: character?.id ?? "",
         name: name.trim(),
         description: description.trim(),
         source,
         consent: source === "real_person" && consent,
         adult,
         refIds: refs.map((r) => r.refId),
-        createdAt: "",
+        refPaths: [],
+        createdAt: character?.createdAt ?? "",
         updatedAt: "",
       });
       onSaved(saved);
@@ -176,7 +188,7 @@ export function CharacterForm({ open, onClose, onSaved }: { open: boolean; onClo
     <Dialog
       open={open}
       onClose={onClose}
-      title="New character"
+      title={character ? "Edit character" : "New character"}
       className="character-dialog"
       initialFocusRef={nameRef}
       footer={
@@ -196,7 +208,7 @@ export function CharacterForm({ open, onClose, onSaved }: { open: boolean; onClo
             disabled={blocked}
             aria-describedby={missing.length ? `${id}-why` : undefined}
           >
-            <Icon name={saving ? "refresh" : "check"} className={saving ? "spin" : undefined} /> {saving ? "Saving…" : "Save character"}
+            <Icon name={saving ? "refresh" : "check"} className={saving ? "spin" : undefined} /> {saving ? "Saving…" : character ? "Save changes" : "Save character"}
           </button>
         </>
       }

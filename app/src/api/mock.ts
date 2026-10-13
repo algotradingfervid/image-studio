@@ -1676,12 +1676,15 @@ if (params.has("storyDemo")) {
       return id;
     });
     const id = uid("char");
-    characters.set(id, { id, name, description, source: "generated", consent: false, adult: true, refIds, createdAt: nowIso(), updatedAt: nowIso() });
+    characters.set(id, { id, name, description, source: "generated", consent: false, adult: true, refIds, refPaths: [], createdAt: nowIso(), updatedAt: nowIso() });
   }
 }
 
+/** Like the core: a display path next to each reference id ("" when it is gone); the mock's are data URLs. */
+const withRefPaths = (c: Character): Character => ({ ...c, refPaths: c.refIds.map((id) => refs.get(id) ?? "") });
+
 const storyCommands: Record<string, Handler> = {
-  list_characters: () => [...characters.values()].sort((a, b) => a.name.localeCompare(b.name)),
+  list_characters: () => [...characters.values()].sort((a, b) => a.name.localeCompare(b.name)).map(withRefPaths),
   save_character: (a) => {
     const c = a.character as Character;
     checkCharacter(c);
@@ -1699,7 +1702,7 @@ const storyCommands: Record<string, Handler> = {
       updatedAt: nowIso(),
     };
     characters.set(saved.id, saved);
-    return saved;
+    return withRefPaths(saved);
   },
   delete_character: (a) => {
     const id = String(a.id);

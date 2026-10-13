@@ -9,7 +9,7 @@ use crate::db::{ImageRecord, KIND_VIDEO};
 use crate::jobs::{self, Destination, VideoRequest};
 use crate::state::Core;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const VIDEO_MODEL: &str = "h3ref";
@@ -19,6 +19,29 @@ fn cast_of(core: &Core, ids: &[String]) -> Result<Vec<Character>, String> {
     let db = core.db.lock().unwrap();
     ids.iter()
         .map(|id| store::get_character(&db, id)?.ok_or_else(|| "A cast character no longer exists".to_string()))
+        .collect()
+}
+
+/// Display paths for the UI next to each `ref_ids` entry: the `references/`
+/// file for a General character ("" when it is gone). Vault paths are their own display path.
+pub fn with_ref_paths(refs_dir: &Path, cs: Vec<Character>) -> Vec<Character> {
+    cs.into_iter()
+        .map(|mut c| {
+            c.ref_paths = c
+                .ref_ids
+                .iter()
+                .map(|id| {
+                    if crate::vault::is_vault_path(id) {
+                        id.clone()
+                    } else {
+                        crate::references::find(refs_dir, id)
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    }
+                })
+                .collect();
+            c
+        })
         .collect()
 }
 

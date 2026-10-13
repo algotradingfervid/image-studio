@@ -71,6 +71,7 @@ fn row_to_character(row: &rusqlite::Row) -> rusqlite::Result<Character> {
         consent: row.get("consent")?,
         adult: row.get("adult")?,
         ref_ids: from_json(&refs),
+        ref_paths: Vec::new(),
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
@@ -401,6 +402,7 @@ mod tests {
             consent: false,
             adult: true,
             ref_ids: vec!["r1".into()],
+            ref_paths: vec![],
             created_at: "t".into(),
             updated_at: "t".into(),
         }
