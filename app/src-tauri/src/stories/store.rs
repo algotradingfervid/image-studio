@@ -24,6 +24,43 @@ fn u32_col(row: &rusqlite::Row, col: &str) -> rusqlite::Result<u32> {
 
 // ----- characters -----
 
+pub const MAX_NAME_CHARS: usize = 40;
+pub const MAX_DESCRIPTION_CHARS: usize = 200;
+pub const MAX_CHARACTER_REFS: usize = 3;
+
+/// Rules a character must meet before it is saved.
+pub fn check_character(c: &Character) -> Result<(), String> {
+    let name = c.name.trim();
+    if name.is_empty() {
+        return Err("Give the character a name".into());
+    }
+    if name.chars().count() > MAX_NAME_CHARS {
+        return Err(format!("Keep the name to {MAX_NAME_CHARS} characters or fewer"));
+    }
+    if c.description.trim().chars().count() > MAX_DESCRIPTION_CHARS {
+        return Err(format!("Keep the description to {MAX_DESCRIPTION_CHARS} characters or fewer"));
+    }
+    if !matches!(c.source.as_str(), "generated" | "real_person") {
+        return Err("Choose whether the character is generated or a real person (unknown source)".into());
+    }
+    if c.ref_ids.is_empty() {
+        return Err("Add at least one reference image".into());
+    }
+    if c.ref_ids.len() > MAX_CHARACTER_REFS {
+        return Err(format!("Use at most {MAX_CHARACTER_REFS} reference images"));
+    }
+    if !c.adult {
+        return Err(format!("{name} is not confirmed as an adult (18+)"));
+    }
+    if c.source == "real_person" && !c.consent {
+        return Err(format!("{name} is a real person without a consent tick"));
+    }
+    if crate::stories::validate::mentions_minor(&c.description) {
+        return Err(format!("{name}'s description must describe an adult; stories use adults only"));
+    }
+    Ok(())
+}
+
 fn row_to_character(row: &rusqlite::Row) -> rusqlite::Result<Character> {
     let refs: String = row.get("refs_json")?;
     Ok(Character {
@@ -284,6 +321,36 @@ pub fn update_shot(db: &Db, s: &Shot) -> Result<(), String> {
         return Err("That shot no longer exists".into());
     }
     Ok(())
+}
+
+/// The shot list to store after a manual edit: `incoming` in its order,
+/// numbered 1..n, under `story_id`, keeping ids (new ids for empty ones). The
+/// stored approval is kept unless the shot's text changed (incoming approvals
+/// are ignored; approving goes through `set_approved`).
+pub fn merge_shots(story_id: &str, existing: &[Shot], incoming: Vec<Shot>) -> Vec<Shot> {
+    let same_text = |a: &Shot, b: &Shot| {
+        a.duration_s == b.duration_s
+            && a.characters == b.characters
+            && a.setting == b.setting
+            && a.camera == b.camera
+            && a.action == b.action
+            && a.dialogue == b.dialogue
+            && a.continuity == b.continuity
+    };
+    incoming
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut s)| {
+            let old = existing.iter().find(|o| !s.id.is_empty() && o.id == s.id);
+            if s.id.is_empty() {
+                s.id = uuid::Uuid::new_v4().to_string();
+            }
+            s.story_id = story_id.to_string();
+            s.position = i as u32 + 1;
+            s.approved_take_id = old.filter(|o| same_text(o, &s)).and_then(|o| o.approved_take_id.clone());
+            s
+        })
+        .collect()
 }
 
 pub fn set_approved(db: &Db, shot_id: &str, take_id: Option<&str>) -> Result<(), String> {
