@@ -627,16 +627,8 @@ pub fn delete_image(core: CoreState<'_>, id: String) -> Res<()> {
         drop(db);
         return delete_vault_item(core, id);
     };
-    db.delete_image(&id)?;
     // Only files the app wrote (images/, videos/) are removed.
-    let owned = [core.cfg.images_dir(), core.cfg.videos_dir()];
-    for f in std::iter::once(&rec.path).chain(rec.poster_path.as_ref()) {
-        let p = PathBuf::from(f);
-        if owned.iter().any(|d| p.starts_with(d)) {
-            let _ = std::fs::remove_file(p);
-        }
-    }
-    Ok(())
+    core.cfg.delete_record(&db, &rec)
 }
 
 /// Additive: copy an image (or a video's .mp4) to a path chosen with the
@@ -837,50 +829,6 @@ fn rendered((shot_id, job_id): (String, String)) -> RenderedShot {
     RenderedShot { shot_id, job_id }
 }
 
-/// Deletes image records and the files the app wrote for them (videos/, images/).
-fn remove_records(core: &Core, recs: &[ImageRecord]) -> Res<()> {
-    let db = core.db.lock().unwrap();
-    let owned = [core.cfg.images_dir(), core.cfg.videos_dir()];
-    for rec in recs {
-        db.delete_image(&rec.id)?;
-        for f in std::iter::once(&rec.path).chain(rec.poster_path.as_ref()) {
-            let p = PathBuf::from(f);
-            if owned.iter().any(|d| p.starts_with(d)) {
-                let _ = std::fs::remove_file(p);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Replaces a story's shots and deletes the takes of shots that are gone.
-fn store_shots(core: &Core, story_id: &str, shots: &[Shot]) -> Res<()> {
-    let orphans: Vec<ImageRecord> = {
-        let db = core.db.lock().unwrap();
-        stories::store::replace_shots(&db, story_id, shots)?;
-        db.list_takes(story_id)?
-            .into_iter()
-            .filter(|t| !shots.iter().any(|s| t.shot_id.as_deref() == Some(s.id.as_str())))
-            .collect()
-    };
-    remove_records(core, &orphans)
-}
-
-/// Brief, cast, target and aspect checks shared by create/update/plan.
-fn check_story(story: &Story) -> Res<()> {
-    if story.brief.trim().is_empty() {
-        return Err("Write a brief first".into());
-    }
-    if story.cast.is_empty() {
-        return Err("Add at least one character to the cast first".into());
-    }
-    if story.target_s == 0 {
-        return Err("Choose a target length".into());
-    }
-    stories::resolution_for(&story.aspect)?;
-    Ok(())
-}
-
 /// Every cast id must be a saved character.
 fn check_cast_exists(core: &Core, cast: &[String]) -> Res<()> {
     let db = core.db.lock().unwrap();
@@ -953,7 +901,7 @@ pub fn create_story(
         created_at: now.clone(),
         updated_at: now,
     };
-    check_story(&story)?;
+    render::check_story(&story)?;
     check_cast_exists(&core, &story.cast)?;
     stories::store::save_story(&core.db.lock().unwrap(), &story)?;
     render::story_view(&core, &story.id)
@@ -971,7 +919,7 @@ pub fn update_story(core: CoreState<'_>, story: Story) -> Res<StoryView> {
     s.style = story.style.trim().to_string();
     s.cast = story.cast;
     s.updated_at = crate::state::now_rfc3339();
-    check_story(&s)?;
+    render::check_story(&s)?;
     check_cast_exists(&core, &s.cast)?;
     stories::store::save_story(&core.db.lock().unwrap(), &s)?;
     render::story_view(&core, &s.id)
@@ -989,7 +937,7 @@ pub fn delete_story(core: CoreState<'_>, id: String) -> Res<()> {
         }
         recs
     };
-    remove_records(&core, &recs)?;
+    render::delete_records(&core, &recs)?;
     stories::store::delete_story(&core.db.lock().unwrap(), &id)
 }
 
@@ -1001,21 +949,7 @@ pub fn get_story(core: CoreState<'_>, id: String) -> Res<StoryView> {
 /// Plans the shots with the local LLM (replaces the shot list).
 #[tauri::command]
 pub async fn plan_story(core: CoreState<'_>, id: String) -> Res<StoryView> {
-    let view = render::story_view(&core, &id)?;
-    check_story(&view.story)?;
-    let base = core.settings.llm_base_url();
-    let model = stories::resolve_llm_model(&base, &core.settings.llm_model()).await?;
-    let out = stories::planner::plan(&base, &model, &view.story, &view.cast).await?;
-    let mut story = view.story;
-    if !out.title.trim().is_empty() {
-        story.title = out.title.trim().to_string();
-    }
-    story.logline = out.logline.trim().to_string();
-    story.status = "planned".into();
-    story.updated_at = crate::state::now_rfc3339();
-    stories::store::save_story(&core.db.lock().unwrap(), &story)?;
-    store_shots(&core, &id, &out.shots)?;
-    render::story_view(&core, &id)
+    render::plan_story(&core, &id).await
 }
 
 /// Saves the edited shot list in the given order (see `store::merge_shots`).
@@ -1027,7 +961,7 @@ pub fn save_shots(core: CoreState<'_>, story_id: String, shots: Vec<Shot>) -> Re
         stories::store::list_shots(&db, &story_id)?
     };
     let merged = stories::store::merge_shots(&story_id, &existing, shots);
-    store_shots(&core, &story_id, &merged)?;
+    render::store_shots(&core, &story_id, &merged)?;
     render::story_view(&core, &story_id)
 }
 

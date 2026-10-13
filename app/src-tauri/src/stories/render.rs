@@ -1,9 +1,14 @@
 //! Shot and story rendering: queues video jobs and links takes to shots.
 
-use super::{compile::compile_shot, ffmpeg, resolution_for, store, validate::validate, Character, Issue, StoryView};
+use super::{
+    compile::compile_shot, ffmpeg, planner, resolution_for, resolve_llm_model, store,
+    validate::{preflight, validate},
+    Character, Issue, Shot, Story, StoryView,
+};
 use crate::db::{ImageRecord, KIND_VIDEO};
 use crate::jobs::{self, Destination, VideoRequest};
 use crate::state::Core;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -28,7 +33,12 @@ pub fn story_view(core: &Core, story_id: &str) -> Result<StoryView, String> {
         (story, shots, takes)
     };
     let cast = cast_of(core, &story.cast)?;
-    let mut issues = if shots.is_empty() { Vec::new() } else { validate(&story, &shots, &cast) };
+    // A fresh draft has no shots yet; it only gets the story-level issues.
+    let mut issues = if shots.is_empty() && story.status == "draft" {
+        preflight(&story, &cast)
+    } else {
+        validate(&story, &shots, &cast)
+    };
     for s in &shots {
         if let Err(e) = compile_shot(&story, s, &cast) {
             issues.push(Issue { shot: Some(s.position), message: e });
@@ -52,12 +62,29 @@ fn take_path(core: &Core, take_id: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// Queues one H3 Character job for the shot; returns the job id.
+/// Whether a story render of `shot_id` is still running. Entries whose job has
+/// finished (left `core.jobs`) don't count and are dropped.
+fn rendering(core: &Core, renders: &mut HashMap<String, String>, shot_id: &str) -> bool {
+    let active = core.jobs.lock().unwrap();
+    renders.retain(|_, job| active.contains_key(job));
+    renders.contains_key(shot_id)
+}
+
+pub fn is_rendering(core: &Core, shot_id: &str) -> bool {
+    rendering(core, &mut core.story_renders.lock().unwrap(), shot_id)
+}
+
+/// Queues one H3 Character job for the shot; returns the job id. Refused
+/// while an earlier render of the shot is still running.
 pub fn render_shot(core: &Arc<Core>, shot_id: &str) -> Result<String, String> {
     let shot = {
         let db = core.db.lock().unwrap();
         store::get_shot(&db, shot_id)?.ok_or("That shot no longer exists")?
     };
+    let busy = || format!("Shot {} is already rendering", shot.position);
+    if is_rendering(core, shot_id) {
+        return Err(busy());
+    }
     let view = story_view(core, &shot.story_id)?;
     if let Some(i) = view.issues.first() {
         return Err(match i.shot {
@@ -102,23 +129,36 @@ pub fn render_shot(core: &Arc<Core>, shot_id: &str) -> Result<String, String> {
         story_take: Some((shot.story_id.clone(), shot.id.clone())),
         ..Default::default()
     };
-    jobs::generate_video(core, req)
+    // Checked again under the lock: another call may have queued it meanwhile.
+    let mut renders = core.story_renders.lock().unwrap();
+    if rendering(core, &mut renders, shot_id) {
+        return Err(busy());
+    }
+    let job_id = jobs::generate_video(core, req)?;
+    renders.insert(shot.id.clone(), job_id.clone());
+    Ok(job_id)
 }
 
-/// Renders every shot that has no takes yet and can start now: `cut` shots,
-/// and `continues` shots whose previous shot is approved. Returns (shot_id, job_id).
+/// Renders every shot that has no takes yet, isn't rendering and can start
+/// now: `cut` shots, and `continues` shots whose previous shot is approved.
+/// Returns (shot_id, job_id).
 pub fn render_story(core: &Arc<Core>, story_id: &str) -> Result<Vec<(String, String)>, String> {
     let view = story_view(core, story_id)?;
     let mut out = Vec::new();
     for s in &view.shots {
-        let has_takes = view.takes.iter().any(|t| t.shot_id.as_deref() == Some(s.id.as_str()));
+        let has_takes = view.takes.iter().any(|t| t.shot_id.as_deref() == Some(s.id.as_str()))
+            || is_rendering(core, &s.id);
         let prev_ok = s.continuity == "cut"
             || view
                 .shots
                 .iter()
                 .any(|p| p.position + 1 == s.position && p.approved_take_id.is_some());
         if !has_takes && prev_ok {
-            out.push((s.id.clone(), render_shot(core, &s.id)?));
+            match render_shot(core, &s.id) {
+                Ok(job) => out.push((s.id.clone(), job)),
+                Err(e) if out.is_empty() => return Err(e),
+                Err(e) => return Err(format!("Queued {} shot(s); shot {}: {e}", out.len(), s.position)),
+            }
         }
     }
     Ok(out)
@@ -141,7 +181,8 @@ pub fn approve_take(core: &Arc<Core>, shot_id: &str, take_id: &str) -> Result<Op
     let Some(next) = view.shots.iter().find(|s| s.position == shot.position + 1) else {
         return Ok(None);
     };
-    let next_has_takes = view.takes.iter().any(|t| t.shot_id.as_deref() == Some(next.id.as_str()));
+    let next_has_takes = view.takes.iter().any(|t| t.shot_id.as_deref() == Some(next.id.as_str()))
+        || is_rendering(core, &next.id);
     if next.continuity == "continues" && !next_has_takes {
         return Ok(Some((next.id.clone(), render_shot(core, &next.id)?)));
     }
@@ -219,16 +260,79 @@ pub fn assemble_story(core: &Core, story_id: &str) -> Result<ImageRecord, String
         }).collect::<Vec<_>>(),
     });
     let db = core.db.lock().unwrap();
+    if let Err(e) = db
+        .insert_image(&rec)
+        .and_then(|_| store::set_result(&db, story_id, &id, &sidecar.to_string()))
+    {
+        let _ = db.delete_image(&id);
+        core.cfg.remove_record_files(&rec);
+        return Err(e);
+    }
+    // The new result is recorded; now the previous one goes.
     if let Some(old) = view.story.result_image_id.as_deref() {
-        if let Ok(Some(o)) = db.get_image(old) {
-            let _ = std::fs::remove_file(&o.path);
-            if let Some(p) = &o.poster_path {
-                let _ = std::fs::remove_file(p);
-            }
-            db.delete_image(old)?;
+        if let Some(o) = db.get_image(old)? {
+            core.cfg.delete_record(&db, &o)?;
         }
     }
-    db.insert_image(&rec)?;
-    store::set_result(&db, story_id, &id, &sidecar.to_string())?;
     Ok(rec)
+}
+
+/// Deletes records and the files the app wrote for them.
+pub fn delete_records(core: &Core, recs: &[crate::db::ImageRecord]) -> Result<(), String> {
+    let db = core.db.lock().unwrap();
+    for rec in recs {
+        core.cfg.delete_record(&db, rec)?;
+    }
+    Ok(())
+}
+
+/// Replaces a story's shots and deletes the takes of shots that are gone.
+pub fn store_shots(core: &Core, story_id: &str, shots: &[Shot]) -> Result<(), String> {
+    let orphans: Vec<ImageRecord> = {
+        let db = core.db.lock().unwrap();
+        store::replace_shots(&db, story_id, shots)?;
+        db.list_takes(story_id)?
+            .into_iter()
+            .filter(|t| !shots.iter().any(|s| t.shot_id.as_deref() == Some(s.id.as_str())))
+            .collect()
+    };
+    delete_records(core, &orphans)
+}
+
+/// Brief, cast, target and aspect checks for saving a story.
+pub fn check_story(story: &Story) -> Result<(), String> {
+    if story.brief.trim().is_empty() {
+        return Err("Write a brief first".into());
+    }
+    if story.cast.is_empty() {
+        return Err("Add at least one character to the cast first".into());
+    }
+    if story.target_s == 0 {
+        return Err("Choose a target length".into());
+    }
+    resolution_for(&story.aspect)?;
+    Ok(())
+}
+
+/// Plans the shots with the local LLM (replaces the shot list). The
+/// story-level safety checks run first; nothing is sent to the LLM when they fail.
+pub async fn plan_story(core: &Arc<Core>, story_id: &str) -> Result<StoryView, String> {
+    let view = story_view(core, story_id)?;
+    if let Some(i) = preflight(&view.story, &view.cast).first() {
+        return Err(i.message.clone());
+    }
+    check_story(&view.story)?;
+    let base = core.settings.llm_base_url();
+    let model = resolve_llm_model(&base, &core.settings.llm_model()).await?;
+    let out = planner::plan(&base, &model, &view.story, &view.cast).await?;
+    let mut story = view.story;
+    if !out.title.trim().is_empty() {
+        story.title = out.title.trim().to_string();
+    }
+    story.logline = out.logline.trim().to_string();
+    story.status = "planned".into();
+    story.updated_at = crate::state::now_rfc3339();
+    store::save_story(&core.db.lock().unwrap(), &story)?;
+    store_shots(core, story_id, &out.shots)?;
+    story_view(core, story_id)
 }
