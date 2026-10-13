@@ -54,6 +54,8 @@ block2 = "=0.6.2"
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"
+# examples/story_run.rs: Ctrl-C stops the GPU pods before exiting.
+tokio = { version = "1", features = ["signal"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
