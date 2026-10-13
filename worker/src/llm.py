@@ -7,11 +7,21 @@ Dockerfile.runtime step 4c: vLLM 0.24 needs transformers 5.x, ComfyUI needs
 Bearer auth.
 
 LLMSupervisor, one background thread:
-  1. downloading: huggingface_hub.snapshot_download of LLM_MODEL (HF_TOKEN)
-     into /models-local/llm/<repo name>. Skipped when a previous run left the
-     completion marker. totalBytes comes from the Hub's file metadata,
-     downloadedBytes from the size of the directory on disk (in-flight files
-     live under its .cache/huggingface/download/).
+  1. downloading: the weights end up in /models-local/llm/<repo name> on the
+     container disk (vLLM loads with small reads, slow on the network volume).
+     The network volume keeps one copy in /runpod-volume/models/llm/<repo name>
+     so a new pod copies it (local_models.copy_file, parallel reads) instead
+     of downloading ~31 GB again:
+       - local completion marker present -> nothing to do;
+       - volume copy complete -> copy it to the local disk;
+       - otherwise huggingface_hub.snapshot_download of LLM_MODEL (HF_TOKEN)
+         onto the volume, then the copy.
+     No volume mounted, or too little room on it -> download straight to the
+     local disk as before. Too little local room, or the copy fails -> vLLM
+     serves from the volume copy. totalBytes comes from the Hub's file
+     metadata; downloadedBytes from the size of the directory being downloaded
+     into (in-flight files live under its .cache/huggingface/download/), or
+     the bytes copied so far.
   2. starting: `/opt/vllm/bin/vllm serve <dir> ...` (vllm.entrypoints.cli.main,
      the console script of vLLM 0.24), its output prefixed "vllm | " in the pod
      log; GET http://127.0.0.1:8001/health is polled until it answers 200.
@@ -28,6 +38,7 @@ Environment (set by the app on the video pod only):
   LLM_GPU_GB        GPU memory for vLLM in GiB, default 44
                     (--gpu-memory-utilization = LLM_GPU_GB / total, in [0.1, 0.9])
   LLM_MAX_LEN       --max-model-len, default 32768
+  VOLUME_ROOT, MODELS_ROOT  where the volume copy lives (local_models.default_source_root)
 """
 
 from __future__ import annotations
@@ -46,6 +57,8 @@ from typing import Any, Callable, Mapping
 
 import requests
 
+import local_models
+
 log = logging.getLogger("image_studio.llm")
 
 OFF, DOWNLOADING, STARTING, READY, FAILED = "off", "downloading", "starting", "ready", "failed"
@@ -59,7 +72,8 @@ HOST, PORT = "127.0.0.1", 8001
 UPSTREAM = f"http://{HOST}:{PORT}"
 COMPLETE_MARKER = ".image-studio-complete"
 GiB = 1024 ** 3
-DISK_RESERVE = 2 * GiB        # kept free on the container disk after the download
+DISK_RESERVE = 2 * GiB        # kept free on the disk after a download or copy
+COPY_THREADS = 16
 START_TIMEOUT_S = 1800.0      # weights load + torch.compile + CUDA graphs, first boot
 GATE_TIMEOUT_S = 300.0
 POLL_S = 2.0
@@ -136,13 +150,14 @@ def _env_int(env: Mapping[str, str], key: str, default: int) -> int:
 class LLMSupervisor:
     """Downloads the model, runs vLLM, reports state. Thread-safe status()."""
 
-    def __init__(self, repo: str, root: Path, *, served_name: str = DEFAULT_SERVED_NAME,
+    def __init__(self, repo: str, root: Path, *, store: Path | None = None, served_name: str = DEFAULT_SERVED_NAME,
                  gpu_gb: float = DEFAULT_GPU_GB, max_len: int = DEFAULT_MAX_LEN,
                  token: str | None = None, env: Mapping[str, str] | None = None,
                  vllm_bin: str = VLLM_BIN, port: int = PORT,
                  popen: Callable[..., Any] = subprocess.Popen,
                  download: Callable[[str, Path, str | None], None] = hf_download,
                  total_bytes: Callable[[str, str | None], int] = hf_total_bytes,
+                 copy: Callable[..., int] = local_models.copy_file,
                  disk_bytes: Callable[[Path], int] = dir_bytes,
                  disk_usage: Callable[[Path], Any] = shutil.disk_usage,
                  gpu_mib: Callable[[], float | None] = gpu_total_mib,
@@ -153,7 +168,10 @@ class LLMSupervisor:
                  sleep: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.monotonic):
         self.repo = repo
-        self.dir = Path(root) / repo.rstrip("/").split("/")[-1]
+        name = repo.rstrip("/").split("/")[-1]
+        self.dir = Path(root) / name                 # local disk, what vLLM serves
+        self.store = Path(store) / name if store is not None else None  # volume copy
+        self.serve_dir = self.dir
         self.served_name = served_name
         self.gpu_gb = gpu_gb
         self.max_len = max_len
@@ -164,6 +182,7 @@ class LLMSupervisor:
         self.popen = popen
         self.download = download
         self.total_bytes = total_bytes
+        self.copy = copy
         self.disk_bytes = disk_bytes
         self.disk_usage = disk_usage
         self.gpu_mib = gpu_mib
@@ -179,6 +198,7 @@ class LLMSupervisor:
         self.error: str | None = None
         self.total = 0
         self.downloaded = 0
+        self._progress: Callable[[], int] = lambda: self.disk_bytes(self.dir)
         self.proc: Any = None
         self.tail: collections.deque[str] = collections.deque(maxlen=LOG_TAIL)
         self._stopped = False
@@ -190,6 +210,8 @@ class LLMSupervisor:
         if not repo:
             return None
         root = Path(env.get("LOCAL_MODELS_ROOT") or "/models-local") / "llm"
+        models = local_models.default_source_root(env)
+        kw.setdefault("store", models / "llm" if models.is_dir() else None)
         return cls(repo, root,
                    served_name=(env.get("LLM_SERVED_NAME") or "").strip() or DEFAULT_SERVED_NAME,
                    gpu_gb=_env_float(env, "LLM_GPU_GB", DEFAULT_GPU_GB),
@@ -205,7 +227,7 @@ class LLMSupervisor:
         with self.lock:
             state, total, done, error = self.state, self.total, self.downloaded, self.error
         if state == DOWNLOADING and total:
-            done = min(self.disk_bytes(self.dir), total)
+            done = min(self._progress(), total)
             with self.lock:
                 self.downloaded = max(self.downloaded, done)
                 done = self.downloaded
@@ -241,32 +263,67 @@ class LLMSupervisor:
             self._kill()
             self._fail(f"{type(exc).__name__}: {exc}")
 
-    def _download(self) -> bool:
-        marker = self.dir / COMPLETE_MARKER
+    def _complete(self, d: Path) -> int | None:
+        """totalBytes from `d`'s completion marker for this repo, else None."""
         try:
-            done = json.loads(marker.read_text())
+            done = json.loads((d / COMPLETE_MARKER).read_text())
             if done.get("repo") == self.repo:
-                with self.lock:
-                    self.total = self.downloaded = int(done.get("totalBytes") or 0)
-                log.info("planner LLM: %s already on local disk (%s)", self.repo, self.dir)
-                return True
-        except (OSError, ValueError, AttributeError):
+                return int(done.get("totalBytes") or 0)
+        except (OSError, ValueError, AttributeError, TypeError):
             pass
+        return None
+
+    def _mark(self, d: Path) -> None:
+        (d / COMPLETE_MARKER).write_text(json.dumps({"repo": self.repo,
+                                                     "totalBytes": self.total}))
+
+    def _download(self) -> bool:
+        total = self._complete(self.dir)
+        if total is not None:
+            with self.lock:
+                self.total = self.downloaded = total
+            log.info("planner LLM: %s already on local disk (%s)", self.repo, self.dir)
+            return True
+        if self.store is None:
+            return self._fetch(self.dir)
+        total = self._complete(self.store)
+        if total is not None:
+            with self.lock:
+                self.total = total
+            log.info("planner LLM: %s found on the volume (%s)", self.repo, self.store)
+        else:
+            fetched = self._fetch(self.store, fall_back=True)
+            if fetched is None:  # no room on the volume
+                return self._fetch(self.dir)
+            if not fetched:
+                return False
+        self._copy_local()
+        return True
+
+    def _fetch(self, dest: Path, fall_back: bool = False) -> bool | None:
+        """Downloads the repo into `dest` and marks it complete. False after a
+        failure; None (nothing failed) when `fall_back` and `dest` lacks room."""
         t0 = self.clock()
         try:
             total = int(self.total_bytes(self.repo, self.token))
             with self.lock:
                 self.total = total
-            self.dir.mkdir(parents=True, exist_ok=True)
-            need = total - min(self.disk_bytes(self.dir), total)
-            free = self.disk_usage(self.dir).free
+            dest.mkdir(parents=True, exist_ok=True)
+            need = total - min(self.disk_bytes(dest), total)
+            free = self.disk_usage(dest).free
             if free < need + DISK_RESERVE:
-                self._fail(f"not enough disk space for {self.repo}: {need / 1e9:.1f} GB "
-                           f"needed, {free / 1e9:.1f} GB free")
+                msg = (f"not enough disk space for {self.repo}: {need / 1e9:.1f} GB "
+                       f"needed, {free / 1e9:.1f} GB free")
+                if fall_back:
+                    log.warning("planner LLM: %s on the volume; downloading to the local "
+                                "disk instead", msg)
+                    return None
+                self._fail(msg)
                 return False
             log.info("planner LLM: downloading %s (%.1f GB) -> %s", self.repo, total / 1e9,
-                     self.dir)
-            self.download(self.repo, self.dir, self.token)
+                     dest)
+            self._progress = lambda: self.disk_bytes(dest)
+            self.download(self.repo, dest, self.token)
         except Exception as exc:
             msg = str(exc).strip().splitlines()[0][:300] if str(exc).strip() else ""
             self._fail(f"download of {self.repo} failed: {type(exc).__name__}"
@@ -274,12 +331,52 @@ class LLMSupervisor:
             return False
         with self.lock:
             self.downloaded = self.total
-        marker.write_text(json.dumps({"repo": self.repo, "totalBytes": self.total}))
+        self._mark(dest)
         log.info("planner LLM: download done in %.0f s", self.clock() - t0)
         return True
 
+    def _copy_local(self) -> None:
+        """Copies the volume copy to the local disk; on any trouble vLLM
+        serves from the volume instead (slower load, same model)."""
+        src = self.store
+        files = [p for p in sorted(src.rglob("*"))
+                 if p.is_file() and p.name != COMPLETE_MARKER
+                 and ".cache" not in p.relative_to(src).parts]
+        size = sum(p.stat().st_size for p in files)
+        copied = [0]
+        with self.lock:
+            self.total, self.downloaded = size, 0
+        self._progress = lambda: copied[0]
+        t0 = self.clock()
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            free = self.disk_usage(self.dir).free
+            if free < size + DISK_RESERVE:
+                raise OSError(f"{size / 1e9:.1f} GB needed, {free / 1e9:.1f} GB free")
+            log.info("planner LLM: copying %s (%.1f GB) from the volume to %s", self.repo,
+                     size / 1e9, self.dir)
+            for p in files:
+                dst = self.dir / p.relative_to(src)
+                if dst.is_file() and dst.stat().st_size == p.stat().st_size:
+                    copied[0] += dst.stat().st_size
+                    continue
+
+                def add(n: int) -> None:
+                    copied[0] += n
+
+                self.copy(p, dst, threads=COPY_THREADS, on_bytes=add)
+        except Exception as exc:
+            log.warning("planner LLM: copy to the local disk failed (%s: %s); serving "
+                        "from the volume", type(exc).__name__, exc)
+            self.serve_dir = src
+        else:
+            self._mark(self.dir)
+            log.info("planner LLM: copy done in %.0f s", self.clock() - t0)
+        with self.lock:
+            self.downloaded = self.total
+
     def command(self, util: float) -> list[str]:
-        return [self.vllm_bin, "serve", str(self.dir),
+        return [self.vllm_bin, "serve", str(self.serve_dir),
                 "--served-model-name", self.served_name,
                 "--host", HOST, "--port", str(self.port),
                 "--language-model-only",

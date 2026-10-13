@@ -934,8 +934,9 @@ def start_prefetch(manager: JobManager, env: Mapping[str, str],
     return local, warm
 
 
-def start_llm(env: Mapping[str, str]) -> llm_mod.LLMSupervisor | None:
-    """Starts the planner LLM supervisor when LLM_MODEL is set. Never raises."""
+def start_llm(env: Mapping[str, str], start: bool = True) -> llm_mod.LLMSupervisor | None:
+    """Creates (and with `start`, starts) the planner LLM supervisor when
+    LLM_MODEL is set. Never raises."""
     try:
         sup = llm_mod.LLMSupervisor.from_env(
             env, gate=lambda: (cuda_info.status() or {}).get("reason") != "probing")
@@ -947,7 +948,8 @@ def start_llm(env: Mapping[str, str]) -> llm_mod.LLMSupervisor | None:
     log.info("planner LLM: %s as %r; the warm-up waits until vLLM is up (vLLM needs its "
              "GPU share free when it starts), then ComfyUI may load weights", sup.repo,
              sup.served_name)
-    sup.start()
+    if start:
+        sup.start()
     return sup
 
 
@@ -969,9 +971,13 @@ def main() -> None:
     # cuda_info first: the LLM supervisor waits for its short-lived CUDA probe
     # to finish before launching vLLM.
     cuda_info.start()  # boot log + /health cudaKernels (comfy-kitchen CUDA backend on/off)
-    llm = start_llm(os.environ)
+    llm = start_llm(os.environ, start=False)
     local, warm = start_prefetch(manager, os.environ,
                                  llm_busy=llm.busy if llm is not None else None)
+    # After start_prefetch: its boot cleanup deletes *.part files under the
+    # local root, which would include the LLM's in-flight copy.
+    if llm is not None:
+        llm.start()
     health = Health(manager, local_models=local.health if local is not None else None,
                     warmup=warm.status if warm is not None else None,
                     llm=llm.status if llm is not None else llm_mod.off_status)

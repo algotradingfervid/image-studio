@@ -146,6 +146,14 @@ def test_from_env_defaults_and_overrides():
     assert s.gpu_gb == 44 and s.max_len == 32768
 
 
+def test_from_env_volume_store(tmp_path):
+    s = llm.LLMSupervisor.from_env({"LLM_MODEL": "org/M", "VOLUME_ROOT": str(tmp_path)})
+    assert s.store is None                         # no models/ on the volume: no store
+    (tmp_path / "models").mkdir()
+    s = llm.LLMSupervisor.from_env({"LLM_MODEL": "org/M", "VOLUME_ROOT": str(tmp_path)})
+    assert s.store == tmp_path / "models" / "llm" / "M" and s.serve_dir == s.dir
+
+
 def test_off_status_shape():
     assert llm.off_status() == {"state": "off", "model": None, "downloadedBytes": 0,
                                 "totalBytes": 0, "error": None}
@@ -154,6 +162,85 @@ def test_off_status_shape():
 # ---------------------------------------------------------------------------
 # state machine
 # ---------------------------------------------------------------------------
+def vllm_dir(rec):
+    cmd, _ = rec["popen"][0]
+    return Path(cmd[2])
+
+
+def test_volume_store_download_then_copy(tmp_path):
+    sup, rec, proc, clock = make_sup(tmp_path, store=tmp_path / "vol")
+    threading.Thread(target=sup.run, daemon=True).start()
+    wait_for(lambda: sup.ready())
+    assert rec["download"] == 1
+    # downloaded onto the volume (HF cache not copied), copied to the local disk
+    assert (sup.store / "model.safetensors").read_bytes() == b"x" * 1000
+    assert (sup.dir / "model.safetensors").read_bytes() == b"x" * 1000
+    for d in (sup.store, sup.dir):
+        assert json.loads((d / llm.COMPLETE_MARKER).read_text())["repo"] == sup.repo
+    assert vllm_dir(rec) == sup.dir
+    assert sup.status()["downloadedBytes"] == 1000 == sup.status()["totalBytes"]
+    sup.stop()
+
+
+def test_volume_store_reused_without_download(tmp_path):
+    vol = tmp_path / "vol" / "Qwen3.8-27B-Uncensored-FP8"
+    (vol / "sub").mkdir(parents=True)
+    (vol / "model.safetensors").write_bytes(b"y" * 600)
+    (vol / "sub" / "tokenizer.json").write_bytes(b"t" * 40)
+    (vol / ".cache" / "huggingface").mkdir(parents=True)
+    (vol / ".cache" / "huggingface" / "junk").write_bytes(b"j" * 99)
+    (vol / llm.COMPLETE_MARKER).write_text(json.dumps(
+        {"repo": "orcarouter/Qwen3.8-27B-Uncensored-FP8", "totalBytes": 640}))
+    sup, rec, proc, clock = make_sup(tmp_path, store=tmp_path / "vol")
+    threading.Thread(target=sup.run, daemon=True).start()
+    wait_for(lambda: sup.ready())
+    assert rec["download"] == 0
+    assert (sup.dir / "sub" / "tokenizer.json").read_bytes() == b"t" * 40
+    assert not (sup.dir / ".cache").exists()
+    assert vllm_dir(rec) == sup.dir
+    assert sup.status()["downloadedBytes"] == 640 == sup.status()["totalBytes"]
+    sup.stop()
+
+
+def test_volume_full_downloads_to_local_disk(tmp_path):
+    def usage(p):
+        return Usage(10 if (tmp_path / "vol") in Path(p).parents else 10**15)
+
+    sup, rec, proc, clock = make_sup(tmp_path, store=tmp_path / "vol")
+    sup.disk_usage = usage
+    threading.Thread(target=sup.run, daemon=True).start()
+    wait_for(lambda: sup.ready())
+    assert rec["download"] == 1
+    assert (sup.dir / "model.safetensors").exists()
+    assert not (sup.store / "model.safetensors").exists()
+    assert vllm_dir(rec) == sup.dir
+    sup.stop()
+
+
+def test_local_disk_full_serves_from_volume(tmp_path):
+    def usage(p):
+        return Usage(10 if (tmp_path / "vol") not in Path(p).parents else 10**15)
+
+    sup, rec, proc, clock = make_sup(tmp_path, store=tmp_path / "vol")
+    sup.disk_usage = usage
+    threading.Thread(target=sup.run, daemon=True).start()
+    wait_for(lambda: sup.ready())
+    assert vllm_dir(rec) == sup.store
+    assert not (sup.dir / llm.COMPLETE_MARKER).exists()
+    sup.stop()
+
+
+def test_copy_failure_serves_from_volume(tmp_path):
+    def broken(src, dst, **kw):
+        raise OSError("disk went away")
+
+    sup, rec, proc, clock = make_sup(tmp_path, store=tmp_path / "vol", copy=broken)
+    threading.Thread(target=sup.run, daemon=True).start()
+    wait_for(lambda: sup.ready())
+    assert vllm_dir(rec) == sup.store and sup.status()["error"] is None
+    sup.stop()
+
+
 def test_download_then_starting_then_ready(tmp_path):
     sup, rec, proc, clock = make_sup(tmp_path, health=(None, 503, 200))
     assert sup.status()["state"] == "downloading" and sup.busy()
@@ -546,6 +633,7 @@ def test_start_llm_off_and_on(monkeypatch):
     assert server.start_llm({}) is None
     started = []
     monkeypatch.setattr(llm.LLMSupervisor, "start", lambda self: started.append(self))
+    assert server.start_llm({"LLM_MODEL": "org/M"}, start=False).busy() and started == []
     sup = server.start_llm({"LLM_MODEL": "org/M"})
     assert started == [sup] and sup.busy()
     server.cuda_info._reset_for_tests()
