@@ -1210,19 +1210,18 @@ impl Vault {
     /// references (a story's takes and a character's reference images may
     /// share blobs). Failures are logged: a leftover blob is ciphertext.
     fn gc_blobs(&self, u: &Unlocked, candidates: impl Iterator<Item = BlobRef>) {
-        let used: HashSet<&str> = u
+        let used: HashSet<String> = u
             .items
             .values()
-            .flat_map(|i| i.blobs().into_iter().map(|b| b.id.as_str()))
-            .chain(u.characters.values().flat_map(|c| {
-                c.ref_ids
-                    .iter()
-                    .filter_map(|p| p.strip_prefix(VAULT_PATH_PREFIX))
-                    .map(|r| r.split('.').next().unwrap_or(""))
-            }))
+            .flat_map(|i| i.blobs().into_iter().map(|b| b.id.clone()))
+            .chain(
+                u.characters
+                    .values()
+                    .flat_map(|c| c.ref_ids.iter().filter_map(|p| BlobRef::parse(p)).map(|b| b.id)),
+            )
             .collect();
         for b in candidates {
-            if !used.contains(b.id.as_str()) {
+            if !used.contains(&b.id) {
                 if let Err(e) = self.delete_blob(&b.id) {
                     crate::alog!("vault", "gc: {e}");
                 }
@@ -1251,8 +1250,15 @@ impl Vault {
         if uuid::Uuid::parse_str(&item.id).is_err() {
             return Err("Invalid vault item id".into());
         }
+        // The guard is held across the write: blob GC (`put_character`,
+        // `delete_character`, `delete_item`) runs under the same guard and
+        // decides from the cache, so it either runs before this record exists
+        // or after it is in the cache — never against a record that is on
+        // disk but not yet indexed. While locked the guard holds `None` and
+        // sealing (public key only) still works.
+        let mut guard = self.unlocked.lock().unwrap();
         self.seal_record(&self.items_dir(), &item.id, item)?;
-        if let Some(u) = self.unlocked.lock().unwrap().as_mut() {
+        if let Some(u) = guard.as_mut() {
             u.items.insert(item.id.clone(), item.clone());
         }
         Ok(())
@@ -1282,7 +1288,9 @@ impl Vault {
             .ok_or_else(|| "That vault item no longer exists".to_string())
     }
 
-    /// Removes an item and every blob no other item and no character still references.
+    /// Removes an item and every blob no other item and no character still
+    /// references. A blob that cannot be unlinked is logged, not returned:
+    /// the item is gone from the index and the leftover is ciphertext.
     pub fn delete_item(&self, id: &str) -> Result<VaultItem, String> {
         let item = {
             let mut guard = self.unlocked.lock().unwrap();
@@ -2135,6 +2143,49 @@ mod tests {
         assert!(v.open_blob(&face.id).is_ok());
         v.delete_character(&twin.id).unwrap();
         assert!(v.open_blob(&face.id).is_err());
+    }
+
+    /// A take finishing on a job thread (`put_item`) and a character edit on a
+    /// command thread (`put_character` → blob GC) are serialised by the
+    /// `unlocked` guard: `put_item` takes it before sealing, so GC never sees
+    /// a record that is on disk but not yet in the cache.
+    #[test]
+    fn put_item_waits_for_the_index_guard_so_gc_sees_the_new_take() {
+        let (_d, v) = vault();
+        v.create(PW, KdfParams::fast()).unwrap();
+        let c = vchar(&v, "Mara");
+        let face = BlobRef::parse(&c.ref_ids[0]).unwrap();
+        v.put_character(&c).unwrap();
+        let mut take = sample_item(&v.seal_blob(b"\0\0\0\x18ftypisom", "mp4").unwrap());
+        take.references = vec![face.clone()];
+        let item_file = v.item_path(&take.id);
+        let v = std::sync::Arc::new(v);
+        let (vv, t) = (v.clone(), take.clone());
+        let saver = {
+            let held = v.unlocked.lock().unwrap();
+            let saver = std::thread::spawn(move || vv.put_item(&t));
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(!item_file.exists(), "put_item must not write before it holds the guard");
+            drop(held);
+            saver
+        };
+        saver.join().unwrap().unwrap();
+        assert!(item_file.exists());
+        assert!(v.item(&take.id).is_ok(), "indexed in the same critical section");
+        // Replacing the character's reference now keeps the face: the take uses it.
+        let mut edited = c.clone();
+        edited.ref_ids = vec![v.seal_blob(b"\x89PNG\r\n\x1a\nother", "png").unwrap().path()];
+        v.put_character(&edited).unwrap();
+        assert!(v.open_blob(&face.id).is_ok());
+        // And a take sealed while locked still works, with no guard to wait for.
+        v.lock();
+        let mut locked_take = sample_item(&v.seal_blob(b"\0\0\0\x18ftypisom", "mp4").unwrap());
+        locked_take.references = vec![face.clone()];
+        v.put_item(&locked_take).unwrap();
+        v.unlock(PW).unwrap();
+        assert!(v.item(&locked_take.id).is_ok());
+        v.delete_item(&take.id).unwrap();
+        assert!(v.open_blob(&face.id).is_ok(), "the locked-sealed take still uses it");
     }
 
     #[test]
