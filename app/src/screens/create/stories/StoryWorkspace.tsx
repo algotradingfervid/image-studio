@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type JSX } from "react";
 import * as api from "../../../api";
-import type { ImageRecord, Job, Shot, StoryView } from "../../../api";
+import type { ImageRecord, Job, Shot, Story, StoryView, Voice } from "../../../api";
 import { Dialog } from "../../../components/Dialog";
 import { Icon } from "../../../components/Icon";
 import { useGpu } from "../../../state/gpu";
@@ -33,6 +33,7 @@ const blankShot = (storyId: string, n: number, cast: string[]): Shot => ({
   camera: "",
   action: "",
   dialogue: [],
+  sound: "",
   continuity: "cut",
   approvedTakeId: null,
 });
@@ -88,6 +89,14 @@ function Workspace({
   const [busy, setBusy] = useState<null | "plan" | "render" | "assemble" | "approve">(null);
   const [confirm, setConfirm] = useState<null | { kind: "replan" } | { kind: "delete"; index: number; key: string }>(null);
   const [titleDraft, setTitleDraft] = useState<string | null>(null);
+  /** Unsaved voice phrases (character id → phrase); null = show the saved ones. */
+  const [voiceDraft, setVoiceDraft] = useState<Record<string, string> | null>(null);
+  const voiceDraftRef = useRef(voiceDraft);
+  voiceDraftRef.current = voiceDraft;
+  const voiceTimer = useRef<number | null>(null);
+  const voiceVersion = useRef(0);
+  const storyRef = useRef<Story | null>(null);
+  storyRef.current = view?.story ?? null;
 
   const keyOf = useRef(new Map<string, string>());
   const newCounter = useRef(0);
@@ -103,12 +112,13 @@ function Workspace({
   const onChangedRef = useRef(onChanged);
   onChangedRef.current = onChanged;
   const alive = useRef(true);
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    // Set on (re)mount too: StrictMode's simulated unmount would otherwise leave it false.
+    alive.current = true;
+    return () => {
       alive.current = false;
-    },
-    [],
-  );
+    };
+  }, []);
 
   const setRendering = useCallback(
     (fn: (r: Record<string, string>) => Record<string, string>) => {
@@ -333,7 +343,13 @@ function Workspace({
         timer.current = null;
       }
       if (inflight.current) await inflight.current;
+      if (voiceTimer.current !== null) {
+        window.clearTimeout(voiceTimer.current);
+        voiceTimer.current = null;
+      }
       const v = await api.planStory(storyId);
+      voiceVersion.current += 1;
+      setVoiceDraft(null);
       version.current += 1;
       setRendering(() => ({}));
       setErrors({});
@@ -368,6 +384,8 @@ function Workspace({
       onChangedRef.current?.();
     } catch (e) {
       toast.error("Couldn't approve the take", e);
+      // The approval may have been saved before starting the next shot failed: show what the backend has.
+      void refetch();
     } finally {
       if (alive.current) setBusy(null);
     }
@@ -419,6 +437,58 @@ function Workspace({
     }
   };
 
+  // ---- voices (debounced like shot edits) ----
+  const voicesFrom = (draft: Record<string, string>, base: Story): Voice[] =>
+    base.cast.map((id) => ({ characterId: id, voice: (draft[id] ?? "").trim() })).filter((v) => v.voice);
+
+  const saveVoices = useCallback(async () => {
+    voiceTimer.current = null;
+    const base = storyRef.current;
+    const draft = voiceDraftRef.current;
+    if (!base || !draft) return;
+    const v = voiceVersion.current;
+    try {
+      const res = await api.updateStory({ ...base, voices: voicesFrom(draft, base) });
+      if (!alive.current) return;
+      setView((cur) => (cur ? { ...cur, story: res.story, issues: res.issues } : res));
+      if (voiceVersion.current === v) setVoiceDraft(null);
+    } catch (e) {
+      toastRef.current.error("Couldn't save the voices", e);
+    }
+  }, []);
+
+  const editVoice = (characterId: string, voice: string) => {
+    if (!story) return;
+    const current = voiceDraft ?? Object.fromEntries(story.voices.map((x) => [x.characterId, x.voice]));
+    const next = { ...current, [characterId]: voice };
+    voiceVersion.current += 1;
+    setVoiceDraft(next);
+    voiceDraftRef.current = next;
+    if (voiceTimer.current !== null) window.clearTimeout(voiceTimer.current);
+    voiceTimer.current = window.setTimeout(() => void saveVoices(), SAVE_DEBOUNCE_MS);
+  };
+
+  // Leaving the story: send pending voice edits.
+  useEffect(
+    () => () => {
+      if (voiceTimer.current === null) return;
+      window.clearTimeout(voiceTimer.current);
+      voiceTimer.current = null;
+      const base = storyRef.current;
+      const draft = voiceDraftRef.current;
+      if (!base || !draft) return;
+      const t = toastRef.current;
+      const p = api.updateStory({ ...base, voices: voicesFrom(draft, base) }).catch((e) => t.error("Couldn't save the voices", e));
+      const prev = pendingSaves.get(storyId);
+      const mine = Promise.all([prev, p]).catch(() => {});
+      pendingSaves.set(storyId, mine);
+      void mine.finally(() => {
+        if (pendingSaves.get(storyId) === mine) pendingSaves.delete(storyId);
+      });
+    },
+    [storyId],
+  );
+
   const move = (i: number, dir: -1 | 1) => {
     const j = i + dir;
     if (j < 0 || j >= shots.length) return;
@@ -452,6 +522,12 @@ function Workspace({
       </div>
     );
   }
+
+  const deleteTakes = confirm?.kind === "delete" ? (takesByShot.get(shots[confirm.index]?.id ?? "")?.length ?? 0) : 0;
+  const deleteText =
+    deleteTakes === 0
+      ? "Removes the shot and its text from the story."
+      : `Removes the shot and its text from the story, and deletes its ${deleteTakes === 1 ? "take (rendered video)" : `${deleteTakes} takes (rendered videos)`}${shots[confirm?.kind === "delete" ? confirm.index : -1]?.approvedTakeId ? ", including the approved one" : ""}.`;
 
   const assembleTitle = !shots.length
     ? "Plan the story first"
@@ -493,6 +569,27 @@ function Workspace({
             {saveState === "pending" && <span className="story-ws__save"> · Unsaved edits</span>}
             {saveState === "error" && <span className="story-ws__save is-error"> · Not saved</span>}
           </p>
+          {cast.length > 0 && (
+            <fieldset className="story-ws__voices">
+              <legend className="story-ws__voices-label">Voices</legend>
+              {cast.map((c) => {
+                const value = voiceDraft?.[c.id] ?? story.voices.find((x) => x.characterId === c.id)?.voice ?? "";
+                return (
+                  <label key={c.id} className="story-ws__voice">
+                    <span className="story-ws__voice-name">{c.name}</span>
+                    <input
+                      className="input"
+                      aria-label={`${c.name}'s voice`}
+                      placeholder="a low, steady female voice with a calm pace"
+                      value={value}
+                      maxLength={200}
+                      onChange={(e) => editVoice(c.id, e.target.value)}
+                    />
+                  </label>
+                );
+              })}
+            </fieldset>
+          )}
         </div>
         <div className="btn-row story-ws__actions">
           <button type="button" className="btn btn--sm" disabled={!!busy || anyRendering} onClick={() => (shots.length ? setConfirm({ kind: "replan" }) : void replan())}>
@@ -597,7 +694,10 @@ function Workspace({
           </>
         }
       >
-        <p>Replaces all shots and their takes' approvals. The local model writes a new shot list from the brief.</p>
+        <p>
+          Replaces all shots and deletes every take (rendered video) of the current shots, approved ones included. The local model writes a new
+          shot list from the brief.
+        </p>
       </Dialog>
 
       <Dialog
@@ -624,7 +724,7 @@ function Workspace({
           </>
         }
       >
-        <p>Removes the shot and its text from the story.</p>
+        <p>{deleteText}</p>
       </Dialog>
     </div>
   );

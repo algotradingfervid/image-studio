@@ -562,6 +562,14 @@ export interface Character {
 export interface DialogueLine {
   speaker: string;
   line: string;
+  /** What the speaker does while saying the line and how (≤ 15 words; may be empty). */
+  delivery: string;
+}
+
+/** A cast member's voice phrase, reused word for word in every shot's prompt. */
+export interface Voice {
+  characterId: string;
+  voice: string;
 }
 
 export interface Shot {
@@ -574,6 +582,8 @@ export interface Shot {
   camera: string;
   action: string;
   dialogue: DialogueLine[];
+  /** Real sounds in the shot (ambience, actions); empty = a generic soundscape. */
+  sound: string;
   continuity: "cut" | "continues";
   approvedTakeId: string | null;
 }
@@ -587,6 +597,7 @@ export interface Story {
   aspect: "16:9" | "9:16" | "1:1";
   style: string;
   cast: string[];
+  voices: Voice[];
   status: "draft" | "planned" | "assembled";
   resultImageId: string | null;
   createdAt: string;

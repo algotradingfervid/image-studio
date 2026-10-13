@@ -79,6 +79,39 @@
   font-size: 12px;
 }
 
+.story-ws__voices {
+  display: grid;
+  gap: 4px;
+  margin: 8px 0 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
+.story-ws__voices-label {
+  padding: 0;
+  margin-bottom: 2px;
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+.story-ws__voice {
+  display: grid;
+  grid-template-columns: minmax(48px, max-content) minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  font-size: 13px;
+}
+
+.story-ws__voice-name {
+  color: var(--text-2);
+}
+
+.story-ws__voice .input {
+  height: 30px;
+  font-size: 13px;
+}
+
 .story-ws__save.is-error {
   color: var(--danger);
 }
@@ -322,6 +355,24 @@
   grid-template-columns: minmax(90px, 140px) minmax(0, 1fr) auto;
   gap: 6px;
   align-items: center;
+}
+
+/* Speaker · delivery · remove on the first row; the spoken line under them. */
+.shot-card__line-text {
+  grid-column: 1 / 3;
+}
+
+.shot-card__delivery {
+  font-style: italic;
+}
+
+.shot-card__delivery.is-over {
+  border-color: var(--danger);
+}
+
+.shot-card__lines > li + li {
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
 }
 
 .shot-card__add-line {
