@@ -141,7 +141,14 @@ export function ShotCard(props: ShotCardProps) {
           >
             <span aria-hidden="true">↓</span>
           </button>
-          <button type="button" className="icon-btn icon-btn--sm" aria-label={`Delete shot ${n}`} onClick={props.onDelete}>
+          <button
+            type="button"
+            className="icon-btn icon-btn--sm"
+            aria-label={`Delete shot ${n}`}
+            title={rendering ? "Wait for the shot to finish rendering" : undefined}
+            disabled={rendering}
+            onClick={props.onDelete}
+          >
             <Icon name="trash" size={14} />
           </button>
         </div>

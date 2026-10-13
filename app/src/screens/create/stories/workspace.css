@@ -400,3 +400,12 @@
 .shot-card__issues .field-error {
   margin: 0;
 }
+
+/* Wraps the workspace so a plan can make it read-only; adds no box of its own. */
+.story-ws__lock {
+  display: contents;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}

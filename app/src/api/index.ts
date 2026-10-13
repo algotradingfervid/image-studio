@@ -11,9 +11,10 @@ import type {
   ApproveResult,
   Character,
   LlmStatus,
-  RenderedShot,
+  RenderAllResult,
   Shot,
   Story,
+  StoryPatch,
   StoryView,
   ImageRecord,
   AddLoraInput,
@@ -238,13 +239,13 @@ export const deleteCharacter = (id: string) => call<void>("delete_character", { 
 export const listStories = () => call<Story[]>("list_stories");
 export const createStory = (input: { brief: string; targetS: number; aspect: string; style: string; cast: string[] }) =>
   callObj<StoryView>("create_story", input);
-export const updateStory = (story: Story) => call<StoryView>("update_story", { story });
+export const updateStory = (id: string, patch: StoryPatch) => call<StoryView>("update_story", { id, patch });
 export const deleteStory = (id: string) => call<void>("delete_story", { id });
 export const getStory = (id: string) => call<StoryView>("get_story", { id });
 export const planStory = (id: string) => call<StoryView>("plan_story", { id });
 export const saveShots = (storyId: string, shots: Shot[]) => call<StoryView>("save_shots", { storyId, shots });
 export const renderShot = (shotId: string) => call<{ jobId: string }>("render_shot", { shotId });
-export const renderStory = (storyId: string) => call<RenderedShot[]>("render_story", { storyId });
+export const renderStory = (storyId: string) => call<RenderAllResult>("render_story", { storyId });
 export const approveTake = (shotId: string, takeId: string) =>
   call<ApproveResult>("approve_take", { shotId, takeId });
 export const assembleStory = (storyId: string) => call<StoryView>("assemble_story", { storyId });

@@ -60,7 +60,7 @@ import { JobList, type JobView } from "./JobCard";
 import { Lightbox } from "./Lightbox";
 import { VideoPanel, type VideoPanelHandle } from "./VideoPanel";
 import { StoriesPanel } from "./stories/StoriesPanel";
-import { StoryWorkspace } from "./stories/StoryWorkspace";
+import { StoryWorkspace, type WorkspaceHandle } from "./stories/StoryWorkspace";
 import { MigrationView, SaveToSwitch, VaultCreate, VaultLockScreen } from "./VaultViews";
 
 const PAGE = 24;
@@ -202,6 +202,23 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   const [planEpoch, setPlanEpoch] = useState(0);
   /** Bumped when the workspace changed the story (title, status): the panel reloads its list. */
   const [storyEpoch, setStoryEpoch] = useState(0);
+  /** Bumped when the panel saved the story's fields: the workspace reloads the story. */
+  const [panelEpoch, setPanelEpoch] = useState(0);
+  /** The panel is planning the selected story: the workspace is read-only. */
+  const [storyPlanning, setStoryPlanning] = useState(false);
+  /** A shot of the open story is rendering: the panel's Delete story / Plan again wait. */
+  const [storyRendering, setStoryRendering] = useState(false);
+  /** The open workspace (its pending edits are flushed before, and dropped after, a panel plan). */
+  const workspaceRef = useRef<WorkspaceHandle | null>(null);
+  const beforeStoryPlan = useCallback(async (id: string) => {
+    const ws = workspaceRef.current;
+    if (ws && ws.storyId === id) await ws.flush();
+  }, []);
+  const onStoryPlanned = useCallback(() => {
+    // The new plan supersedes whatever the workspace still had pending; it remounts with the plan.
+    workspaceRef.current?.discard();
+    setPlanEpoch((n) => n + 1);
+  }, []);
   /** A take or result opened from the workspace (takes aren't in the gallery list). */
   const [storyItem, setStoryItem] = useState<ImageRecord | null>(null);
 
@@ -1283,8 +1300,12 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         modeSwitch={modeSwitch}
         selectedStoryId={storyId}
         onSelectStory={setStoryId}
-        onPlanned={() => setPlanEpoch((n) => n + 1)}
+        onPlanned={onStoryPlanned}
         refreshKey={storyEpoch}
+        beforePlan={beforeStoryPlan}
+        onPlanningChange={setStoryPlanning}
+        onSaved={() => setPanelEpoch((n) => n + 1)}
+        rendering={storyRendering}
       />
       <form
         ref={formRef}
@@ -1491,6 +1512,10 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
             storyId={storyId}
             jobs={jobs}
             onOpenImage={setStoryItem}
+            planning={storyPlanning}
+            handle={workspaceRef}
+            onRenderingChange={setStoryRendering}
+            refreshKey={panelEpoch}
             onChanged={() => {
               setStoryEpoch((n) => n + 1);
               void refreshGalleryTop();

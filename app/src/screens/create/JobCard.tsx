@@ -205,7 +205,9 @@ export function JobCard({
       ? outputIds.current.map((id) => vault.items.find((x) => x.id === id)).filter((r): r is NonNullable<typeof r> => !!r)
       : null;
   const outputs = rehydrated ?? job.images;
-  const prompt = job.prompt || rehydrated?.[0]?.prompt || "";
+  // A story render shows its label ("Story: … · shot N") instead of the model and the compiled prompt.
+  const prompt = job.label ? "" : job.prompt || rehydrated?.[0]?.prompt || "";
+  const heading = job.label || job.modelName;
 
   const k = Math.min(job.completed + 1, job.total);
   const noun = video ? "video" : "image";
@@ -329,14 +331,14 @@ export function JobCard({
 
   const showCountTag = job.total > 1 && active && !staged;
   const started = job.status === "running" || job.completed > 0;
-  const promptLine = `${job.modelName}${prompt ? ` · ${prompt}` : ""}`;
+  const promptLine = `${heading}${prompt ? ` · ${prompt}` : ""}`;
 
   // UI-057: names that tell cards apart ("Job 4, Z-Image Turbo, done").
   const jobName = num != null ? `job ${num}` : "this job";
   const stateWord = STATE_WORD[job.status] ?? job.status;
   const cardName = sealed
     ? `${num != null ? `Job ${num}` : video ? "Video" : "Generation"} for the vault, ${stateWord}`
-    : `${num != null ? `Job ${num}, ` : ""}${job.modelName || (video ? "Video" : "Generation")}, ${stateWord}`;
+    : `${num != null ? `Job ${num}, ` : ""}${heading || (video ? "Video" : "Generation")}, ${stateWord}`;
   const valueText = caption ? caption.left : bar?.indeterminate ? title : undefined;
   const toVault = job.destination === "vault";
   // The vault was erased after this job: its outputs are gone, there is nothing to unlock (UI-059).
@@ -499,7 +501,7 @@ export function JobCard({
           )
         ) : (
           <p className="job-card__prompt" title={promptLine}>
-            <strong>{job.modelName}</strong>
+            <strong>{heading}</strong>
             {prompt ? ` · ${prompt}` : ""}
             {toVault && !prompt && !active && job.completed > 0 && outputs.length === 0 && (
               <>
@@ -519,7 +521,7 @@ export function JobCard({
                 type="button"
                 className="job-thumb"
                 onClick={() => onOpenImage(im.id)}
-                aria-label={`Open ${im.kind === "video" ? "video" : "image"} ${i + 1} of ${outputs.length}${prompt ? `: ${clip(prompt)}` : ""}`}
+                aria-label={`Open ${im.kind === "video" ? "video" : "image"} ${i + 1} of ${outputs.length}${prompt || job.label ? `: ${clip(prompt || job.label || "")}` : ""}`}
               >
                 <img src={fileSrc(im.thumbPath ?? (im.kind === "video" ? (im.posterPath ?? "") : im.path))} alt="" />
               </button>
