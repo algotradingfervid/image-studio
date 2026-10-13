@@ -78,6 +78,7 @@ OUTPUT_TYPES: dict[str, list[str]] = {
     "BasicGuider": ["GUIDER"],
     "MiniMaxH3ImageToVideo": ["CONDITIONING", "LATENT"],
     "MiniMaxH3ReferenceToVideo": ["CONDITIONING", "LATENT"],
+    "MiniMaxH3AddGuide": ["CONDITIONING"],
     "VAEDecodeAudio": ["AUDIO"],
     "VAEDecodeTiled": ["IMAGE"],
     "CreateVideo": ["VIDEO"],
@@ -528,7 +529,7 @@ def _video_resolved(params: dict, model: dict) -> dict:
         raise WorkflowError(f"INVALID_INPUT: durationS must be within "
                             f"[{lim.get('minDurationS', 0)}, {lim['maxDurationS']}] for {model['id']}")
     p["durationS"] = dur
-    if p.get("initImage") and "i2v" not in model.get("modes", []):
+    if p.get("initImage") and not {"i2v", "r2v"} & set(model.get("modes", [])):
         raise WorkflowError(f"I2V_NOT_SUPPORTED: {model['id']} does not accept a start image")
     p["references"] = _ref_names(p.get("references") or [])
     n_refs, max_refs = len(p["references"]), int(model.get("maxReferences", 0))
@@ -696,6 +697,8 @@ def _ltx25(p: dict, model: dict) -> tuple[dict, dict]:
 # RandomNoise + KSamplerSelect(res_multistep) -> SamplerCustomAdvanced ->
 # VAEDecode / VAEDecodeAudio -> CreateVideo(24 fps) -> SaveVideo.
 # The prompt refers to the references as <Picture 1>, <Picture 2>... in order.
+# Optional initImage: LoadImage -> MiniMaxH3AddGuide(frame_idx 0) between the
+# reference node and BasicGuider (output size stays the preset).
 # --------------------------------------------------------------------------
 def _h3ref(p: dict, model: dict) -> tuple[dict, dict]:
     w, h = video_size(p["resolution"], H3_MULTIPLE)
@@ -714,11 +717,17 @@ def _h3ref(p: dict, model: dict) -> tuple[dict, dict]:
         img = g.add("LoadImage", f"Reference {i + 1}", image=name)
         cond_inputs[f"{H3_REF_PREFIX}{i}"] = _out(img)
     cond = g.add("MiniMaxH3ReferenceToVideo", **cond_inputs)
+    positive = _out(cond, 0)
+    if p.get("initImage"):
+        # "Continues previous" shot (Stories): pin the start image at frame 0.
+        start = g.add("LoadImage", "Start image", image=p["initImage"]["name"])
+        positive = _out(g.add("MiniMaxH3AddGuide", positive=positive, vae=_out(vae),
+                              latent=_out(cond, 1), image=_out(start), frame_idx=0))
     noise = g.add("RandomNoise", noise_seed=int(p["seed"]))
     sampler = g.add("KSamplerSelect", sampler_name=H3_SAMPLER)
     sched = g.add("BasicScheduler", model=_out(unet), scheduler=H3_SCHEDULER,
                   steps=int(p["steps"]), denoise=1.0)
-    guider = g.add("BasicGuider", model=_out(unet), conditioning=_out(cond, 0))
+    guider = g.add("BasicGuider", model=_out(unet), conditioning=positive)
     sca = g.add("SamplerCustomAdvanced", noise=_out(noise), guider=_out(guider),
                 sampler=_out(sampler), sigmas=_out(sched), latent_image=_out(cond, 1))
     dec = g.add("VAEDecode", samples=_out(sca, 0), vae=_out(vae))
@@ -873,6 +882,7 @@ _VIDEO_STAGE_OF_CLASS: dict[str, str] = {
     "LTXVConditioning": "encoding_prompt",
     "MiniMaxH3ImageToVideo": "encoding_prompt",  # prompt encode (+ first-frame VAE encode)
     "MiniMaxH3ReferenceToVideo": "encoding_prompt",  # prompt + reference VAE encodes
+    "MiniMaxH3AddGuide": "encoding_prompt",  # first-frame VAE encode + guide
     "UNETLoader": "loading_model",
     "LatentUpscaleModelLoader": "loading_model",
     "LoadImage": "preparing_init_image",
@@ -895,12 +905,17 @@ _VIDEO_STAGE_OF_CLASS: dict[str, str] = {
 def _video_node_stages(graph: dict) -> dict[str, str]:
     refs = {v[0] for n in graph.values() if n.get("class_type") == "MiniMaxH3ReferenceToVideo"
             for v in n.get("inputs", {}).values() if isinstance(v, list)}
+    guide_imgs = {n["inputs"]["image"][0] for n in graph.values()
+                  if n.get("class_type") == "MiniMaxH3AddGuide"
+                  and isinstance(n.get("inputs", {}).get("image"), list)}
     out = {}
     for nid, node in graph.items():
         cls = node.get("class_type", "")
         stage = _VIDEO_STAGE_OF_CLASS.get(cls)
         if cls == "LoadImage" and nid in refs:
             stage = "preparing_references"
+        if cls == "LoadImage" and nid in guide_imgs:
+            stage = "preparing_init_image"
         if cls == "LTXVImgToVideoInplace":
             src = node.get("inputs", {}).get("latent")
             if isinstance(src, list) and graph.get(src[0], {}).get("class_type") == \

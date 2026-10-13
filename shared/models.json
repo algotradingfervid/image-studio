@@ -378,7 +378,7 @@
           "role": "audio_vae"
         }
       ],
-      "maxReferences": 4
+      "maxReferences": 6
     },
     {
       "id": "ltx25",

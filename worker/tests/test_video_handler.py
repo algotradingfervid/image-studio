@@ -395,6 +395,17 @@ def test_generate_video_h3ref_four_references(venv):
         [f"ref_images.ref_image_{i}" for i in range(4)]
 
 
+def test_h3ref_accepts_init_image(venv):
+    venv.install("h3ref")
+    fake = venv.fake(steps=1)
+    out = handler.handler(vid_input(model="h3ref", steps=1, references=[ref()],
+                                    initImage=ref(PNG_INIT, "start.png")))
+    assert "error" not in out, out
+    graph = fake.prompts[0]["prompt"]
+    assert any(n["class_type"] == "MiniMaxH3AddGuide" for n in graph.values())
+    assert len(fake.uploads) == 2
+
+
 def test_h3ref_needs_its_own_unet(venv):
     venv.install("h3")  # shared clip + VAEs present, the ref2va weights are not
     fake = venv.fake()
@@ -405,16 +416,14 @@ def test_h3ref_needs_its_own_unet(venv):
 
 
 @pytest.mark.parametrize("model,patch,code", [
-    ("h3ref", {}, "INVALID_INPUT: h3ref needs 1-4 reference images"),
-    ("h3ref", {"references": []}, "INVALID_INPUT: h3ref needs 1-4 reference images"),
-    ("h3ref", {"references": None}, "INVALID_INPUT: h3ref needs 1-4 reference images"),
+    ("h3ref", {}, "INVALID_INPUT: h3ref needs 1-6 reference images"),
+    ("h3ref", {"references": []}, "INVALID_INPUT: h3ref needs 1-6 reference images"),
+    ("h3ref", {"references": None}, "INVALID_INPUT: h3ref needs 1-6 reference images"),
     ("h3ref", {"references": "x"}, "INVALID_INPUT: references must be a list"),
-    ("h3ref", {"references": [ref()] * 5}, "TOO_MANY_REFERENCES: h3ref accepts at most 4"),
+    ("h3ref", {"references": [ref()] * 7}, "TOO_MANY_REFERENCES: h3ref accepts at most 6"),
     ("h3ref", {"references": [{"name": "a.png", "base64": "!!!"}]}, "INVALID_REFERENCE"),
     ("h3ref", {"references": [ref(b"GIF89a....", "a.gif")]}, "INVALID_REFERENCE"),
     ("h3ref", {"references": ["x"]}, "INVALID_REFERENCE"),
-    ("h3ref", {"references": [ref()], "initImage": ref(PNG_INIT, "start.png")},
-     "I2V_NOT_SUPPORTED: h3ref"),
     ("h3", {"references": [ref()]}, "REFERENCES_NOT_SUPPORTED: h3"),
     ("ltx25", {"references": [ref()]}, "REFERENCES_NOT_SUPPORTED: ltx25"),
 ])
