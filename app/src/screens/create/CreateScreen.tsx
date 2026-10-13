@@ -59,11 +59,15 @@ import { GalleryPicker } from "./GalleryPicker";
 import { JobList, type JobView } from "./JobCard";
 import { Lightbox } from "./Lightbox";
 import { VideoPanel, type VideoPanelHandle } from "./VideoPanel";
+import { StoriesPanel } from "./stories/StoriesPanel";
+import { StoryWorkspace } from "./stories/StoryWorkspace";
 import { MigrationView, SaveToSwitch, VaultCreate, VaultLockScreen } from "./VaultViews";
 
 const PAGE = 24;
 const LAST_MODEL_KEY = "imagestudio.lastModel";
 const MODE_KEY = "imagestudio.createMode";
+/** The Stories tab's last selected story. */
+const STORY_KEY = "imagestudio.storyId";
 /** The user's last Save-to choice (UX-009: it never changes by itself). */
 const SAVE_TO_KEY = "imagestudio.saveTo";
 const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp|tiff?|heic)$/i;
@@ -93,9 +97,18 @@ function readLastModel(): string {
 
 function readMode(): CreateMode {
   try {
-    return localStorage.getItem(MODE_KEY) === "video" ? "video" : "image";
+    const m = localStorage.getItem(MODE_KEY);
+    return m === "video" || m === "stories" ? m : "image";
   } catch {
     return "image";
+  }
+}
+
+function readStoryId(): string | null {
+  try {
+    return localStorage.getItem(STORY_KEY) || null;
+  } catch {
+    return null;
   }
 }
 
@@ -173,6 +186,24 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
   }, []);
   const videoRef = useRef<VideoPanelHandle>(null);
   const modeSwitch = <ModeSwitch value={mode} onChange={setMode} />;
+
+  // ---------- Stories: the selected story (remembered), and reload signals between panel and workspace ----------
+  const [storyId, setStoryIdState] = useState<string | null>(readStoryId);
+  const setStoryId = useCallback((id: string | null) => {
+    setStoryIdState(id);
+    try {
+      if (id) localStorage.setItem(STORY_KEY, id);
+      else localStorage.removeItem(STORY_KEY);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+  /** Bumped after a plan: the workspace remounts and loads the new shot list. */
+  const [planEpoch, setPlanEpoch] = useState(0);
+  /** Bumped when the workspace changed the story (title, status): the panel reloads its list. */
+  const [storyEpoch, setStoryEpoch] = useState(0);
+  /** A take or result opened from the workspace (takes aren't in the gallery list). */
+  const [storyItem, setStoryItem] = useState<ImageRecord | null>(null);
 
   // ---------- Save to: General | Vault (spec v6; the last choice is remembered, never switched by itself) ----------
   const [saveChoice, setSaveChoiceState] = useState<Destination | null>(readSaveTo);
@@ -758,9 +789,11 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         if (!ex) return [...js, { ...payload, modelName: "", prompt: "", startedAt: Date.now() }];
         return js.map((j) => (j.jobId === job.jobId ? { ...j, ...payload, ...(sealed ? { prompt: "" } : {}) } : j));
       });
-      if (payload.images.length) {
-        prependImages(payload.images);
-        addVaultLocal(payload.images.filter((r) => r.vault));
+      // Story takes (shotId) belong to their story's workspace, not the gallery.
+      const outputs = payload.images.filter((r) => !r.shotId);
+      if (outputs.length) {
+        prependImages(outputs);
+        addVaultLocal(outputs.filter((r) => r.vault));
       }
       if (job.status === "failed") toast.error("Generation failed", job.error ?? undefined);
     });
@@ -837,6 +870,16 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     })();
   }, [vault.generalEpoch, toast]);
 
+
+  /** New items at the top of the General gallery (e.g. an assembled story): merge page one in. */
+  const refreshGalleryTop = useCallback(async () => {
+    try {
+      const page = await api.listImages({ limit: PAGE, before: null });
+      prependImages([...page.items].reverse());
+    } catch {
+      /* the gallery catches up on the next load */
+    }
+  }, [prependImages]);
 
   // On lock: drop every vault record this screen holds (open lightbox, job card prompts/outputs).
   // The form's own vault values are handled by useVaultLockCycle above.
@@ -1175,6 +1218,12 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
 
   /** Job card thumbnail → open it in the right tab (clearing a filter that hides it). */
   const openFromJob = (id: string) => {
+    // A story take lives in its story, not the gallery: open it in the story lightbox.
+    const take = jobs.flatMap((j) => j.images).find((x) => x.id === id && x.shotId);
+    if (take) {
+      setStoryItem(take);
+      return;
+    }
     const inVault = vault.unlocked && vault.items.some((x) => x.id === id);
     const tab: GalleryTab = inVault ? "vault" : "general";
     const list = inVault ? vault.items : images;
@@ -1227,6 +1276,15 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         activeJobs={activeVideoJobs}
         modelNames={modelNames}
         history={images}
+      />
+      <StoriesPanel
+        hidden={mode !== "stories"}
+        active={active && mode === "stories"}
+        modeSwitch={modeSwitch}
+        selectedStoryId={storyId}
+        onSelectStory={setStoryId}
+        onPlanned={() => setPlanEpoch((n) => n + 1)}
+        refreshKey={storyEpoch}
       />
       <form
         ref={formRef}
@@ -1427,81 +1485,112 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
           onDismiss={(ids) => setJobs((js) => js.filter((x) => !ids.includes(x.jobId)))}
           onOpenImage={openFromJob}
         />
-        <div className="canvas__head">
-          <h2 className="canvas__title">Gallery</h2>
-          <GalleryTabs value={galleryTab} onChange={setGalleryTab} unlocked={vault.unlocked} exists={vault.exists} />
-          {(galleryTab === "general" || (vault.unlocked && !migrating)) && (
-            <GalleryFilterChips
-              value={filter}
-              onChange={(f) => {
-                setFilter(f);
-                setLightboxId(null);
-              }}
-            />
-          )}
-          <span className="hint canvas__count">
-            {totals && totals.items && !(galleryTab === "vault" && migrating)
-              ? filter === "all"
-                ? `${totals.items} item${totals.items === 1 ? "" : "s"}${totals.videos ? ` · ${totals.videos} video${totals.videos === 1 ? "" : "s"}` : ""}`
-                : `${totalFor(totals, filter)} ${filter === "video" ? (totalFor(totals, filter) === 1 ? "video" : "videos") : totalFor(totals, filter) === 1 ? "image" : "images"}`
-              : ""}
-          </span>
-          {vault.unlocked && (
-            <button type="button" className="btn btn--sm vault-lock-btn" onClick={() => void vault.lock()} title="Lock the vault now — its items disappear until you unlock">
-              <Icon name="lock" size={14} /> Lock vault
-            </button>
-          )}
-        </div>
-        <div id="gallery-panel" role="tabpanel" aria-labelledby={`gallery-tab-${galleryTab}`}>
-          {galleryTab === "general" ? (
-            <Gallery
-              items={shown}
-              filter={filter}
-              loadedCount={images.length}
-              modelNames={modelNames}
-              loading={loadingImages}
-              hasMore={hasMore}
-              onLoadMore={loadMore}
-              onOpen={(i) => setLightboxId(shown[i]?.id ?? null)}
-              scrollRoot={scrollRef}
-            />
-          ) : (
-            <>
-              {vault.migration && (vault.unlocked || migrating) && (
-                <MigrationView progress={vault.migration} onDone={vault.dismissMigration} />
+        {mode === "stories" ? (
+          <StoryWorkspace
+            key={`${storyId ?? "new"}:${planEpoch}`}
+            storyId={storyId}
+            jobs={jobs}
+            onOpenImage={setStoryItem}
+            onChanged={() => {
+              setStoryEpoch((n) => n + 1);
+              void refreshGalleryTop();
+            }}
+          />
+        ) : (
+          <>
+            <div className="canvas__head">
+              <h2 className="canvas__title">Gallery</h2>
+              <GalleryTabs value={galleryTab} onChange={setGalleryTab} unlocked={vault.unlocked} exists={vault.exists} />
+              {(galleryTab === "general" || (vault.unlocked && !migrating)) && (
+                <GalleryFilterChips
+                  value={filter}
+                  onChange={(f) => {
+                    setFilter(f);
+                    setLightboxId(null);
+                  }}
+                />
               )}
-              {!vault.status ? (
-                <div className="gallery__loading" role="status">
-                  <Icon name="refresh" className="spin" /> Loading…
-                </div>
-              ) : !vault.exists ? (
-                <VaultCreate generalCount={images.length} generalMore={hasMore} />
-              ) : !vault.unlocked ? (
-                <VaultLockScreen />
-              ) : !migrating ? (
+              <span className="hint canvas__count">
+                {totals && totals.items && !(galleryTab === "vault" && migrating)
+                  ? filter === "all"
+                    ? `${totals.items} item${totals.items === 1 ? "" : "s"}${totals.videos ? ` · ${totals.videos} video${totals.videos === 1 ? "" : "s"}` : ""}`
+                    : `${totalFor(totals, filter)} ${filter === "video" ? (totalFor(totals, filter) === 1 ? "video" : "videos") : totalFor(totals, filter) === 1 ? "image" : "images"}`
+                  : ""}
+              </span>
+              {vault.unlocked && (
+                <button type="button" className="btn btn--sm vault-lock-btn" onClick={() => void vault.lock()} title="Lock the vault now — its items disappear until you unlock">
+                  <Icon name="lock" size={14} /> Lock vault
+                </button>
+              )}
+            </div>
+            <div id="gallery-panel" role="tabpanel" aria-labelledby={`gallery-tab-${galleryTab}`}>
+              {galleryTab === "general" ? (
                 <Gallery
                   items={shown}
                   filter={filter}
-                  loadedCount={vault.items.length}
+                  loadedCount={images.length}
                   modelNames={modelNames}
-                  loading={vault.loading && vault.items.length === 0}
-                  hasMore={false}
-                  onLoadMore={() => {}}
+                  loading={loadingImages}
+                  hasMore={hasMore}
+                  onLoadMore={loadMore}
                   onOpen={(i) => setLightboxId(shown[i]?.id ?? null)}
                   scrollRoot={scrollRef}
-                  empty={
-                    filter === "video"
-                      ? { icon: "video", title: "No videos in the vault", text: "Set Save to: Vault before generating a video, or move one in from General." }
-                      : filter === "image"
-                        ? { icon: "image", title: "No images in the vault", text: "Set Save to: Vault before generating, or move images in from General." }
-                        : { icon: "lock", title: "Your vault is empty", text: "Set Save to: Vault on the Create panel, or open an item in General and choose Move to vault." }
-                  }
                 />
-              ) : null}
-            </>
-          )}
-        </div>
+              ) : (
+                <>
+                  {vault.migration && (vault.unlocked || migrating) && (
+                    <MigrationView progress={vault.migration} onDone={vault.dismissMigration} />
+                  )}
+                  {!vault.status ? (
+                    <div className="gallery__loading" role="status">
+                      <Icon name="refresh" className="spin" /> Loading…
+                    </div>
+                  ) : !vault.exists ? (
+                    <VaultCreate generalCount={images.length} generalMore={hasMore} />
+                  ) : !vault.unlocked ? (
+                    <VaultLockScreen />
+                  ) : !migrating ? (
+                    <Gallery
+                      items={shown}
+                      filter={filter}
+                      loadedCount={vault.items.length}
+                      modelNames={modelNames}
+                      loading={vault.loading && vault.items.length === 0}
+                      hasMore={false}
+                      onLoadMore={() => {}}
+                      onOpen={(i) => setLightboxId(shown[i]?.id ?? null)}
+                      scrollRoot={scrollRef}
+                      empty={
+                        filter === "video"
+                          ? { icon: "video", title: "No videos in the vault", text: "Set Save to: Vault before generating a video, or move one in from General." }
+                          : filter === "image"
+                            ? { icon: "image", title: "No images in the vault", text: "Set Save to: Vault before generating, or move images in from General." }
+                            : { icon: "lock", title: "Your vault is empty", text: "Set Save to: Vault on the Create panel, or open an item in General and choose Move to vault." }
+                      }
+                    />
+                  ) : null}
+                </>
+              )}
+            </div>
+          </>
+        )}
       </section>
+
+      <Lightbox
+        items={storyItem ? [storyItem] : []}
+        index={storyItem ? 0 : null}
+        onIndex={() => {}}
+        onClose={() => setStoryItem(null)}
+        onDeleted={() => {
+          setStoryItem(null);
+          setPlanEpoch((n) => n + 1);
+        }}
+        onUseSettings={(im) => {
+          setStoryItem(null);
+          void applySettings(im);
+        }}
+        modelNames={modelNames}
+      />
 
       <Lightbox
         items={shown}

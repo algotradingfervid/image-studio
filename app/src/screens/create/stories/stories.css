@@ -1,0 +1,129 @@
+/* ---------- Stories tab: left panel (story picker, cast, brief) ---------- */
+
+.story-picker {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.story-picker .select {
+  flex: 1;
+  min-width: 0;
+  text-overflow: ellipsis;
+}
+
+.story-picker .btn {
+  flex: none;
+}
+
+.story-delete {
+  font-size: 12px;
+}
+
+.story-cast {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 10px;
+  padding: 0;
+  list-style: none;
+}
+
+.story-cast__chip {
+  max-width: 100%;
+  padding-right: 5px;
+  color: var(--text);
+}
+
+.story-cast__name {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.story-cast__add {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.story-brief__row {
+  margin-top: 14px;
+}
+
+.story-aspect {
+  display: flex;
+}
+
+.story-aspect > button {
+  flex: 1;
+  width: auto;
+  height: 30px;
+  padding: 0 6px;
+}
+
+.story-style {
+  margin-top: 14px;
+}
+
+.story-llm .link-btn {
+  font-size: inherit;
+}
+
+/* Shared tick boxes (consent, adult). */
+.story-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: var(--text);
+  font-weight: 550;
+  cursor: pointer;
+}
+
+.story-check input {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  margin: 1px 0 0;
+  accent-color: var(--accent);
+}
+
+/* ---------- New character dialog ---------- */
+
+.character-dialog {
+  width: min(520px, calc(100vw - 48px));
+}
+
+.character-form {
+  display: grid;
+  gap: 16px;
+}
+
+.character-form .field + .field {
+  margin-top: 0;
+}
+
+.character-form__source {
+  display: flex;
+}
+
+.character-form__source > button {
+  flex: 1;
+}
+
+.character-form__ticks {
+  display: grid;
+  gap: 10px;
+}
+
+.character-dialog .dialog__foot {
+  flex-wrap: wrap;
+}
+
+.character-dialog__why {
+  flex: 1 1 100%;
+  margin: 0;
+  text-align: right;
+}
