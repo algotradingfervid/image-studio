@@ -516,7 +516,7 @@ pub async fn plan_story(core: &Arc<Core>, story_id: &str) -> Result<StoryView, S
     // A vault story whose vault locked meanwhile can't take the plan (it was only in memory).
     let mid_plan = |e: String| {
         if e.starts_with(ERR_LOCKED) {
-            "The vault locked while planning; unlock and plan again".to_string()
+            format!("{ERR_LOCKED}: The vault locked while planning; unlock and plan again")
         } else {
             e
         }

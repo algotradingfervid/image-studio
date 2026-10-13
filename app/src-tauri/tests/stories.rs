@@ -1307,7 +1307,7 @@ mod repo_tests {
         core.settings.save_llm(Some(format!("{}/v1", s.uri())), Some("m".into())).unwrap();
         assert_eq!(
             render::plan_story(&core, &story.id).await.unwrap_err(),
-            "The vault locked while planning; unlock and plan again"
+            "VAULT_LOCKED: The vault locked while planning; unlock and plan again"
         );
         assert!(!core.vault.is_unlocked());
         assert_eq!(render::plan_story(&core, &story.id).await.unwrap_err(), "VAULT_LOCKED: Unlock the vault to plan the story");
