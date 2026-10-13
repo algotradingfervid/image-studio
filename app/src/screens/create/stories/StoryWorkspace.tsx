@@ -20,6 +20,9 @@ const NEW_PREFIX = "new:";
  */
 const renderingStore = new Map<string, Record<string, string>>();
 
+/** Shot saves still running after their workspace unmounted, per story: the next load waits for them. */
+const pendingSaves = new Map<string, Promise<unknown>>();
+
 const blankShot = (storyId: string, n: number, cast: string[]): Shot => ({
   id: `${NEW_PREFIX}${n}`,
   storyId,
@@ -83,7 +86,7 @@ function Workspace({
   const [rendering, setRenderingState] = useState<Record<string, string>>(() => renderingStore.get(storyId) ?? {});
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<null | "plan" | "render" | "assemble" | "approve">(null);
-  const [confirm, setConfirm] = useState<null | { kind: "replan" } | { kind: "delete"; index: number }>(null);
+  const [confirm, setConfirm] = useState<null | { kind: "replan" } | { kind: "delete"; index: number; key: string }>(null);
   const [titleDraft, setTitleDraft] = useState<string | null>(null);
 
   const keyOf = useRef(new Map<string, string>());
@@ -95,6 +98,8 @@ function Workspace({
   shotsRef.current = shots;
   const renderingRef = useRef(rendering);
   renderingRef.current = rendering;
+  const toastRef = useRef(toast);
+  toastRef.current = toast;
   const onChangedRef = useRef(onChanged);
   onChangedRef.current = onChanged;
   const alive = useRef(true);
@@ -119,11 +124,15 @@ function Workspace({
   /** Adopt a server view. `withShots`: also replace the local shot list (no newer local edits). */
   const adopt = useCallback((v: StoryView, withShots = true) => {
     setView(v);
-    if (withShots) setShots(v.shots);
+    if (withShots) {
+      setShots(v.shots);
+      shotsRef.current = v.shots;
+    }
   }, []);
 
   const refetch = useCallback(async () => {
     try {
+      await pendingSaves.get(storyId);
       const v = await api.getStory(storyId);
       if (!alive.current) return;
       // Unsaved edits win over the refetched shot list.
@@ -157,9 +166,9 @@ function Workspace({
       adopt(res, unchanged);
       setSaveState(timer.current !== null ? "pending" : "idle");
     } catch (e) {
-      if (!alive.current) return;
-      setSaveState("error");
-      toast.error("Couldn't save the shots", e);
+      // The toast provider lives at the app root: report the failure even after this workspace is gone.
+      toast.error("Could not save your shot edits", e);
+      if (alive.current) setSaveState("error");
     }
   }, [storyId, adopt, toast]);
 
@@ -184,7 +193,8 @@ function Workspace({
   }, [runSave]);
 
   const edit = useCallback(
-    (next: Shot[]) => {
+    (list: Shot[]) => {
+      const next = list[0]?.continuity === "continues" ? [{ ...list[0], continuity: "cut" as const }, ...list.slice(1)] : list;
       version.current += 1;
       setShots(next);
       shotsRef.current = next;
@@ -198,10 +208,22 @@ function Workspace({
   // Leaving the story: send what's pending.
   useEffect(
     () => () => {
+      let p: Promise<unknown> | null = inflight.current;
       if (timer.current !== null) {
         window.clearTimeout(timer.current);
         timer.current = null;
-        void api.saveShots(storyId, toWire(shotsRef.current)).catch(() => {});
+        const wire = toWire(shotsRef.current);
+        const t = toastRef.current;
+        p = (inflight.current ?? Promise.resolve())
+          .then(() => api.saveShots(storyId, wire))
+          .catch((e) => t.error("Could not save your shot edits", e));
+      }
+      if (p) {
+        const mine = p.catch(() => {});
+        pendingSaves.set(storyId, mine);
+        void mine.finally(() => {
+          if (pendingSaves.get(storyId) === mine) pendingSaves.delete(storyId);
+        });
       }
     },
     [storyId],
@@ -329,6 +351,17 @@ function Workspace({
     setBusy("approve");
     try {
       await flush();
+      // The backend renders the next shot right away when it continues this one and has no takes.
+      const list = shotsRef.current;
+      const i = list.findIndex((s) => s.id === shotId);
+      const next = i >= 0 ? list[i + 1] : undefined;
+      if (next && next.continuity === "continues" && !takesByShot.get(next.id)?.length) {
+        const ok = await gpu.confirmStart(`render shot ${i + 2} (continues shot ${i + 1})`, "video", { licence: H3_LICENCE });
+        if (!ok) {
+          toast.info(`Not approved — approving shot ${i + 1} starts shot ${i + 2} on the GPU`);
+          return;
+        }
+      }
       const res = await api.approveTake(shotId, takeId);
       adopt(res.view, timer.current === null);
       if (res.queued) track([res.queued]);
@@ -534,7 +567,7 @@ function Workspace({
                   busy={!!busy}
                   onChange={(next) => edit(shots.map((x, j) => (j === i ? next : x)))}
                   onMove={(dir) => move(i, dir)}
-                  onDelete={() => setConfirm({ kind: "delete", index: i })}
+                  onDelete={() => setConfirm({ kind: "delete", index: i, key })}
                   onRender={() => void renderOne(s)}
                   onApprove={(takeId) => void approve(s.id, takeId)}
                 />
@@ -581,9 +614,9 @@ function Workspace({
               className="btn btn--danger"
               onClick={() => {
                 if (confirm?.kind !== "delete") return;
-                const i = confirm.index;
+                const k = confirm.key;
                 setConfirm(null);
-                edit(shots.filter((_, j) => j !== i));
+                edit(shots.filter((x) => (keyOf.current.get(x.id) ?? x.id) !== k));
               }}
             >
               <Icon name="trash" size={14} /> Delete shot
