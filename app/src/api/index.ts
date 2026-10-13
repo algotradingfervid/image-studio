@@ -8,6 +8,13 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getBackend, inTauri, type Unlisten } from "./backend";
 import type {
+  ApproveResult,
+  Character,
+  LlmStatus,
+  RenderedShot,
+  Shot,
+  Story,
+  StoryView,
   ImageRecord,
   AddLoraInput,
   ConnectionTest,
@@ -223,3 +230,24 @@ export function blobToBase64(blob: Blob): Promise<string> {
     r.readAsDataURL(blob);
   });
 }
+
+// ---- Stories ----
+export const listCharacters = () => call<Character[]>("list_characters");
+export const saveCharacter = (character: Character) => call<Character>("save_character", { character });
+export const deleteCharacter = (id: string) => call<void>("delete_character", { id });
+export const listStories = () => call<Story[]>("list_stories");
+export const createStory = (input: { brief: string; targetS: number; aspect: string; style: string; cast: string[] }) =>
+  callObj<StoryView>("create_story", input);
+export const updateStory = (story: Story) => call<StoryView>("update_story", { story });
+export const deleteStory = (id: string) => call<void>("delete_story", { id });
+export const getStory = (id: string) => call<StoryView>("get_story", { id });
+export const planStory = (id: string) => call<StoryView>("plan_story", { id });
+export const saveShots = (storyId: string, shots: Shot[]) => call<StoryView>("save_shots", { storyId, shots });
+export const renderShot = (shotId: string) => call<{ jobId: string }>("render_shot", { shotId });
+export const renderStory = (storyId: string) => call<RenderedShot[]>("render_story", { storyId });
+export const approveTake = (shotId: string, takeId: string) =>
+  call<ApproveResult>("approve_take", { shotId, takeId });
+export const assembleStory = (storyId: string) => call<StoryView>("assemble_story", { storyId });
+export const llmStatus = () => call<LlmStatus>("llm_status");
+export const saveLlmSettings = (baseUrl: string | null, model: string | null) =>
+  call<LlmStatus>("save_llm_settings", { baseUrl, model });

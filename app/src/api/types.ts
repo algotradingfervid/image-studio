@@ -349,6 +349,9 @@ export interface ImageRecord {
   vault?: boolean;
   /** Vault items: small JPEG preview for grid tiles (videos reuse the poster). */
   thumbPath?: string | null;
+  /** Stories: owning story / shot of a take. */
+  storyId?: string;
+  shotId?: string;
 }
 
 export interface ImagePage {
@@ -541,3 +544,82 @@ export const isConfigured = (s: Settings | null | undefined): boolean =>
 
 /** The GPU pod has to be started before work can run. */
 export const gpuIsOff = (g: GpuState | null | undefined): boolean => !!g && (g.status === "stopped" || g.status === "error");
+
+// ---- Stories ----
+
+export interface Character {
+  id: string;
+  name: string;
+  description: string;
+  source: "generated" | "real_person";
+  consent: boolean;
+  adult: boolean;
+  refIds: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DialogueLine {
+  speaker: string;
+  line: string;
+}
+
+export interface Shot {
+  id: string;
+  storyId: string;
+  position: number;
+  durationS: number;
+  characters: string[];
+  setting: string;
+  camera: string;
+  action: string;
+  dialogue: DialogueLine[];
+  continuity: "cut" | "continues";
+  approvedTakeId: string | null;
+}
+
+export interface Story {
+  id: string;
+  title: string;
+  logline: string;
+  brief: string;
+  targetS: number;
+  aspect: "16:9" | "9:16" | "1:1";
+  style: string;
+  cast: string[];
+  status: "draft" | "planned" | "assembled";
+  resultImageId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface StoryIssue {
+  shot: number | null;
+  message: string;
+}
+
+export interface StoryView {
+  story: Story;
+  cast: Character[];
+  shots: Shot[];
+  takes: ImageRecord[];
+  issues: StoryIssue[];
+}
+
+export interface RenderedShot {
+  shotId: string;
+  jobId: string;
+}
+
+export interface ApproveResult {
+  view: StoryView;
+  queued: RenderedShot | null;
+}
+
+export interface LlmStatus {
+  baseUrl: string;
+  model: string;
+  reachable: boolean;
+  models: string[];
+  error: string | null;
+}

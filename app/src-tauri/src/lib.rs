@@ -10,6 +10,7 @@ pub mod registry;
 pub mod runpod;
 pub mod settings;
 pub mod state;
+pub mod stories;
 pub mod status;
 pub mod tasks;
 pub mod timings;
