@@ -42,10 +42,18 @@ pub fn mentions_minor(text: &str) -> bool {
     }) || w.windows(2).any(|p| minor_age(&p[0]) && p[1] == "yo")
 }
 
-pub fn validate(story: &Story, shots: &[Shot], cast: &[Character]) -> Vec<Issue> {
+/// Story-level checks that must pass before planning or rendering: a brief,
+/// a cast, adults only, consent for real people, no minors in the brief, style
+/// or character descriptions.
+pub fn preflight(story: &Story, cast: &[Character]) -> Vec<Issue> {
     let mut out = Vec::new();
-    let name = |id: &str| cast.iter().find(|c| c.id == id).map(|c| c.name.clone()).unwrap_or_else(|| id.to_string());
     let story_issue = |out: &mut Vec<Issue>, m: String| out.push(Issue { shot: None, message: m });
+    if story.brief.trim().is_empty() {
+        story_issue(&mut out, "Write a brief first".into());
+    }
+    if story.cast.is_empty() || cast.is_empty() {
+        story_issue(&mut out, "Add at least one character to the cast first".into());
+    }
     for c in cast {
         if !c.adult {
             story_issue(&mut out, format!("{} is not confirmed as an adult (18+)", c.name));
@@ -60,6 +68,14 @@ pub fn validate(story: &Story, shots: &[Shot], cast: &[Character]) -> Vec<Issue>
     if mentions_minor(&story.brief) || mentions_minor(&story.style) {
         story_issue(&mut out, "The brief must describe adults only".into());
     }
+    out
+}
+
+/// `preflight` plus the shot rules.
+pub fn validate(story: &Story, shots: &[Shot], cast: &[Character]) -> Vec<Issue> {
+    let mut out = preflight(story, cast);
+    let name = |id: &str| cast.iter().find(|c| c.id == id).map(|c| c.name.clone()).unwrap_or_else(|| id.to_string());
+    let story_issue = |out: &mut Vec<Issue>, m: String| out.push(Issue { shot: None, message: m });
     if shots.is_empty() {
         story_issue(&mut out, "The story has no shots".into());
         return out;

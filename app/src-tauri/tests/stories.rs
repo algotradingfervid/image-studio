@@ -521,3 +521,103 @@ async fn assemble_requires_all_approved_and_saves_gallery_video() {
     assert_eq!(view.story.result_image_id.as_deref(), Some(again.id.as_str()));
     assert_eq!(view.story.status, "assembled");
 }
+
+// ----- fix round 1: no duplicate renders, pre-plan safety gate -----
+
+#[tokio::test]
+async fn second_render_of_a_shot_is_refused_while_the_first_runs() {
+    let (h, _server) = video_harness().await;
+    let (_, shot_ids) = seed_story(&h.core, &[("cut", 8)]);
+    let job = render::render_shot(&h.core, &shot_ids[0]).unwrap();
+    let e = render::render_shot(&h.core, &shot_ids[0]).unwrap_err();
+    assert_eq!(e, "Shot 1 is already rendering");
+    wait_video(&h, &job).await;
+    // Finished jobs no longer count (reroll).
+    let again = render::render_shot(&h.core, &shot_ids[0]).unwrap();
+    wait_video(&h, &again).await;
+}
+
+#[tokio::test]
+async fn render_story_twice_queues_each_shot_once() {
+    let (h, server) = video_harness().await;
+    let (story_id, _) = seed_story(&h.core, &[("cut", 8), ("cut", 8)]);
+    let first = render::render_story(&h.core, &story_id).unwrap();
+    assert_eq!(first.len(), 2);
+    assert!(render::render_story(&h.core, &story_id).unwrap().is_empty());
+    for (_, job) in &first {
+        wait_video(&h, job).await;
+    }
+    let runs = server.received_requests().await.unwrap().iter().filter(|r| r.url.path() == "/proxy/vid1/run").count();
+    assert_eq!(runs, 2);
+}
+
+/// Points the app's LLM settings at a mock LM Studio (models + chat).
+async fn mock_llm(core: &app_lib::state::Core, shots_json: String) -> MockServer {
+    let s = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "m"}]}))).mount(&s).await;
+    Mock::given(method("POST")).and(path("/v1/chat/completions")).respond_with(reply(&shots_json)).mount(&s).await;
+    core.settings.save_llm(Some(format!("{}/v1", s.uri())), Some("m".into())).unwrap();
+    s
+}
+
+#[tokio::test]
+async fn plan_story_refuses_unsafe_stories_without_contacting_the_llm() {
+    use app_lib::stories::store;
+    let (h, _server) = video_harness().await;
+    let (story_id, _) = seed_story(&h.core, &[("cut", 8)]);
+    let llm = mock_llm(&h.core, good_plan(8)).await;
+    let edit_story = |f: &dyn Fn(&mut Story)| {
+        let db = h.core.db.lock().unwrap();
+        let mut s = store::get_story(&db, &story_id).unwrap().unwrap();
+        f(&mut s);
+        store::save_story(&db, &s).unwrap();
+    };
+    let edit_mara = |f: &dyn Fn(&mut Character)| {
+        let db = h.core.db.lock().unwrap();
+        let mut c = store::get_character(&db, "c-mara").unwrap().unwrap();
+        f(&mut c);
+        store::save_character(&db, &c).unwrap();
+    };
+
+    edit_story(&|s| s.brief = "A teen heist on a rooftop".into());
+    let e = render::plan_story(&h.core, &story_id).await.unwrap_err();
+    assert!(e.contains("adults only"), "{e}");
+    edit_story(&|s| s.brief = "A heist on a rooftop".into());
+
+    edit_mara(&|c| c.adult = false);
+    let e = render::plan_story(&h.core, &story_id).await.unwrap_err();
+    assert_eq!(e, "Mara is not confirmed as an adult (18+)");
+    edit_mara(&|c| c.adult = true);
+
+    edit_mara(&|c| c.source = "real_person".into());
+    let e = render::plan_story(&h.core, &story_id).await.unwrap_err();
+    assert_eq!(e, "Mara is a real person without a consent tick");
+    assert!(llm.received_requests().await.unwrap().is_empty(), "nothing reached the LLM");
+
+    // Once safe, planning goes through and replaces the shots.
+    edit_mara(&|c| c.consent = true);
+    let view = render::plan_story(&h.core, &story_id).await.unwrap();
+    assert_eq!(view.story.status, "planned");
+    assert_eq!(view.shots.len(), 1);
+    assert!(view.issues.is_empty(), "{:?}", view.issues);
+}
+
+#[tokio::test]
+async fn story_view_of_a_fresh_draft_reports_cast_issues() {
+    use app_lib::stories::store;
+    let (h, _server) = video_harness().await;
+    let (story_id, _) = seed_story(&h.core, &[]);
+    {
+        let db = h.core.db.lock().unwrap();
+        let mut s = store::get_story(&db, &story_id).unwrap().unwrap();
+        s.status = "draft".into();
+        store::save_story(&db, &s).unwrap();
+        let mut c = store::get_character(&db, "c-mara").unwrap().unwrap();
+        c.adult = false;
+        store::save_character(&db, &c).unwrap();
+    }
+    let view = render::story_view(&h.core, &story_id).unwrap();
+    let msgs: Vec<&str> = view.issues.iter().map(|i| i.message.as_str()).collect();
+    assert_eq!(msgs, vec!["Mara is not confirmed as an adult (18+)"], "no 'no shots' issue on a draft");
+}

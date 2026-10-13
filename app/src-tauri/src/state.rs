@@ -1,7 +1,7 @@
 //! Shared application core: registry, database, settings, event sink and the
 //! in-memory job/task tables. Independent of Tauri so it can be tested.
 
-use crate::db::Db;
+use crate::db::{Db, ImageRecord};
 use crate::jobs::{Job, JobEntry};
 use crate::links::LinkResolver;
 use crate::pod::{Gpu, GpuState};
@@ -105,6 +105,9 @@ pub struct Core {
     pub gpu: Gpu,
     /// Encrypted vault (spec v6), at `<data_dir>/vault/`.
     pub vault: Vault,
+    /// Stories: shot id → job id of its latest render. An entry counts only
+    /// while that job is still in `jobs` (see `stories::render`).
+    pub story_renders: Mutex<HashMap<String, String>>,
 }
 
 impl Core {
@@ -133,6 +136,7 @@ impl Core {
             tasks: Mutex::new(HashMap::new()),
             refresh_lock: tokio::sync::Mutex::new(()),
             video_refresh_lock: tokio::sync::Mutex::new(()),
+            story_renders: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -164,6 +168,28 @@ impl CoreConfig {
     /// Encrypted vault files (spec v6).
     pub fn vault_dir(&self) -> PathBuf {
         self.data_dir.join("vault")
+    }
+
+    /// Removes a general record's files (media, poster, thumbnail). Only
+    /// files the app wrote (under `images/` or `videos/`) are touched.
+    pub fn remove_record_files(&self, rec: &ImageRecord) {
+        let owned = [self.images_dir(), self.videos_dir()];
+        let files = std::iter::once(&rec.path)
+            .chain(rec.poster_path.as_ref())
+            .chain(rec.thumb_path.as_ref());
+        for f in files {
+            let p = PathBuf::from(f);
+            if owned.iter().any(|d| p.starts_with(d)) {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
+    /// Deletes a general record's row, then its files.
+    pub fn delete_record(&self, db: &Db, rec: &ImageRecord) -> Result<(), String> {
+        db.delete_image(&rec.id)?;
+        self.remove_record_files(rec);
+        Ok(())
     }
 }
 
