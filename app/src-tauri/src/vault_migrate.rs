@@ -16,6 +16,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
+/// Stories v1 keeps story media (takes and assembled results) out of the vault.
+const ERR_STORY_MEDIA: &str = "Story videos stay in the general gallery for now";
+
 /// Test hook: `stop_after` simulates a crash after that many items.
 #[derive(Debug, Clone, Default)]
 pub struct MigrateOptions {
@@ -299,6 +302,9 @@ pub fn move_to_vault(core: &Core, id: &str) -> Result<ImageRecord, String> {
         .unwrap()
         .get_image(id)?
         .ok_or("Image not found")?;
+    if rec.story_id.is_some() {
+        return Err(ERR_STORY_MEDIA.into());
+    }
     if !core.vault.is_unlocked() {
         return Err(format!("{ERR_LOCKED}: Unlock the vault first"));
     }
@@ -443,6 +449,12 @@ fn migrate_inner(
             progress.done += 1;
             continue;
         };
+        if rec.story_id.is_some() {
+            // Story media stays in the general store (not listed by
+            // `all_image_ids`; guards journals that somehow name one).
+            progress.done += 1;
+            continue;
+        }
         let result: Result<(), String> = (|| {
             if let Some(item_id) = journal.done.get(id) {
                 // Encrypted copy already verified; only the originals are left.
