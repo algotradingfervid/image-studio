@@ -322,10 +322,10 @@ def test_h3ref_reference_dicts_accepted(registry):
 
 
 @pytest.mark.parametrize("model,patch,code", [
-    ("h3ref", {"references": []}, "INVALID_INPUT: h3ref needs 1-6 reference images"),
-    ("h3ref", {"references": None}, "INVALID_INPUT: h3ref needs 1-6 reference images"),
-    ("h3ref", {"references": REF_NAMES + ["is_abc_ref5.png", "is_abc_ref6.png", "is_abc_ref7.png"]},
-     "TOO_MANY_REFERENCES: h3ref accepts at most 6"),
+    ("h3ref", {"references": []}, "INVALID_INPUT: h3ref needs 1-7 reference images"),
+    ("h3ref", {"references": None}, "INVALID_INPUT: h3ref needs 1-7 reference images"),
+    ("h3ref", {"references": REF_NAMES + ["is_abc_ref5.png", "is_abc_ref6.png", "is_abc_ref7.png", "is_abc_ref8.png"]},
+     "TOO_MANY_REFERENCES: h3ref accepts at most 7"),
     ("h3", {"references": REF_NAMES[:1]}, "REFERENCES_NOT_SUPPORTED: h3"),
     ("ltx25", {"references": REF_NAMES[:1]}, "REFERENCES_NOT_SUPPORTED: ltx25"),
 ])
@@ -577,7 +577,7 @@ def test_video_registry_entries(registry):
     assert {f["role"] for f in h3["files"]} == {"unet", "clip", "video_vae", "audio_vae"}
     assert not any(f["gated"] for f in h3["files"])
     h3ref = get_video_model(registry, "h3ref")
-    assert h3ref["maxReferences"] == 6
+    assert h3ref["maxReferences"] == 7
     assert {f["role"] for f in h3ref["files"]} == {"unet", "clip", "video_vae", "audio_vae"}
     assert not any(f["gated"] for f in h3ref["files"])
     assert model_file_by_role(h3ref, "unet")["filename"] == \
@@ -668,11 +668,11 @@ def test_h3ref_without_first_frame_has_no_guide(registry):
     assert not any(n["class_type"] == "MiniMaxH3AddGuide" for n in g.values())
 
 
-def test_h3ref_accepts_six_references(registry):
+def test_h3ref_accepts_seven_references(registry):
     g, _ = build_video_workflow(
-        vparams("h3ref", references=[f"r{i}.png" for i in range(6)]), registry)
+        vparams("h3ref", references=[f"r{i}.png" for i in range(7)]), registry)
     ref = next(n for n in g.values() if n["class_type"] == "MiniMaxH3ReferenceToVideo")
-    assert "ref_images.ref_image_5" in ref["inputs"]
+    assert "ref_images.ref_image_6" in ref["inputs"]
 
 
 def test_h3ref_first_frame_stages(registry):

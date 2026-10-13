@@ -416,11 +416,11 @@ def test_h3ref_needs_its_own_unet(venv):
 
 
 @pytest.mark.parametrize("model,patch,code", [
-    ("h3ref", {}, "INVALID_INPUT: h3ref needs 1-6 reference images"),
-    ("h3ref", {"references": []}, "INVALID_INPUT: h3ref needs 1-6 reference images"),
-    ("h3ref", {"references": None}, "INVALID_INPUT: h3ref needs 1-6 reference images"),
+    ("h3ref", {}, "INVALID_INPUT: h3ref needs 1-7 reference images"),
+    ("h3ref", {"references": []}, "INVALID_INPUT: h3ref needs 1-7 reference images"),
+    ("h3ref", {"references": None}, "INVALID_INPUT: h3ref needs 1-7 reference images"),
     ("h3ref", {"references": "x"}, "INVALID_INPUT: references must be a list"),
-    ("h3ref", {"references": [ref()] * 7}, "TOO_MANY_REFERENCES: h3ref accepts at most 6"),
+    ("h3ref", {"references": [ref()] * 8}, "TOO_MANY_REFERENCES: h3ref accepts at most 7"),
     ("h3ref", {"references": [{"name": "a.png", "base64": "!!!"}]}, "INVALID_REFERENCE"),
     ("h3ref", {"references": [ref(b"GIF89a....", "a.gif")]}, "INVALID_REFERENCE"),
     ("h3ref", {"references": ["x"]}, "INVALID_REFERENCE"),

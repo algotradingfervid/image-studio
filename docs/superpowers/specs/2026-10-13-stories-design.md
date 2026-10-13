@@ -80,19 +80,40 @@ The steps:
   `response_format: {type: "json_schema", ...}` (structured output). If the server rejects
   `json_schema`, fall back to plain JSON with the schema in the prompt and parse the first
   JSON object. (To verify against LM Studio's API during implementation.)
-- System prompt contents (template in code, `stories/planner_prompt.txt`):
-  role ("film writer and director"); the character ids/names/descriptions it may use and
-  nothing else; all characters are adults; hard limits (shot 5–15 s, ≤ 2 characters per shot,
-  ≤ 2.5 spoken words per second, total ≈ target); "describe action that runs through the
-  whole shot, never a frozen frame"; dialogue must come from the story; one complete example.
+- System prompt (`SYSTEM_PROMPT` in `stories/planner.rs`; text from the H3 prompt research
+  `.superpowers/sdd/2026-10-13-stories/h3-prompt-research.md` §3b): role ("film writer and
+  director", fields are read literally by the video model, only what can be seen or heard,
+  present tense); the character names/descriptions it may use and nothing else; all
+  characters are adults; hard limits (shot 5–15 s, ≤ 2 characters per shot, ≤ 2.5 spoken words
+  per second **and the last line ends at least 1 s before the shot ends**, total ≈ target,
+  continuity rules, never describe face/hair/body/clothing); per-field writing rules:
+  - `voices` (once per film): one phrase per speaking character (gender, age range, pitch,
+    timbre, pace, accent), reused word for word in every shot;
+  - `setting`: 1–2 sentences, place, time, light, weather, 2–3 concrete props, no characters;
+  - `camera`: one sentence, shot size, who stands where, exactly one move from MiniMax's list
+    (static shot, push in, pull out, pan, truck, tilt, pedestal, arc, tracking, zoom, shake
+    slightly) with optional "with small/large amplitude", "at slow/fast speed";
+  - `action`: 3–6 sentences, 50–120 words, in order, ending on a held state; names, never
+    spoken words; the first sentence is the opening state before anyone speaks;
+  - `dialogue`: `line` word for word, no quotation marks, ends with . ? or !; `delivery` = what
+    the speaker does while saying it and how ("turns her head toward Ivo and says quietly");
+  - `sound`: 1–2 sentences of real sounds in the shot, no dialogue, no music.
+
+  One complete example (the research §3b rooftop plan, the first two cast names substituted;
+  a one-character variant when the cast has one character).
 - Output schema:
   ```json
   { "title": "…", "logline": "…",
-    "shots": [ { "duration_s": 10, "characters": ["mara"], "setting": "rooftop at night",
-                 "camera": "medium close-up, slow push-in", "continuity": "cut",
-                 "action": "…",
-                 "dialogue": [ {"speaker": "mara", "line": "…"} ] } ] }
+    "voices": [ {"name": "Mara", "voice": "a low, steady female voice with a calm pace"} ],
+    "shots": [ { "duration_s": 10, "characters": ["Mara"], "continuity": "cut",
+                 "setting": "…", "camera": "…", "action": "…",
+                 "dialogue": [ {"speaker": "Mara", "delivery": "…", "line": "…"} ],
+                 "sound": "…" } ] }
   ```
+  Names map to character ids (case-insensitive); an unknown name (in `characters`, `speaker`
+  or `voices`) becomes the issue "X is not in the cast". The plan's voices are saved on the
+  story (`Story.voices: [{characterId, voice}]`); a partial list is fine, and saving a story
+  drops entries for characters no longer in the cast.
 - Repair loop: on validation failure, send the previous output + the exact error list back
   (same conversation), up to 3 attempts; after that, show the best attempt with its errors
   for manual editing.
@@ -109,31 +130,103 @@ Runs after planning and after every manual edit. Per shot / story:
 | Dialogue speaker | speaker is one of the shot's characters |
 | Dialogue fit | total words in the shot ≤ 2.5 × duration_s |
 | Continuity | first shot is `cut`; `continues` requires the previous shot to share ≥ 1 character |
-| Adult rule | no character/action/dialogue text matches the under-18 term list (child, kid, minor, teen, schoolgirl, schoolboy, underage, "years old" with a number < 18, …) |
+| Delivery | each dialogue line's `delivery` ≤ 15 words, no double quotes |
+| Line quotes | dialogue `line` has no double quotes (quotes mean on-screen text to H3) |
+| Adult rule | no character/action/dialogue/delivery/sound text matches the under-18 term list (child, kid, minor, teen, schoolgirl, schoolboy, underage, "years old" with a number < 18, …); voice phrases (story-level, checked before planning and rendering and on the planned voices) also refuse girl/boy/girlish/boyish/childlike/childish |
 | Consent | every cast character: adult ticked; real_person → consent ticked |
 | Prompt length | compiled prompt ≤ 7,000 chars |
-| References | ≤ 6 images per shot (2 characters × 3 images); `h3ref` maxReferences raised 4 → 6 (node allows 9) |
+| References | ≤ 6 character images per shot (2 characters × 3 images); `h3ref` maxReferences is 7 = 6 character images + 1 first frame for a continuing shot (node allows 9) |
 
 ## 6. Prompt compiler (Rust)
 
-Fixed reference order per shot: character A images, then character B images (in cast order),
-numbered `<Picture 1>`…; the compiled text (H3 five-block style, from the PDF):
+The compiled text follows MiniMax H3's official ref2va "Context IR" format (MiniMax-H3
+`docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md`; research §1–§3a): six sections in fixed order,
+header on its own line, a blank line between sections. `compile_shot(story, shot, cast,
+has_first_frame)` returns the prompt and the character reference ids.
+
+Rules (deterministic):
+
+1. Subjects = the shot's characters in cast order, labelled `<Subject 1>`, `<Subject 2>`.
+   Pictures: all of subject 1's references, then subject 2's, as `<Picture 1>`…
+2. Continuing shot: the previous approved take's last frame is an extra reference appended
+   **last** (`<Picture M>`, M = character references + 1), with the anchor lines below, the
+   summary prefix `[keyframe completion + reference generation]` and the body opening
+   "The shot begins from <Picture M>." It is also still sent as the worker `initImage`
+   (frame-0 guide); the GPU spike decides whether to keep that.
+3. Names → labels: whole-word, case-sensitive cast names of the shot's characters become
+   `<Subject k>` in setting, camera, action, delivery and sound — never inside dialogue lines.
+4. Speaker ids `(S1)`, `(S2)` in order of first speech in the shot.
+5. Dialogue: `<Subject k> (Sx), [in {voice}, ]{delivery}: <d>[English] {line}</d>` — the voice
+   phrase (from `Story.voices`) only on that speaker's first line, omitted when the speaker
+   has none; a delivery without a speech verb (says, asks, answers, replies, whispers, …)
+   gets ", says:"; no delivery → "says:". Lines end with `.`, `?` or `!` (added when missing).
+6. Body order: frame anchor, camera, setting, action sentence 1, the dialogue lines in order,
+   the remaining action sentences, then (only with dialogue) "{last speaker} finishes the line
+   and closes their lips; nobody speaks for the rest of the shot.", then
+   "Only <Subject 1>[ and <Subject 2>] appear(s) in the shot."
+7. Style sentence: "The target video is in a {style head} style[ with {rest}]." (style split at
+   its first comma), or "The target video is in a live-action, cinematic style." when empty.
+8. `overall_soundscape`: the shot's `sound`, or "Natural ambient sound of {setting first
+   clause}, with soft footsteps and clothing movement." `non_diegetic_music`: always `N/A`
+   (music is an assembly concern; per-shot score would jump at every cut).
+9. Aspect and duration are request parameters, not prompt text. Compiled prompt ≤ 7,000 chars.
+   No negative/LIMITS block (the H3 graph uses `BasicGuider`: there is no negative branch).
+
+Template:
 
 ```
-ROLES:
-<Picture 1>, <Picture 2> are Mara: woman in her 30s, short black hair, green bomber jacket.
-Keep her face, hair, body and clothing identical to these pictures.
-SHOT ({duration}s, {aspect}, {camera}): {setting}.
-{action}
-Mara says: "…"
-LOOK: {style line, or "natural cinematic look"}
-SOUND: natural ambient sound of the setting. Dialogue is spoken aloud and lip-synced to the speaker.
-LIMITS: Hold identity and clothing from the pictures. No subtitles, no on-screen text,
-no watermark, no extra people, no face morphing.
+subject_definitions:
+<Subject 1> is {Name1}, the person in <Picture 1>[ and <Picture 2>]: {locked description 1}.
+<Subject 2> is {Name2}, the person in <Picture 3>: {locked description 2}.
+[<Picture M> is the first frame of [Shot 1], the last frame of the previous shot.]
+
+summary:
+[reference generation] The target video is a single continuous shot of <Subject 1>[ and <Subject 2>] in {setting first clause}.
+
+retention_analysis:
+<Subject 1> (appears in [Shot 1]): fully_preserved - {Name1}'s face, hair, body and clothing from <Picture 1>[ and <Picture 2>] are retained.
+<Subject 2> (appears in [Shot 1]): fully_preserved - {Name2}'s face, hair, body and clothing from <Picture 3> are retained.
+[<Picture M> ([Shot 1] first frame): fully_preserved - the shot starts exactly from this frame.]
+
+detailed_description:
+{style sentence}
+[Shot 1] [The shot begins from <Picture M>. ]{camera} {setting} {action 1} {dialogue} {action 2..} {closing} {scope}
+
+overall_soundscape:
+{sound or fallback}
+
+non_diegetic_music:
+N/A
 ```
 
-Locked descriptions and the style line are pasted verbatim into every shot. The compiled
-prompt, reference list and seed are stored with each take.
+Example (golden test in `compile.rs`; Mara 2 references, Ivo 1, style "35 mm film, warm
+grain", both voices set, a cut shot):
+
+```
+subject_definitions:
+<Subject 1> is Mara, the person in <Picture 1> and <Picture 2>: woman in her 30s, short black hair, green bomber jacket.
+<Subject 2> is Ivo, the person in <Picture 3>: man in his 40s, grey beard, dark wool coat.
+
+summary:
+[reference generation] The target video is a single continuous shot of <Subject 1> and <Subject 2> in a flat rooftop at night.
+
+retention_analysis:
+<Subject 1> (appears in [Shot 1]): fully_preserved - Mara's face, hair, body and clothing from <Picture 1> and <Picture 2> are retained.
+<Subject 2> (appears in [Shot 1]): fully_preserved - Ivo's face, hair, body and clothing from <Picture 3> are retained.
+
+detailed_description:
+The target video is in a 35 mm film style with warm grain.
+[Shot 1] A medium two-shot frames <Subject 1> on the left and <Subject 2> on the right at the rooftop's edge; the camera pushes in with small amplitude at slow speed. A flat rooftop at night, wet concrete shining under a single sodium lamp, a rusted water tank behind them and the city's lights spread out below in a light drizzle. <Subject 1> stands with her hands in her jacket pockets, watching the street below, while <Subject 2> leans on the low parapet beside her, rolling an unlit cigarette between his fingers. <Subject 1> (S1), in a low, steady female voice with a calm pace, turns her head toward <Subject 2> and says quietly: <d>[English] We leave tonight.</d> <Subject 2> (S2), in a deep, slightly hoarse male voice with a slow pace, stops rolling the cigarette, straightens up and answers with a tired half-smile: <d>[English] Then I'd better pack light.</d> He pockets the cigarette as <Subject 1> nods once and looks back out over the city. Both hold still in the drizzle as the camera completes its push-in. <Subject 2> finishes the line and closes their lips; nobody speaks for the rest of the shot. Only <Subject 1> and <Subject 2> appear in the shot.
+
+overall_soundscape:
+Light rain patters on the wet concrete and the metal water tank while distant city traffic hums far below. Fabric rustles softly as the two shift their weight, and the sodium lamp buzzes faintly overhead.
+
+non_diegetic_music:
+N/A
+```
+
+Locked descriptions, voices and the style sentence are pasted verbatim into every shot. The
+compiled prompt, reference list and seed are stored with each take.
 
 ## 7. Rendering
 
@@ -169,9 +262,11 @@ prompt, reference list and seed are stored with each take.
 - `characters(id, name, description, source[generated|real_person], consent INTEGER,
   adult INTEGER, refs_json, created_at, updated_at)`
 - `stories(id, title, logline, brief, target_s, aspect, style, cast_json,
-  status, result_image_id, sidecar_json, created_at, updated_at)` (no destination column in v1)
+  status, result_image_id, sidecar_json, created_at, updated_at, voices_json)` (no destination
+  column in v1; `voices_json` = `[{characterId, voice}]`)
 - `shots(id, story_id, position, duration_s, characters_json, setting, camera, action,
-  dialogue_json, continuity, approved_take_id)`
+  dialogue_json, continuity, approved_take_id, sound)` (`dialogue_json` =
+  `[{speaker, line, delivery}]`)
 - `images` gains nullable `story_id`, `shot_id` (takes and results); gallery queries exclude
   rows with `shot_id` set.
 - Character reference images use the existing references store (`refs_json` =
@@ -202,6 +297,11 @@ prompt, reference list and seed are stored with each take.
 
 ## 12. Out of scope (later, in this order of likely value)
 
-Vault stories, burned-in AI label, Voice references (`<Audio N>` per character), draft/final tiers (turbo LoRA), face-similarity
-QC, full consent registry (releases, ID, revocation), H3 edit path, colour grading/LUT,
-music bed, multi-pass planning.
+Vault stories, burned-in AI label, voice references (`<Audio N>` per character: the
+strongest cross-shot voice consistency in MiniMax's guide; needs per-character audio upload
+and a worker audio input), draft/final tiers (turbo LoRA), face-similarity QC, full consent
+registry (releases, ID, revocation), H3 edit path, colour grading/LUT, music bed, multi-pass
+planning, a story-level dialogue language (`[Language]` tag; v1 is `[English]`).
+Tuning to A/B on the GPU: `beta` (or `normal`) vs `simple` scheduler for h3ref (Comfy's r2v
+template note says beta/normal beat simple for reference-heavy prompts); `ref_image_size: max`
+(2048 px short edge) for identity-critical shots (stronger identity, slower).

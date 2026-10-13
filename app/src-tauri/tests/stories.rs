@@ -7,15 +7,42 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 fn mara() -> Character { Character { id: "c1".into(), name: "Mara".into(), description: "woman in her 30s".into(),
     source: "generated".into(), consent: false, adult: true, ref_ids: vec!["r1".into()], created_at: "t".into(), updated_at: "t".into() } }
 fn st(target: u32) -> Story { Story { id: "s1".into(), title: String::new(), logline: String::new(), brief: "A heist on a rooftop".into(),
-    target_s: target, aspect: "16:9".into(), style: String::new(), cast: vec!["c1".into()], status: "draft".into(),
+    target_s: target, aspect: "16:9".into(), style: String::new(), cast: vec!["c1".into()], voices: vec![], status: "draft".into(),
     result_image_id: None, created_at: "t".into(), updated_at: "t".into() } }
+#[test]
+fn partial_voices_are_accepted_and_stale_entries_dropped() {
+    use app_lib::stories::{cast_voices, compile::compile_shot, DialogueLine, Shot, Voice};
+    let v = |id: &str, voice: &str| Voice { character_id: id.into(), voice: voice.into() };
+    let cast = vec!["c1".to_string(), "c2".to_string()];
+    // c2 has no entry (fine); c9 left the cast; empty phrases and duplicates go.
+    let kept = cast_voices(&cast, vec![v("c1", " a calm voice "), v("c9", "gone"), v("c2", "  "), v("c1", "second")]);
+    assert_eq!(kept, vec![v("c1", "a calm voice")]);
+
+    let ivo = Character { id: "c2".into(), name: "Ivo".into(), ..mara() };
+    let story = Story { cast: cast.clone(), voices: kept, ..st(10) };
+    let shot = Shot {
+        id: "a".into(), story_id: "s1".into(), position: 1, duration_s: 10, characters: cast,
+        setting: "A roof".into(), camera: "Wide".into(), action: "They wait.".into(),
+        dialogue: vec![
+            DialogueLine { speaker: "c1".into(), line: "Go.".into(), delivery: String::new() },
+            DialogueLine { speaker: "c2".into(), line: "No.".into(), delivery: String::new() },
+        ],
+        sound: String::new(), continuity: "cut".into(), approved_take_id: None,
+    };
+    let p = compile_shot(&story, &shot, &[mara(), ivo], false).unwrap().prompt;
+    assert!(p.contains("<Subject 1> (S1), in a calm voice, says: <d>[English] Go.</d> <Subject 2> (S2) says: <d>[English] No.</d>"), "{p}");
+}
+
 fn reply(content: &str) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(json!({"choices": [{"message": {"role": "assistant", "content": content}}]}))
 }
 fn good_plan(dur: u32) -> String {
-    json!({"title": "Rooftop", "logline": "Mara escapes.", "shots": [
+    json!({"title": "Rooftop", "logline": "Mara escapes.",
+        "voices": [{"name": "mara", "voice": "a low, steady female voice with a calm pace"}],
+        "shots": [
         {"duration_s": dur, "characters": ["Mara"], "setting": "rooftop", "camera": "wide", "continuity": "cut",
-         "action": "Mara runs to the edge.", "dialogue": [{"speaker": "mara", "line": "Now."}]}]}).to_string()
+         "action": "Mara runs to the edge.", "dialogue": [{"speaker": "mara", "delivery": "glances back and says", "line": "Now."}],
+         "sound": "Wind gusts across the roof."}]}).to_string()
 }
 struct Seq(Vec<ResponseTemplate>, AtomicUsize);
 impl Respond for Seq { fn respond(&self, _: &Request) -> ResponseTemplate {
@@ -30,8 +57,19 @@ async fn plan_succeeds_and_maps_names_to_ids() {
     assert_eq!(out.attempts, 1);
     assert_eq!(out.shots[0].characters, vec!["c1"]);
     assert_eq!(out.shots[0].dialogue[0].speaker, "c1");
+    assert_eq!(out.shots[0].dialogue[0].delivery, "glances back and says");
+    assert_eq!(out.shots[0].sound, "Wind gusts across the roof.");
+    assert_eq!(out.voices, vec![app_lib::stories::Voice { character_id: "c1".into(), voice: "a low, steady female voice with a calm pace".into() }]);
     let body: serde_json::Value = s.received_requests().await.unwrap()[0].body_json().unwrap();
     assert_eq!(body["response_format"]["type"], "json_schema");
+    let schema = &body["response_format"]["json_schema"]["schema"];
+    assert_eq!(schema["properties"]["voices"]["items"]["required"], json!(["name", "voice"]));
+    assert!(schema["properties"]["shots"]["items"]["required"].as_array().unwrap().contains(&json!("sound")));
+    let system = body["messages"][0]["content"].as_str().unwrap();
+    assert!(system.contains("the last line must end at least 1 second before\n  the shot ends."), "{system}");
+    assert!(system.contains("- Mara: woman in her 30s"), "{system}");
+    assert!(system.contains("\"voices\": [{\"name\": \"Mara\""), "{system}");
+    assert!(!system.contains("Ivo"), "one-character cast gets the one-character example: {system}");
     assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
 }
 
@@ -84,6 +122,38 @@ async fn unknown_character_name_becomes_issue() {
     Mock::given(method("POST")).and(path("/v1/chat/completions")).respond_with(reply(&bad)).mount(&s).await;
     let out = planner::plan(&format!("{}/v1", s.uri()), "m", &st(10), &[mara()]).await.unwrap();
     assert!(out.issues.iter().any(|i| i.message.contains("Zed")), "{:?}", out.issues);
+}
+
+#[tokio::test]
+async fn unknown_voice_name_becomes_issue() {
+    let s = MockServer::start().await;
+    let bad = good_plan(10).replace("{\"name\":\"mara\"", "{\"name\":\"Zed\"");
+    assert!(bad.contains("Zed"), "{bad}");
+    Mock::given(method("POST")).and(path("/v1/chat/completions")).respond_with(reply(&bad)).mount(&s).await;
+    let out = planner::plan(&format!("{}/v1", s.uri()), "m", &st(10), &[mara()]).await.unwrap();
+    assert!(out.issues.iter().any(|i| i.shot.is_none() && i.message == "Zed is not in the cast"), "{:?}", out.issues);
+    assert!(out.voices.is_empty());
+}
+
+#[tokio::test]
+async fn planned_minor_voice_becomes_issue() {
+    let s = MockServer::start().await;
+    let bad = good_plan(10).replace("a low, steady female voice with a calm pace", "a young girl's voice");
+    Mock::given(method("POST")).and(path("/v1/chat/completions")).respond_with(reply(&bad)).mount(&s).await;
+    let out = planner::plan(&format!("{}/v1", s.uri()), "m", &st(10), &[mara()]).await.unwrap();
+    assert!(out.issues.iter().any(|i| i.message == "Mara's voice must describe an adult; stories use adults only"), "{:?}", out.issues);
+    let system = planner::system_prompt(&st(10), &[mara()]);
+    assert!(system.contains("Example: \"A medium shot frames Mara in the center;"), "{system}");
+    assert!(!system.contains("the other character"), "{system}");
+}
+
+#[test]
+fn two_character_cast_gets_the_research_example_with_its_names() {
+    let ivo = Character { id: "c2".into(), name: "Ivo".into(), ..mara() };
+    let p = planner::system_prompt(&st(10), &[mara(), ivo]);
+    assert!(p.contains("\"delivery\": \"turns her head toward Ivo and says quietly\", \"line\": \"We leave tonight.\""), "{p}");
+    assert!(p.contains("Example: \"A medium two-shot frames Mara on the left and Ivo on the right;"), "{p}");
+    assert!(p.contains("The first sentence of action is the opening\n  state before anyone speaks."), "{p}");
 }
 
 #[tokio::test]
@@ -142,7 +212,7 @@ fn merge_shots_renumbers_keeps_ids_and_clears_edited_approvals() {
     let shot = |id: &str, pos: u32, approved: Option<&str>| Shot {
         id: id.into(), story_id: "s1".into(), position: pos, duration_s: 8, characters: vec!["c1".into()],
         setting: "roof".into(), camera: "wide".into(), action: "walks".into(), dialogue: vec![],
-        continuity: "cut".into(), approved_take_id: approved.map(String::from),
+        sound: String::new(), continuity: "cut".into(), approved_take_id: approved.map(String::from),
     };
     let existing = vec![shot("a", 1, Some("ta")), shot("b", 2, Some("tb"))];
     let mut edited_b = shot("b", 9, Some("tb"));
@@ -362,7 +432,7 @@ mod render_harness {
         let story = Story {
             id: "s-1".into(), title: "Rooftop".into(), logline: String::new(), brief: "A heist on a rooftop".into(),
             target_s: shots.iter().map(|s| s.1).sum(), aspect: "16:9".into(), style: String::new(),
-            cast: vec![mara.id.clone()], status: "planned".into(), result_image_id: None,
+            cast: vec![mara.id.clone()], voices: vec![], status: "planned".into(), result_image_id: None,
             created_at: "t".into(), updated_at: "t".into(),
         };
         let list: Vec<Shot> = shots
@@ -372,8 +442,8 @@ mod render_harness {
                 id: format!("shot-{}", i + 1), story_id: story.id.clone(), position: i as u32 + 1, duration_s: *dur,
                 characters: vec![mara.id.clone()], setting: "rooftop at night".into(), camera: "wide".into(),
                 action: "Mara runs to the edge.".into(),
-                dialogue: vec![DialogueLine { speaker: mara.id.clone(), line: "Now.".into() }],
-                continuity: cont.to_string(), approved_take_id: None,
+                dialogue: vec![DialogueLine { speaker: mara.id.clone(), line: "Now.".into(), delivery: String::new() }],
+                sound: String::new(), continuity: cont.to_string(), approved_take_id: None,
             })
             .collect();
         let db = core.db.lock().unwrap();
@@ -423,7 +493,10 @@ async fn render_shot_queues_h3ref_job_with_compiled_prompt_and_refs() {
     assert_eq!(body["resolution"], "1344x768");
     assert_eq!(body["durationS"], 8.0);
     assert_eq!(body["references"].as_array().unwrap().len(), 2);
-    assert!(body["prompt"].as_str().unwrap().starts_with("ROLES:\n<Picture 1>, <Picture 2> are Mara"), "{}", body["prompt"]);
+    let prompt = body["prompt"].as_str().unwrap();
+    assert!(prompt.starts_with("subject_definitions:\n<Subject 1> is Mara, the person in <Picture 1> and <Picture 2>: woman in her 30s, short black hair.\n\nsummary:\n[reference generation] "), "{prompt}");
+    assert!(prompt.contains("<Subject 1> (S1) says: <d>[English] Now.</d>"), "{prompt}");
+    assert!(!prompt.contains("<Picture 3>"), "{prompt}");
     assert!(body.get("initImage").is_none());
     let (page, _) = h.core.db.lock().unwrap().list_images(100, None).unwrap();
     assert!(page.iter().all(|r| r.id != rec.id), "takes stay out of the gallery");
@@ -468,7 +541,15 @@ async fn approving_a_shot_queues_the_continuing_shot_with_its_last_frame() {
     wait_video(&h, &queued.1).await;
     let body = last_run_input(&server).await;
     assert!(body["initImage"]["base64"].as_str().unwrap().len() > 100);
-    assert_eq!(body["references"].as_array().unwrap().len(), 2);
+    // 2 character refs + the previous shot's last frame as <Picture 3>.
+    let refs = body["references"].as_array().unwrap();
+    assert_eq!(refs.len(), 3);
+    assert_eq!(refs[2]["base64"], body["initImage"]["base64"], "the frame is the last reference");
+    let prompt = body["prompt"].as_str().unwrap();
+    assert!(prompt.contains("\n<Picture 3> is the first frame of [Shot 1], the last frame of the previous shot.\n"), "{prompt}");
+    assert!(prompt.contains("summary:\n[keyframe completion + reference generation] "), "{prompt}");
+    assert!(prompt.contains("<Picture 3> ([Shot 1] first frame): fully_preserved - the shot starts exactly from this frame."), "{prompt}");
+    assert!(prompt.contains("[Shot 1] The shot begins from <Picture 3>. wide."), "{prompt}");
     // A take of another shot can't be approved here.
     let e = render::approve_take(&h.core, &shot_ids[1], &take.id).unwrap_err();
     assert!(e.contains("another shot"), "{e}");

@@ -6,11 +6,17 @@ pub const MAX_CAST_PER_SHOT: usize = 2;
 pub const WORDS_PER_S: f64 = 2.5;
 pub const TOTAL_TOLERANCE: f64 = 0.15;
 pub const MAX_REFS_PER_SHOT: usize = 6;
+pub const MAX_DELIVERY_WORDS: usize = 15;
+const DOUBLE_QUOTES: &[char] = &['"', '\u{201C}', '\u{201D}'];
 
 const MINOR_TERMS: &[&str] = &[
     "child", "children", "kid", "kids", "teen", "teens", "teenage", "teenager", "teenagers",
     "schoolgirl", "schoolgirls", "schoolboy", "schoolboys", "underage", "preteen", "preteens",
     "toddler", "toddlers", "infant", "infants", "loli", "shota",
+];
+
+const VOICE_MINOR_TERMS: &[&str] = &[
+    "girl", "girls", "boy", "boys", "girlish", "boyish", "childlike", "childish",
 ];
 
 const NUMBER_WORDS: &[&str] = &[
@@ -68,7 +74,22 @@ pub fn preflight(story: &Story, cast: &[Character]) -> Vec<Issue> {
     if mentions_minor(&story.brief) || mentions_minor(&story.style) {
         story_issue(&mut out, "The brief must describe adults only".into());
     }
+    for v in &story.voices {
+        let name = cast.iter().find(|c| c.id == v.character_id).map(|c| c.name.as_str()).unwrap_or(&v.character_id);
+        if voice_mentions_minor(&v.voice) {
+            story_issue(&mut out, format!("{name}'s voice must describe an adult; stories use adults only"));
+        }
+        if v.voice.contains(DOUBLE_QUOTES) {
+            story_issue(&mut out, format!("{name}'s voice has double quotes; remove them"));
+        }
+    }
     out
+}
+
+/// Voice phrases also refuse "girl"/"boy" words ("a young girl's voice"), which other
+/// fields allow ("girls' night out").
+fn voice_mentions_minor(voice: &str) -> bool {
+    mentions_minor(voice) || words(voice).iter().any(|w| VOICE_MINOR_TERMS.contains(&w.as_str()))
 }
 
 /// `preflight` plus the shot rules.
@@ -108,8 +129,19 @@ pub fn validate(story: &Story, shots: &[Shot], cast: &[Character]) -> Vec<Issue>
             if !s.characters.contains(&d.speaker) {
                 push(format!("{} speaks but is not in this shot", name(&d.speaker)));
             }
+            if d.line.contains(DOUBLE_QUOTES) {
+                push(format!("{}'s line has double quotes; write the words without quotation marks", name(&d.speaker)));
+            }
+            if d.delivery.contains(DOUBLE_QUOTES) {
+                push(format!("{}'s delivery has double quotes; remove them", name(&d.speaker)));
+            }
+            let n = words(&d.delivery).len();
+            if n > MAX_DELIVERY_WORDS {
+                push(format!("{}'s delivery has {n} words; keep it to {MAX_DELIVERY_WORDS} or fewer", name(&d.speaker)));
+            }
         }
-        if [&s.action, &s.setting, &s.camera].iter().any(|t| mentions_minor(t)) || s.dialogue.iter().any(|d| mentions_minor(&d.line)) {
+        if [&s.action, &s.setting, &s.camera, &s.sound].iter().any(|t| mentions_minor(t))
+            || s.dialogue.iter().any(|d| mentions_minor(&d.line) || mentions_minor(&d.delivery)) {
             push("Stories use adults only; remove the reference to a minor".into());
         }
         if s.continuity == "continues" {
@@ -142,7 +174,7 @@ mod tests {
         Story {
             id: "s1".into(), title: "T".into(), logline: String::new(), brief: "two adults on a roof".into(), target_s,
             aspect: "16:9".into(), style: "cinematic".into(), cast: cast.iter().map(|c| c.to_string()).collect(),
-            status: "draft".into(), result_image_id: None, created_at: String::new(), updated_at: String::new(),
+            voices: vec![], status: "draft".into(), result_image_id: None, created_at: String::new(), updated_at: String::new(),
         }
     }
     fn shot(id: &str, position: u32, duration_s: u32, characters: &[&str], continuity: &str) -> Shot {
@@ -150,7 +182,7 @@ mod tests {
             id: id.into(), story_id: "s1".into(), position, duration_s,
             characters: characters.iter().map(|c| c.to_string()).collect(),
             setting: "roof".into(), camera: "wide".into(), action: "walks".into(), dialogue: vec![],
-            continuity: continuity.into(), approved_take_id: None,
+            sound: String::new(), continuity: continuity.into(), approved_take_id: None,
         }
     }
 
@@ -170,7 +202,7 @@ mod tests {
 }
 #[test] fn dialogue_too_long_and_wrong_speaker() {
     let mut s = shot("a", 1, 5, &["c1"], "cut");
-    s.dialogue = vec![DialogueLine { speaker: "c2".into(), line: "one two three four five six seven eight nine ten eleven twelve thirteen".into() }];
+    s.dialogue = vec![DialogueLine { speaker: "c2".into(), line: "one two three four five six seven eight nine ten eleven twelve thirteen".into(), delivery: String::new() }];
     let i = validate(&story(5, &["c1", "c2"]), &[s], &[ch("c1","Mara"), ch("c2","Ivo")]);
     assert!(i.iter().any(|x| x.message.contains("words")));
     assert!(i.iter().any(|x| x.message.contains("Ivo") && x.message.contains("not in this shot")));
@@ -217,5 +249,34 @@ mod tests {
     let mut b = ch("c2","Ivo"); b.ref_ids = vec!["5".into(),"6".into(),"7".into()];
     let i = validate(&story(8, &["c1","c2"]), &[shot("a",1,8,&["c1","c2"],"cut")], &[a, b]);
     assert!(i.iter().any(|x| x.message.contains("6 reference images")));
+}
+#[test] fn delivery_length_and_quotes() {
+    let line = |l: &str, d: &str| DialogueLine { speaker: "c1".into(), line: l.into(), delivery: d.into() };
+    let mut s = shot("a", 1, 10, &["c1"], "cut");
+    s.dialogue = vec![line("Fine.", "turns to the window and says quietly")];
+    assert!(validate(&story(10, &["c1"]), &[s.clone()], &[ch("c1","Mara")]).is_empty());
+    s.dialogue = vec![
+        line("He said \"go\".", "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen"),
+        line("Ok.", "says \u{201C}softly\u{201D}"),
+    ];
+    let i = validate(&story(10, &["c1"]), &[s], &[ch("c1","Mara")]);
+    assert!(i.iter().any(|x| x.message.contains("delivery has 16 words")), "{i:?}");
+    assert!(i.iter().any(|x| x.message.contains("line has double quotes")), "{i:?}");
+    assert!(i.iter().any(|x| x.message.contains("delivery has double quotes")), "{i:?}");
+}
+#[test] fn voice_phrases_must_describe_adults() {
+    let with_voice = |v: &str| Story {
+        voices: vec![crate::stories::Voice { character_id: "c1".into(), voice: v.into() }],
+        ..story(8, &["c1"])
+    };
+    let cast = [ch("c1", "Mara")];
+    for v in ["a young girl's voice", "a teenage boy's voice", "a high, childlike voice"] {
+        let i = preflight(&with_voice(v), &cast);
+        assert!(i.iter().any(|x| x.shot.is_none() && x.message == "Mara's voice must describe an adult; stories use adults only"), "{v}: {i:?}");
+    }
+    assert!(preflight(&with_voice("a low, steady female voice in her 30s"), &cast).is_empty());
+    // validate() (used after planning) runs the same check.
+    let i = validate(&with_voice("a teenage boy's voice"), &[shot("a", 1, 8, &["c1"], "cut")], &cast);
+    assert!(i.iter().any(|x| x.message.contains("voice must describe an adult")), "{i:?}");
 }
 }
