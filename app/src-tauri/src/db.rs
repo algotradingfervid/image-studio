@@ -422,11 +422,12 @@ impl Db {
         Ok(n.max(0) as usize)
     }
 
-    /// Every record id, oldest first (for the vault migration).
+    /// Every record id, oldest first (for the vault migration). Story media
+    /// (rows with `story_id`) is left out: it stays in the general store.
     pub fn all_image_ids(&self) -> Result<Vec<String>, String> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id FROM images ORDER BY seq ASC")
+            .prepare("SELECT id FROM images WHERE story_id IS NULL ORDER BY seq ASC")
             .map_err(e)?;
         let ids = stmt
             .query_map([], |r| r.get(0))

@@ -784,3 +784,62 @@ fn changing_the_password_to_the_same_one_is_refused() {
     v.lock();
     v.unlock(PW).unwrap();
 }
+
+/// Stories v1: a plain image plus story media (a take and an assembled result).
+fn seed_story_media(h: &Harness) {
+    let imgs = h.core.cfg.images_dir();
+    let vids = h.core.cfg.videos_dir();
+    std::fs::create_dir_all(&imgs).unwrap();
+    std::fs::create_dir_all(&vids).unwrap();
+    let db = h.core.db.lock().unwrap();
+    let p = imgs.join("plain.png");
+    std::fs::write(&p, png(1, 8, 8)).unwrap();
+    db.insert_image(&record("plain", KIND_IMAGE, &p, "2026-01-01T00:00:00Z")).unwrap();
+    let t = vids.join("take.mp4");
+    std::fs::write(&t, mp4(2)).unwrap();
+    let mut take = record("take", KIND_VIDEO, &t, "2026-01-02T00:00:00Z");
+    take.story_id = Some("s1".into());
+    take.shot_id = Some("sh1".into());
+    db.insert_image(&take).unwrap();
+    let r = vids.join("result.mp4");
+    std::fs::write(&r, mp4(3)).unwrap();
+    let mut result = record("result", KIND_VIDEO, &r, "2026-01-03T00:00:00Z");
+    result.story_id = Some("s1".into());
+    db.insert_image(&result).unwrap();
+}
+
+#[test]
+fn migration_leaves_story_media_in_general() {
+    let h = harness("http://127.0.0.1:1");
+    seed_story_media(&h);
+    h.core.vault.create(PW, KdfParams::fast()).unwrap();
+    let report = vault_migrate::migrate(&h.core, MigrateOptions::default()).unwrap();
+    assert_eq!(report.phase, "done");
+    assert_eq!((report.done, report.total, report.errors), (1, 1, 0));
+    assert_eq!((report.counts.images, report.counts.videos), (1, 0));
+    assert!(!vault_migrate::migration_pending(&h.core));
+    let items = h.core.vault.items().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].source_id.as_deref(), Some("plain"));
+    let db = h.core.db.lock().unwrap();
+    assert!(db.get_image("plain").unwrap().is_none());
+    assert!(db.get_image("take").unwrap().is_some());
+    assert!(db.get_image("result").unwrap().is_some());
+    assert!(h.core.cfg.videos_dir().join("take.mp4").exists());
+    assert!(h.core.cfg.videos_dir().join("result.mp4").exists());
+}
+
+#[test]
+fn move_to_vault_refuses_story_media() {
+    let h = harness("http://127.0.0.1:1");
+    seed_story_media(&h);
+    h.core.vault.create(PW, KdfParams::fast()).unwrap();
+    for id in ["take", "result"] {
+        assert_eq!(
+            vault_migrate::move_to_vault(&h.core, id).unwrap_err(),
+            "Story videos stay in the general gallery for now"
+        );
+        assert!(h.core.db.lock().unwrap().get_image(id).unwrap().is_some());
+    }
+    assert!(h.core.vault.items().unwrap().is_empty());
+}
