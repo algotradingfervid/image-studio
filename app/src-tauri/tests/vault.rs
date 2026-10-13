@@ -158,11 +158,14 @@ fn files_in(dir: &Path) -> usize {
     walk(dir).len()
 }
 
-/// Every byte of the data dir outside `vault/` plus the sqlite files.
+/// Every byte of the data dir outside the vault's sealed folders (`vault/blobs`,
+/// `vault/items`, `vault/stories`, `vault/characters`) plus the sqlite files.
 fn plaintext_areas(h: &Harness) -> Vec<(PathBuf, Vec<u8>)> {
+    let vault = h.core.cfg.vault_dir();
+    let sealed = ["blobs", "items", "stories", "characters"].map(|d| vault.join(d));
     walk(h.dir.path())
         .into_iter()
-        .filter(|p| !p.starts_with(h.core.cfg.vault_dir()))
+        .filter(|p| !sealed.iter().any(|d| p.starts_with(d)))
         .map(|p| {
             let b = std::fs::read(&p).unwrap();
             (p, b)
@@ -893,4 +896,345 @@ fn move_to_vault_refuses_story_media() {
         assert!(h.core.db.lock().unwrap().get_image(id).unwrap().is_some());
     }
     assert!(h.core.vault.items().unwrap().is_empty());
+}
+
+// ----- vault stories: render, approve, assemble, export, delete -----
+
+use app_lib::pod::Profile;
+use app_lib::stories::{render, repo, Character, Shot, Story, StoryDoc};
+
+/// The worker's take fixture: a tiny moov-first MP4 with audio (ffmpeg), or a
+/// header-only stand-in when ffmpeg is missing (nothing decodes it then).
+fn worker_clip() -> Vec<u8> {
+    let Ok(ff) = app_lib::stories::ffmpeg::find_ffmpeg() else {
+        return mp4(7);
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("clip.mp4");
+    let st = std::process::Command::new(&ff)
+        .args([
+            "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=c=blue:s=320x180:d=1:r=24",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+            "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", "-y",
+        ])
+        .arg(&p)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    std::fs::read(&p).unwrap()
+}
+
+fn offset_of(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+fn has_ffmpeg() -> bool {
+    let ok = app_lib::stories::ffmpeg::find_ffmpeg().is_ok();
+    if !ok {
+        eprintln!("ffmpeg not installed; skipping the assembly part");
+    }
+    ok
+}
+
+/// Every video job completes with `video` (reported at its real size) and `poster`.
+struct VideoDone {
+    video: Vec<u8>,
+    poster: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+impl Respond for VideoDone {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let out = json!({"video": {"base64": b64(&self.video), "width": self.width, "height": self.height, "fps": 24,
+                "durationS": 1.0, "hasAudio": true}, "poster": {"base64": b64(&self.poster)}, "timings": {"totalMs": 900}});
+        ResponseTemplate::new(200).set_body_json(json!({"status": "COMPLETED", "delayTime": 1, "executionTime": 2, "output": out}))
+    }
+}
+
+/// The RunPod REST API with a running video pod `vid1`, and that pod's worker.
+async fn video_pod_server(video: Vec<u8>, poster: Vec<u8>, width: u32, height: u32) -> MockServer {
+    let server = MockServer::start().await;
+    let pod = json!({"id": "vid1", "name": "image-studio-video-gpu", "status": "RUNNING", "cost": 2.39,
+        "gpu": {"id": "NVIDIA H200", "count": 1}, "dataCenterId": "CA-MTL-3",
+        "createdAt": "2026-10-09T10:00:00Z", "startedAt": "2026-10-09T10:00:05Z", "env": {}});
+    Mock::given(method("GET"))
+        .and(path("/v2/pods"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pods": [pod.clone()], "pagination": {"hasNextPage": false}})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/pods/vid1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pod))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/network-volumes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"networkVolumes": [
+            {"id": "v7hzxkm304", "name": "image-studio-video", "size": 150, "dataCenter": "CA-MTL-3"}]})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/proxy/vid1/ping"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ok"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/proxy/vid1/health"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"jobs": {"inQueue": 0, "inProgress": 0},
+            "workers": {"idle": 1, "running": 0}, "ready": true})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/proxy/vid1/run"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "rp-video", "status": "IN_QUEUE"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex("/proxy/vid1/status/.*"))
+        .respond_with(VideoDone { video, poster, width, height })
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Adopts the mocked running video pod.
+async fn adopt_video_pod(h: &Harness) {
+    pod::adopt_for(&h.core, Profile::Video).await.unwrap();
+    for _ in 0..500 {
+        if pod::state_for(&h.core, Profile::Video).status == GpuStatus::Running {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the mocked video pod never became ready");
+}
+
+/// `input` of the last `/run` the pod received.
+async fn last_run_input(server: &MockServer) -> Value {
+    let reqs = server.received_requests().await.unwrap();
+    let run = reqs.iter().rev().find(|r| r.url.path() == "/proxy/vid1/run").expect("no /run");
+    run.body_json::<Value>().unwrap()["input"].clone()
+}
+
+fn character(name: &str) -> Character {
+    Character {
+        id: uuid::Uuid::new_v4().to_string(), name: name.into(), description: "woman in her 30s, short black hair".into(),
+        source: "generated".into(), consent: false, adult: true, ref_ids: vec![], ref_paths: vec![], vault: false,
+        created_at: "t".into(), updated_at: "t".into(),
+    }
+}
+
+fn story_draft(title: &str, brief: &str) -> Story {
+    Story {
+        id: uuid::Uuid::new_v4().to_string(), title: title.into(), logline: String::new(), brief: brief.into(), target_s: 8,
+        aspect: "16:9".into(), style: String::new(), cast: vec![], voices: vec![], status: "planned".into(),
+        result_image_id: None, vault: false, created_at: "t".into(), updated_at: "t".into(),
+    }
+}
+
+fn shot(story_id: &str, position: u32, character: &str, action: &str) -> Shot {
+    Shot {
+        id: uuid::Uuid::new_v4().to_string(), story_id: story_id.into(), position, duration_s: 8,
+        characters: vec![character.into()], setting: "rooftop at night".into(), camera: "wide".into(), action: action.into(),
+        dialogue: vec![], sound: String::new(), continuity: "cut".into(), approved_take_id: None,
+    }
+}
+
+/// A vault character "Mara" (one sealed reference) cast in a vault story with the given shots.
+/// Returns (face ref id, character, story, shot ids).
+fn seed_vault_story(h: &Harness, title: &str, brief: &str, shots: &[(&str, &str)]) -> (String, Character, Story, Vec<String>) {
+    let face = vault_migrate::import_reference_to_vault(&h.core, &png(3, 64, 64)).unwrap();
+    let mara = repo::save_character(&h.core, &Character { ref_ids: vec![face.ref_id.clone()], vault: true, ..character("Mara") }).unwrap();
+    let story = repo::save_story(
+        &h.core,
+        &Story { cast: vec![mara.id.clone()], vault: true, target_s: 8 * shots.len() as u32, ..story_draft(title, brief) },
+    )
+    .unwrap();
+    let list: Vec<Shot> = shots
+        .iter()
+        .enumerate()
+        .map(|(i, (cont, action))| Shot { continuity: cont.to_string(), ..shot(&story.id, i as u32 + 1, &mara.id, action) })
+        .collect();
+    render::store_shots(&h.core, &story.id, &list).unwrap();
+    let ids = repo::list_shots(&h.core, &story.id).unwrap().into_iter().map(|s| s.id).collect();
+    (face.ref_id, mara, story, ids)
+}
+
+/// Not one byte of the story (text, reference pixels, take video) outside the sealed folders.
+fn assert_no_plaintext(h: &Harness, needles: &[&[u8]]) {
+    for (path, bytes) in plaintext_areas(h) {
+        for needle in needles {
+            assert!(!contains(&bytes, needle), "{} holds story plaintext", path.display());
+        }
+    }
+    assert!(!h.dir.path().join("stories-tmp").exists());
+    assert_eq!(files_in(&h.core.cfg.references_dir()), 0, "no plain reference for a vault character");
+    assert_eq!(files_in(&h.core.cfg.videos_dir()), 0, "no plain take or film of a vault story");
+}
+
+#[tokio::test]
+async fn vault_story_renders_sealed_even_when_locked_meanwhile_and_leaves_no_plaintext() {
+    let clip = worker_clip();
+    assert_eq!(&clip[4..8], b"ftyp");
+    if let (Some(moov), Some(mdat)) = (offset_of(&clip, b"moov"), offset_of(&clip, b"mdat")) {
+        assert!(moov < mdat, "the worker's takes are moov-first");
+    }
+    let server = video_pod_server(clip.clone(), jpeg(2), 320, 180).await;
+    let h = harness(&server.uri());
+    h.core.vault.create(PW, KdfParams::fast()).unwrap();
+    adopt_video_pod(&h).await;
+    let (face, _mara, story, shot_ids) =
+        seed_vault_story(&h, "Light Packing", "two partners decide to run tonight", &[("cut", "Mara runs to the edge of the roof.")]);
+    let shot_id = shot_ids[0].clone();
+    let job = render::render_shot(&h.core, &shot_id).unwrap();
+    h.core.vault.lock(); // locks while the pod works
+    // Locked: every verb on the story answers the spec's copy and changes nothing.
+    assert_eq!(render::approve_take(&h.core, &shot_id, "t").unwrap_err(), "VAULT_LOCKED: Unlock the vault to approve takes");
+    assert_eq!(render::assemble_story(&h.core, &story.id).unwrap_err(), "VAULT_LOCKED: Unlock the vault to assemble the story");
+    assert_eq!(render::plan_story(&h.core, &story.id).await.unwrap_err(), "VAULT_LOCKED: Unlock the vault to plan the story");
+    assert_eq!(render::render_shot(&h.core, &shot_id).unwrap_err(), "VAULT_LOCKED: Unlock the vault to open this story");
+    assert_eq!(render::render_story(&h.core, &story.id).unwrap_err(), "VAULT_LOCKED: Unlock the vault to open this story");
+    assert_eq!(render::delete_story(&h.core, &story.id).unwrap_err(), "VAULT_LOCKED: Unlock the vault to open this story");
+    let done = wait_job(&h.sink, &job).await;
+    assert_eq!(done.status, JobState::Completed, "{:?}", done.error);
+    assert!(done.images.is_empty() && done.completed == 1, "redacted while locked");
+    assert_eq!(done.label.as_deref(), Some("Vault story · shot 1"));
+    for j in h.sink.jobs.lock().unwrap().iter() {
+        let s = serde_json::to_string(j).unwrap();
+        assert!(!s.contains("Light Packing") && !s.contains("run tonight") && !s.contains("edge of the roof"), "{s}");
+    }
+    // The pod got the character's reference decrypted in memory, like every vault job.
+    let run = last_run_input(&server).await;
+    let sent = base64::engine::general_purpose::STANDARD.decode(run["references"][0]["base64"].as_str().unwrap()).unwrap();
+    assert_eq!(sent, app_lib::references::process(&png(3, 64, 64)).unwrap().0);
+    h.core.vault.unlock(PW).unwrap();
+    let view = render::story_view(&h.core, &story.id).unwrap();
+    assert_eq!(view.takes.len(), 1);
+    assert!(view.takes[0].vault && view.takes[0].path.starts_with("vault://localhost/"));
+    assert_eq!(view.takes[0].shot_id.as_deref(), Some(shot_id.as_str()));
+    assert!(view.takes[0].references.iter().all(|r| r.starts_with("vault://localhost/")));
+    assert!(h.core.vault.gallery_items().unwrap().is_empty(), "takes are not gallery items");
+    // Approve and assemble (needs ffmpeg; skipped otherwise).
+    if has_ffmpeg() {
+        render::approve_take(&h.core, &shot_id, &view.takes[0].id).unwrap();
+        let film = render::assemble_story(&h.core, &story.id).unwrap();
+        assert!(film.vault && film.story_id.as_deref() == Some(story.id.as_str()) && film.shot_id.is_none());
+        assert!(film.path.starts_with("vault://localhost/") && film.path.ends_with(".mp4"), "{}", film.path);
+        assert!(film.poster_path.as_deref().unwrap_or_default().starts_with("vault://localhost/"));
+        let s = repo::get_story(&h.core, &story.id).unwrap().unwrap();
+        assert_eq!((s.status.as_str(), s.result_image_id.as_deref()), ("assembled", Some(film.id.as_str())));
+        assert!(h.core.vault.gallery_items().unwrap().is_empty());
+        assert_eq!(h.core.vault.status().item_count, Some(0));
+        assert!(h.core.db.lock().unwrap().get_image(&film.id).unwrap().is_none(), "nothing in SQLite");
+        let view = render::story_view(&h.core, &story.id).unwrap();
+        assert_eq!(view.result.as_ref().map(|r| r.id.as_str()), Some(film.id.as_str()));
+        assert_eq!(view.takes.len(), 1, "the film is not a take");
+        let dest = h.dir.path().join("export.mp4");
+        vault_migrate::export_item(&h.core, &film.id, &dest).unwrap();
+        assert_eq!(&std::fs::read(&dest).unwrap()[4..8], b"ftyp");
+        std::fs::remove_file(&dest).unwrap();
+        // Re-assembling replaces the previous film.
+        let again = render::assemble_story(&h.core, &story.id).unwrap();
+        assert!(h.core.vault.item(&film.id).is_err(), "the old film is gone");
+        assert_eq!(h.core.vault.items_for_story(&story.id).unwrap().len(), 2, "one take, one film");
+        assert_eq!(repo::get_story(&h.core, &story.id).unwrap().unwrap().result_image_id.as_deref(), Some(again.id.as_str()));
+    }
+    // Nothing readable anywhere in the data dir: the brief, the action, the reference pixels, the take's video.
+    let mid = clip.len() / 2;
+    assert_no_plaintext(&h, &[
+        b"run tonight", b"edge of the roof", b"Light Packing", &png(3, 64, 64)[16..48], &clip[..32], &clip[mid..mid + 32],
+    ]);
+    assert!(h.core.db.lock().unwrap().list_takes(&story.id).unwrap().is_empty());
+    // Delete the story: takes, film and doc go; the character's reference blob stays.
+    render::delete_story(&h.core, &story.id).unwrap();
+    assert!(h.core.vault.items().unwrap().is_empty());
+    assert!(repo::get_story(&h.core, &story.id).unwrap().is_none());
+    assert!(h.core.vault.open_blob(&BlobRef::parse(&face).unwrap().id).is_ok());
+    assert_eq!(files_in(&h.core.cfg.vault_dir().join("blobs")), 1, "only the character's face is left");
+}
+
+/// A continues shot of a vault story: the previous take's last frame is sealed
+/// (never a `references/` file), fed to the pod from memory and recorded as a
+/// vault path on the take; assembly and export touch no plaintext file.
+#[tokio::test]
+async fn vault_story_leaves_no_plaintext_on_disk() {
+    if !has_ffmpeg() {
+        return;
+    }
+    let clip = worker_clip();
+    let server = video_pod_server(clip.clone(), jpeg(2), 320, 180).await;
+    let h = harness(&server.uri());
+    h.core.vault.create(PW, KdfParams::fast()).unwrap();
+    adopt_video_pod(&h).await;
+    let (_face, _mara, story, shot_ids) = seed_vault_story(
+        &h,
+        "Light Packing",
+        "two partners decide to run tonight",
+        &[("cut", "Mara runs to the edge of the roof."), ("continues", "Mara looks down at the street.")],
+    );
+    let job = render::render_shot(&h.core, &shot_ids[0]).unwrap();
+    let done = wait_job(&h.sink, &job).await;
+    assert_eq!(done.status, JobState::Completed, "{:?}", done.error);
+    let take1 = done.images[0].clone();
+    assert!(take1.vault && take1.shot_id.as_deref() == Some(shot_ids[0].as_str()));
+    // Approving shot 1 renders the continuing shot 2 from shot 1's last frame.
+    let queued = render::approve_take(&h.core, &shot_ids[0], &take1.id).unwrap().unwrap();
+    assert_eq!(queued.0, shot_ids[1]);
+    assert_eq!(files_in(&h.core.cfg.references_dir()), 0, "the first frame is a sealed blob, not a references/ file");
+    let done = wait_job(&h.sink, &queued.1).await;
+    assert_eq!(done.status, JobState::Completed, "{:?}", done.error);
+    let take2 = done.images[0].clone();
+    assert!(take2.init_image.as_deref().unwrap_or_default().starts_with("vault://localhost/"), "{:?}", take2.init_image);
+    assert_eq!(take2.references.len(), 2);
+    assert_eq!(take2.references[1].as_str(), take2.init_image.as_deref().unwrap(), "the frame is the last reference");
+    let run = last_run_input(&server).await;
+    let frame = base64::engine::general_purpose::STANDARD.decode(run["initImage"]["base64"].as_str().unwrap()).unwrap();
+    assert_eq!(run["references"][1]["base64"], run["initImage"]["base64"]);
+    let img = image::load_from_memory(&frame).unwrap().to_rgb8();
+    let p = img.get_pixel(160, 90).0;
+    assert!(p[2] > 200 && p[0] < 40 && p[1] < 40, "the last frame of the blue clip: {p:?}");
+    let sealed = h.core.vault.open_blob(&BlobRef::parse(take2.init_image.as_deref().unwrap()).unwrap().id).unwrap();
+    assert_eq!(sealed.as_slice(), frame.as_slice(), "the sealed frame is what the pod got");
+    render::approve_take(&h.core, &shot_ids[1], &take2.id).unwrap();
+    let film = render::assemble_story(&h.core, &story.id).unwrap();
+    assert!(film.vault && film.story_id.as_deref() == Some(story.id.as_str()));
+    let dest = h.dir.path().join("export.mp4");
+    vault_migrate::export_item(&h.core, &film.id, &dest).unwrap();
+    assert_eq!(&std::fs::read(&dest).unwrap()[4..8], b"ftyp");
+    std::fs::remove_file(&dest).unwrap();
+    let mid = clip.len() / 2;
+    assert_no_plaintext(&h, &[
+        b"run tonight", b"edge of the roof", b"down at the street", b"Light Packing",
+        &png(3, 64, 64)[16..48], &frame[16..48], &clip[..32], &clip[mid..mid + 32],
+    ]);
+    assert_eq!(h.core.vault.items_for_story(&story.id).unwrap().len(), 3, "two takes and the film");
+    assert!(h.core.vault.gallery_items().unwrap().is_empty());
+    // Dropping shot 2 discards its sealed take; shot 1's stays.
+    let shots = repo::list_shots(&h.core, &story.id).unwrap();
+    render::save_shots(&h.core, &story.id, vec![shots[0].clone()]).unwrap();
+    assert!(h.core.vault.item(&take2.id).is_err());
+    assert!(h.core.vault.item(&take1.id).is_ok());
+}
+
+#[tokio::test]
+async fn a_vault_take_for_a_shot_that_is_gone_is_discarded() {
+    let server = video_pod_server(worker_clip(), jpeg(2), 320, 180).await;
+    let h = harness(&server.uri());
+    h.core.vault.create(PW, KdfParams::fast()).unwrap();
+    adopt_video_pod(&h).await;
+    let (_face, _mara, story, shot_ids) =
+        seed_vault_story(&h, "Light Packing", "two partners decide to run tonight", &[("cut", "Mara runs to the edge of the roof.")]);
+    let job = render::render_shot(&h.core, &shot_ids[0]).unwrap();
+    // Removed behind the app's back (the commands refuse this while it renders).
+    let doc = h.core.vault.story_doc(&story.id).unwrap();
+    h.core.vault.put_story_doc(&StoryDoc { shots: vec![], ..doc }).unwrap();
+    let j = wait_job(&h.sink, &job).await;
+    assert_eq!(j.status, JobState::Failed, "{:?}", j.error);
+    assert!(j.error.as_deref().unwrap_or_default().contains("The shot was removed while it rendered"), "{:?}", j.error);
+    assert!(j.images.is_empty());
+    assert!(h.core.vault.items_for_story(&story.id).unwrap().is_empty());
+    assert_eq!(files_in(&h.core.cfg.vault_dir().join("blobs")), 1, "the take's blobs went; the face stays");
+    assert_eq!(files_in(&h.core.cfg.videos_dir()), 0);
 }

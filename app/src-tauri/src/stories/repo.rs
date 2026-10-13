@@ -64,6 +64,28 @@ pub fn character_home(core: &Core, id: &str) -> Result<Option<Home>, String> {
     Ok(core.vault.character_file_exists(id).then_some(Home::Vault))
 }
 
+/// `VAULT_LOCKED: Unlock the vault to {what}` when `story_id` is a vault story
+/// and the vault is locked (spec §8: approve takes / assemble the story / plan
+/// the story). Checked up front so the verb's own copy wins over the generic
+/// "open this story".
+pub fn require_unlocked_story(core: &Core, story_id: &str, what: &str) -> Result<(), String> {
+    if story_home(core, story_id)? == Some(Home::Vault) && !core.vault.is_unlocked() {
+        return Err(locked(what));
+    }
+    Ok(())
+}
+
+/// A shot by id. A shot id alone can't say which store holds it, so an unknown
+/// id while the vault is locked is reported as locked (`… to {what}`) rather
+/// than gone; "That shot no longer exists" otherwise.
+pub fn shot_or_locked(core: &Core, shot_id: &str, what: &str) -> Result<Shot, String> {
+    match get_shot(core, shot_id)? {
+        Some(s) => Ok(s),
+        None if core.vault.exists() && !core.vault.is_unlocked() => Err(locked(what)),
+        None => Err("That shot no longer exists".into()),
+    }
+}
+
 // ----- story docs (vault) -----
 
 /// The vault story's doc; `VAULT_LOCKED` while locked, `Ok(None)` when there is no such story.

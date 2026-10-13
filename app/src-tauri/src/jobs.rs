@@ -1134,7 +1134,19 @@ fn save_video(
     crate::timings::append(core, &crate::timings::entry(&rec, gpu.as_deref(), out, &rec.created_at));
     if plan.destination == Destination::Vault {
         // Encrypted the moment it arrives; the plaintext never touches disk.
-        return vault_migrate::seal_output(core, &rec, &bytes, poster.as_deref());
+        let saved = vault_migrate::seal_output(core, &rec, &bytes, poster.as_deref())?;
+        // A story take whose shot was removed while it rendered would be
+        // unreachable: it goes again (blobs included). While the vault is
+        // locked the shot cannot have been removed (spec §3.4), so no check.
+        if core.vault.is_unlocked() {
+            if let Some(shot_id) = rec.shot_id.as_deref() {
+                if crate::stories::repo::get_shot(core, shot_id)?.is_none() {
+                    core.vault.delete_item(&saved.id)?;
+                    return Err("The shot was removed while it rendered; its take was discarded".into());
+                }
+            }
+        }
+        return Ok(saved);
     }
     let id = uuid::Uuid::new_v4().to_string();
     let dir = core.cfg.videos_dir();

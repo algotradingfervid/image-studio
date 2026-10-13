@@ -1281,4 +1281,39 @@ mod repo_tests {
         // A General character used by a vault story can't go.
         assert_eq!(repo::delete_character(&core, &mara.id).unwrap_err(), "Mara is used by story \"V3\"");
     }
+
+    /// The LLM reply arrives after the vault locked: the plan is lost, nothing changes, and the
+    /// message says so. Locked before planning starts: the spec's `VAULT_LOCKED` copy.
+    struct LockThenReply(Arc<Core>, String);
+    impl wiremock::Respond for LockThenReply {
+        fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
+            self.0.vault.lock();
+            super::reply(&self.1)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_vault_story_locking_mid_plan_loses_the_plan_and_says_so() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let (_d, core) = core_with_vault();
+        let mara = repo::save_character(&core, &character_in(Home::Vault, "Mara")).unwrap();
+        let story = repo::save_story(&core, &Story { cast: vec![mara.id.clone()], ..story_in(Home::Vault, "Light Packing") }).unwrap();
+        let s = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": [{"id": "m"}]}))).mount(&s).await;
+        Mock::given(method("POST")).and(path("/v1/chat/completions"))
+            .respond_with(LockThenReply(core.clone(), super::good_plan(10))).mount(&s).await;
+        core.settings.save_llm(Some(format!("{}/v1", s.uri())), Some("m".into())).unwrap();
+        assert_eq!(
+            render::plan_story(&core, &story.id).await.unwrap_err(),
+            "The vault locked while planning; unlock and plan again"
+        );
+        assert!(!core.vault.is_unlocked());
+        assert_eq!(render::plan_story(&core, &story.id).await.unwrap_err(), "VAULT_LOCKED: Unlock the vault to plan the story");
+        core.vault.unlock(PW).unwrap();
+        assert!(repo::list_shots(&core, &story.id).unwrap().is_empty(), "nothing changed");
+        let st = repo::get_story(&core, &story.id).unwrap().unwrap();
+        assert_eq!((st.status.as_str(), st.title.as_str()), ("draft", "Light Packing"));
+    }
 }

@@ -8,6 +8,8 @@ use super::{
 use crate::db::{ImageRecord, KIND_VIDEO};
 use crate::jobs::{self, Destination, VideoRequest};
 use crate::state::Core;
+use crate::vault::{BlobRef, ERR_LOCKED};
+use crate::vault_migrate;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -70,9 +72,14 @@ pub fn story_view(core: &Core, story_id: &str) -> Result<StoryView, String> {
     Ok(StoryView { story, cast, shots, takes, result, issues })
 }
 
-/// The approved take's video bytes (General: the file; vault: Task 7).
-fn take_bytes(core: &Core, take_id: &str) -> Result<(ImageRecord, Zeroizing<Vec<u8>>), String> {
-    let rec = core.db.lock().unwrap().get_image(take_id)?.ok_or("The approved take's video is missing")?;
+/// The approved take's video bytes: the `videos/` file of a General story, the
+/// decrypted blob of a vault story (in memory only, unlocked vault).
+fn take_bytes(core: &Core, story: &Story, take_id: &str) -> Result<(ImageRecord, Zeroizing<Vec<u8>>), String> {
+    let rec = repo::get_take(core, take_id)?.ok_or("The approved take's video is missing")?;
+    if story.vault {
+        let b = BlobRef::parse(&rec.path).ok_or("The approved take's video is missing")?;
+        return Ok((rec, core.vault.open_blob(&b.id)?));
+    }
     let bytes = std::fs::read(&rec.path).map_err(|_| "The approved take's video file is missing".to_string())?;
     Ok((rec, Zeroizing::new(bytes)))
 }
@@ -134,7 +141,7 @@ pub fn job_label(story: &Story, position: u32) -> String {
 /// Queues one H3 Character job for the shot; returns the job id. Refused
 /// while an earlier render of the shot is still running.
 pub fn render_shot(core: &Arc<Core>, shot_id: &str) -> Result<String, String> {
-    let shot = repo::get_shot(core, shot_id)?.ok_or("That shot no longer exists")?;
+    let shot = repo::shot_or_locked(core, shot_id, "open this story")?;
     let busy = || format!("Shot {} is already rendering", shot.position);
     if is_rendering(core, shot_id) {
         return Err(busy());
@@ -159,10 +166,19 @@ pub fn render_shot(core: &Arc<Core>, shot_id: &str) -> Result<String, String> {
             .as_deref()
             .ok_or_else(|| format!("Approve shot {} first", prev.position))?;
         let ff = ffmpeg::find_ffmpeg()?;
-        let (prev_rec, bytes) = take_bytes(core, take)?;
-        let frame = ffmpeg::last_frame_png(&ff, &bytes, prev_rec.width, prev_rec.height)
-            .map_err(|e| format!("Could not read the last frame of shot {}: {e}", prev.position))?;
-        init_image_id = Some(crate::references::import_bytes(&core.cfg.references_dir(), &frame)?.ref_id);
+        let (prev_rec, bytes) = take_bytes(core, &view.story, take)?;
+        let frame = Zeroizing::new(
+            ffmpeg::last_frame_png(&ff, &bytes, prev_rec.width, prev_rec.height)
+                .map_err(|e| format!("Could not read the last frame of shot {}: {e}", prev.position))?,
+        );
+        drop(bytes);
+        // The frame is a reference of the take: a `references/` file for a General
+        // story, a sealed blob for a vault story (never written in plaintext).
+        init_image_id = Some(if view.story.vault {
+            vault_migrate::seal_verified(core, &frame, "png")?.path()
+        } else {
+            crate::references::import_bytes(&core.cfg.references_dir(), &frame)?.ref_id
+        });
     }
     // A continuing shot's first frame is also the last reference (`<Picture M>` in the prompt)
     // and stays the worker's frame-0 guide (`initImage`).
@@ -235,7 +251,7 @@ pub struct RenderAll {
 /// Approves `take_id` for the shot. When the next shot continues this one and
 /// has no takes yet, it is rendered now; returns its (shot_id, job_id).
 pub fn approve_take(core: &Arc<Core>, shot_id: &str, take_id: &str) -> Result<Option<(String, String)>, String> {
-    let shot = repo::get_shot(core, shot_id)?.ok_or("That shot no longer exists")?;
+    let shot = repo::shot_or_locked(core, shot_id, "approve takes")?;
     let take = repo::get_take(core, take_id)?.ok_or("That take no longer exists")?;
     if take.shot_id.as_deref() != Some(shot_id) {
         return Err("That take belongs to another shot".into());
@@ -253,9 +269,11 @@ pub fn approve_take(core: &Arc<Core>, shot_id: &str, take_id: &str) -> Result<Op
     Ok(None)
 }
 
-/// Stitches the approved takes (shot order) into one gallery video, replacing
-/// any earlier result of the story.
+/// Stitches the approved takes (shot order) into the story's final film —
+/// a `videos/` file (General) or a sealed vault item (vault) — replacing any
+/// earlier result of the story. Nothing of a vault story touches disk in plaintext.
 pub fn assemble_story(core: &Core, story_id: &str) -> Result<ImageRecord, String> {
+    repo::require_unlocked_story(core, story_id, "assemble the story")?;
     let view = story_view(core, story_id)?;
     if view.shots.is_empty() {
         return Err("The story has no shots".into());
@@ -266,23 +284,12 @@ pub fn assemble_story(core: &Core, story_id: &str) -> Result<ImageRecord, String
             .approved_take_id
             .as_deref()
             .ok_or_else(|| format!("Approve a take for shot {} first", s.position))?;
-        inputs.push(take_bytes(core, take)?.1);
+        inputs.push(take_bytes(core, &view.story, take)?.1);
     }
     let ff = ffmpeg::find_ffmpeg()?;
     let film = Zeroizing::new(ffmpeg::assemble(&ff, &inputs.iter().map(|b| b.as_slice()).collect::<Vec<_>>())?);
     drop(inputs);
     let poster_jpg = Zeroizing::new(ffmpeg::first_frame_jpg(&ff, &film)?);
-    // General store: the film and its poster are files under `videos/`.
-    let dir = core.cfg.videos_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Could not create the videos folder: {e}"))?;
-    let id = uuid::Uuid::new_v4().to_string();
-    let out = dir.join(format!("{id}.mp4"));
-    let poster = dir.join(format!("{id}.jpg"));
-    std::fs::write(&out, &*film).map_err(|e| format!("Could not save the story video: {e}"))?;
-    if let Err(e) = std::fs::write(&poster, &*poster_jpg) {
-        let _ = std::fs::remove_file(&out);
-        return Err(format!("Could not save the story poster: {e}"));
-    }
     let first_take = view.shots[0].approved_take_id.as_deref().unwrap_or_default();
     let first = view
         .takes
@@ -290,9 +297,10 @@ pub fn assemble_story(core: &Core, story_id: &str) -> Result<ImageRecord, String
         .find(|t| t.id == first_take)
         .ok_or("The approved take's video is missing")?;
     let name = if view.story.title.trim().is_empty() { &view.story.brief } else { &view.story.title };
+    // The template: id, path and poster are filled by the store that keeps the film.
     let rec = ImageRecord {
-        id: id.clone(),
-        path: out.to_string_lossy().into(),
+        id: String::new(),
+        path: String::new(),
         model: VIDEO_MODEL.into(),
         prompt: format!("Story: {name}"),
         negative_prompt: String::new(),
@@ -313,8 +321,8 @@ pub fn assemble_story(core: &Core, story_id: &str) -> Result<ImageRecord, String
         duration_s: Some(view.shots.iter().map(|s| s.duration_s as f64).sum()),
         fps: Some(FPS),
         has_audio: Some(true),
-        poster_path: Some(poster.to_string_lossy().into()),
-        vault: false,
+        poster_path: None,
+        vault: view.story.vault,
         thumb_path: None,
         story_id: Some(story_id.into()),
         shot_id: None,
@@ -327,18 +335,44 @@ pub fn assemble_story(core: &Core, story_id: &str) -> Result<ImageRecord, String
                 "seed": t.map(|t| t.seed), "prompt": t.map(|t| &t.prompt)})
         }).collect::<Vec<_>>(),
     });
-    let inserted = core.db.lock().unwrap().insert_image(&rec);
-    if let Err(e) = inserted.and_then(|_| repo::set_result(core, story_id, &id, &sidecar)) {
-        let _ = core.db.lock().unwrap().delete_image(&id);
-        core.cfg.remove_record_files(&rec);
+    let saved = if view.story.vault {
+        // Sealed straight from memory (a vault item with `story_id`, not a gallery item).
+        vault_migrate::seal_output(core, &rec, &film, Some(&poster_jpg))?
+    } else {
+        save_general_film(core, rec, &film, &poster_jpg)?
+    };
+    drop((film, poster_jpg));
+    if let Err(e) = repo::set_result(core, story_id, &saved.id, &sidecar) {
+        let _ = delete_records(core, std::slice::from_ref(&saved));
         return Err(e);
     }
     // The new result is recorded; now the previous one goes.
     if let Some(old) = view.story.result_image_id.as_deref() {
-        let db = core.db.lock().unwrap();
-        if let Some(o) = db.get_image(old)? {
-            core.cfg.delete_record(&db, &o)?;
+        if let Some(o) = repo::get_take(core, old)? {
+            delete_records(core, &[o])?;
         }
+    }
+    Ok(saved)
+}
+
+/// General store: the film and its poster are files under `videos/`, plus a row.
+fn save_general_film(core: &Core, mut rec: ImageRecord, film: &[u8], poster_jpg: &[u8]) -> Result<ImageRecord, String> {
+    let dir = core.cfg.videos_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Could not create the videos folder: {e}"))?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let out = dir.join(format!("{id}.mp4"));
+    let poster = dir.join(format!("{id}.jpg"));
+    std::fs::write(&out, film).map_err(|e| format!("Could not save the story video: {e}"))?;
+    if let Err(e) = std::fs::write(&poster, poster_jpg) {
+        let _ = std::fs::remove_file(&out);
+        return Err(format!("Could not save the story poster: {e}"));
+    }
+    rec.id = id;
+    rec.path = out.to_string_lossy().into();
+    rec.poster_path = Some(poster.to_string_lossy().into());
+    if let Err(e) = core.db.lock().unwrap().insert_image(&rec) {
+        core.cfg.remove_record_files(&rec);
+        return Err(e);
     }
     Ok(rec)
 }
@@ -465,6 +499,7 @@ pub fn check_story(story: &Story) -> Result<(), String> {
 /// Plans the shots with the local LLM (replaces the shot list). The
 /// story-level safety checks run first; nothing is sent to the LLM when they fail.
 pub async fn plan_story(core: &Arc<Core>, story_id: &str) -> Result<StoryView, String> {
+    repo::require_unlocked_story(core, story_id, "plan the story")?;
     let view = story_view(core, story_id)?;
     if let Some(i) = preflight(&view.story, &view.cast).first() {
         return Err(i.message.clone());
@@ -478,10 +513,18 @@ pub async fn plan_story(core: &Arc<Core>, story_id: &str) -> Result<StoryView, S
     let base = core.settings.llm_base_url();
     let model = resolve_llm_model(&base, &core.settings.llm_model()).await?;
     let out = planner::plan(&base, &model, &view.story, &view.cast).await?;
+    // A vault story whose vault locked meanwhile can't take the plan (it was only in memory).
+    let mid_plan = |e: String| {
+        if e.starts_with(ERR_LOCKED) {
+            "The vault locked while planning; unlock and plan again".to_string()
+        } else {
+            e
+        }
+    };
     // The shots first: refused, with nothing changed, if a render started meanwhile.
-    store_shots(core, story_id, &out.shots)?;
+    store_shots(core, story_id, &out.shots).map_err(mid_plan)?;
     // Built on the story as stored now, not as it was when planning began.
-    let mut story = repo::get_story(core, story_id)?.ok_or("That story no longer exists")?;
+    let mut story = repo::get_story(core, story_id).map_err(mid_plan)?.ok_or("That story no longer exists")?;
     if !out.title.trim().is_empty() {
         story.title = out.title.trim().to_string();
     }
@@ -489,6 +532,6 @@ pub async fn plan_story(core: &Arc<Core>, story_id: &str) -> Result<StoryView, S
     story.voices = out.voices;
     story.status = "planned".into();
     story.updated_at = crate::state::now_rfc3339();
-    repo::save_story(core, &story)?;
+    repo::save_story(core, &story).map_err(mid_plan)?;
     story_view(core, story_id)
 }
