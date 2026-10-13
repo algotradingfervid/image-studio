@@ -357,7 +357,7 @@ MiniMax H3 reference-to-video, `ltx25` LTX-2.5 distilled). Each has `modes` (`t2
 
 | | `h3`, `h3ref` | `ltx25` |
 |---|---|---|
-| modes | `h3`: t2v, i2v; `h3ref`: r2v (1–4 `references`, required) | t2v, i2v |
+| modes | `h3`: t2v, i2v; `h3ref`: r2v (1–6 `references`, required; optional `initImage` → frame-0 guide) | t2v, i2v |
 | defaults | 5 s, 24 fps, `864x480`, 20 steps | 5 s, 24 fps, `1280x704`, cfg 1.0 |
 | durationS | 2–15 | 2–20 |
 | fps | 24 (fixed by the model) | 24, 25 |
@@ -375,11 +375,11 @@ MiniMax H3 reference-to-video, `ltx25` LTX-2.5 distilled). Each has `modes` (`t2
   to multiples of 32 (H3) or 64 (LTX). The templates instead stretch (H3) or centre-crop (LTX)
   the image to a fixed canvas. Read the real size from `video.width/height`.
 - **Character references (`h3ref`, mode `r2v`):** `references: [{name, base64}]`, 1 to
-  `maxReferences` (4) PNG, JPEG or WebP images (a `data:` URL prefix is accepted), uploaded
+  `maxReferences` (6) PNG, JPEG or WebP images (a `data:` URL prefix is accepted), uploaded
   like image-job references as `is_<tag>_ref<i>.<ext>` and removed after the job. They are
   required for `r2v` models (`INVALID_INPUT` without them, `TOO_MANY_REFERENCES` above the
   limit, `INVALID_REFERENCE` for a bad image) and rejected for every other video model
-  (`REFERENCES_NOT_SUPPORTED`). `h3ref` takes no start image (`I2V_NOT_SUPPORTED`). The
+  (`REFERENCES_NOT_SUPPORTED`). `h3ref` takes an optional `initImage` (first frame): a `MiniMaxH3AddGuide` pins it at frame 0, the output stays the preset `resolution`. The
   identity of the people or characters in the references is held through the whole clip
   (reference tokens ride through every sampling step); refer to them in the prompt as
   `<Picture 1>`, `<Picture 2>`… in request order. The output is the preset `resolution`.

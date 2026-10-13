@@ -746,7 +746,7 @@ def validate_generate_video(inp: dict, registry: dict) -> dict:
         raise InputError("INVALID_INPUT: negativePrompt must be a string")
     init = None
     if inp.get("initImage") is not None:
-        if "i2v" not in model.get("modes", []):
+        if "i2v" not in model.get("modes", []) and "r2v" not in model.get("modes", []):
             raise InputError(f"I2V_NOT_SUPPORTED: {mid} does not accept a start image")
         data, ext, mime = _decode_image(inp["initImage"], "INVALID_INIT_IMAGE", "initImage")
         size = image_size(data, ext)

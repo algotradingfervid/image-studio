@@ -322,11 +322,10 @@ def test_h3ref_reference_dicts_accepted(registry):
 
 
 @pytest.mark.parametrize("model,patch,code", [
-    ("h3ref", {"references": []}, "INVALID_INPUT: h3ref needs 1-4 reference images"),
-    ("h3ref", {"references": None}, "INVALID_INPUT: h3ref needs 1-4 reference images"),
-    ("h3ref", {"references": REF_NAMES + ["is_abc_ref5.png"]},
-     "TOO_MANY_REFERENCES: h3ref accepts at most 4"),
-    ("h3ref", {"initImage": INIT}, "I2V_NOT_SUPPORTED: h3ref"),
+    ("h3ref", {"references": []}, "INVALID_INPUT: h3ref needs 1-6 reference images"),
+    ("h3ref", {"references": None}, "INVALID_INPUT: h3ref needs 1-6 reference images"),
+    ("h3ref", {"references": REF_NAMES + ["is_abc_ref5.png", "is_abc_ref6.png", "is_abc_ref7.png"]},
+     "TOO_MANY_REFERENCES: h3ref accepts at most 6"),
     ("h3", {"references": REF_NAMES[:1]}, "REFERENCES_NOT_SUPPORTED: h3"),
     ("ltx25", {"references": REF_NAMES[:1]}, "REFERENCES_NOT_SUPPORTED: ltx25"),
 ])
@@ -578,7 +577,7 @@ def test_video_registry_entries(registry):
     assert {f["role"] for f in h3["files"]} == {"unet", "clip", "video_vae", "audio_vae"}
     assert not any(f["gated"] for f in h3["files"])
     h3ref = get_video_model(registry, "h3ref")
-    assert h3ref["maxReferences"] == 4
+    assert h3ref["maxReferences"] == 6
     assert {f["role"] for f in h3ref["files"]} == {"unet", "clip", "video_vae", "audio_vae"}
     assert not any(f["gated"] for f in h3ref["files"])
     assert model_file_by_role(h3ref, "unet")["filename"] == \
@@ -641,3 +640,49 @@ def test_build_time_node_check_sees_only_node_classes(object_info):
     assert set(names) <= set(object_info), set(names) - set(object_info)
     assert {"SaveVideo", "MiniMaxH3ImageToVideo", "MiniMaxH3ReferenceToVideo",
             "LTXVLatentUpsampler"} <= set(names)
+
+
+# ---------------------------------------------------------------------------
+# h3ref: optional first frame (MiniMaxH3AddGuide at frame 0)
+# ---------------------------------------------------------------------------
+def test_h3ref_first_frame_adds_guide_at_frame_zero(registry, object_info):
+    p = vparams("h3ref", references=REF_NAMES[:2],
+                initImage={"name": "start.png", "width": 1344, "height": 768})
+    g, info = build_video_workflow(p, registry)
+    assert_valid_video_graph(g, info, object_info)
+    guides = [n for n in g.values() if n["class_type"] == "MiniMaxH3AddGuide"]
+    assert len(guides) == 1
+    gd = guides[0]["inputs"]
+    assert gd["frame_idx"] == 0
+    start = g[gd["image"][0]]
+    assert start["class_type"] == "LoadImage" and start["inputs"]["image"] == "start.png"
+    ref = next(k for k, n in g.items() if n["class_type"] == "MiniMaxH3ReferenceToVideo")
+    assert gd["positive"] == [ref, 0] and gd["latent"] == [ref, 1]
+    guider = next(n for n in g.values() if n["class_type"] == "BasicGuider")
+    assert g[guider["inputs"]["conditioning"][0]]["class_type"] == "MiniMaxH3AddGuide"
+    assert (info["width"], info["height"]) == (864, 480)  # preset size, not the image's
+
+
+def test_h3ref_without_first_frame_has_no_guide(registry):
+    g, _ = build_video_workflow(vparams("h3ref", references=REF_NAMES[:1]), registry)
+    assert not any(n["class_type"] == "MiniMaxH3AddGuide" for n in g.values())
+
+
+def test_h3ref_accepts_six_references(registry):
+    g, _ = build_video_workflow(
+        vparams("h3ref", references=[f"r{i}.png" for i in range(6)]), registry)
+    ref = next(n for n in g.values() if n["class_type"] == "MiniMaxH3ReferenceToVideo")
+    assert "ref_images.ref_image_5" in ref["inputs"]
+
+
+def test_h3ref_first_frame_stages(registry):
+    p = vparams("h3ref", references=REF_NAMES[:1],
+                initImage={"name": "s.png", "width": 8, "height": 8})
+    g, _ = build_video_workflow(p, registry)
+    stages = graph_node_stages(g)
+    start = next(k for k, n in g.items()
+                 if n["class_type"] == "LoadImage" and n["inputs"]["image"] == "s.png")
+    assert stages[start] == "preparing_init_image"
+    ref = next(k for k, n in g.items() if n["class_type"] == "LoadImage"
+               and n["inputs"]["image"] == REF_NAMES[0])
+    assert stages[ref] == "preparing_references"
