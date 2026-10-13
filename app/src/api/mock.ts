@@ -1562,7 +1562,10 @@ function cannedPlan(story: Story): { title: string; logline: string; voices: Voi
   });
   // Shot 2 continues shot 1, so it must share a character with it (it always has `a`).
   const brief = story.brief.trim();
-  const title = brief ? brief.split(/[.!?\n]/)[0].slice(0, 48).trim() : "Untitled story";
+  const first = brief ? brief.split(/[.!?\n]/)[0].trim() : "";
+  // At most 48 characters, cut at a word boundary with an ellipsis.
+  const cut = first.length > 48 ? first.slice(0, 48).replace(/\s+\S*$/, "").trim() + "…" : first;
+  const title = cut || "Untitled story";
   return { title, logline: `${cast.map((c) => c.name).join(" and ")} — ${brief.slice(0, 120) || "a short story"}`, voices, shots: list };
 }
 

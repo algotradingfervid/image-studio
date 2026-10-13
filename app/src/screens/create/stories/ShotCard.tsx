@@ -272,7 +272,7 @@ export function ShotCard(props: ShotCardProps) {
             </label>
             <fieldset className="field shot-card__cont">
               <legend className="field__label">Continuity</legend>
-              <div className="segmented" role="radiogroup" aria-label={`Shot ${n} continuity`}>
+              <div className="segmented segmented--wide shot-card__seg" role="radiogroup" aria-label={`Shot ${n} continuity`}>
                 <button type="button" role="radio" aria-checked={shot.continuity === "cut"} className={shot.continuity === "cut" ? "is-selected" : ""} onClick={() => set({ continuity: "cut" })}>
                   Cut
                 </button>

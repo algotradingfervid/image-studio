@@ -219,11 +219,14 @@
   font-size: 12px;
 }
 
+/* Top-right on a solid backing: the poster's own caption sits top-left, the controls at the bottom. */
 .shot-card__take-badge {
   position: absolute;
   top: 8px;
-  left: 8px;
+  right: 8px;
   pointer-events: none;
+  background: rgba(12, 10, 8, 0.82);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
 }
 
 .shot-card__status {
@@ -325,6 +328,10 @@
 
 .shot-card__dur {
   width: 110px;
+}
+
+.shot-card__seg > button {
+  white-space: nowrap;
 }
 
 .shot-card__cont .segmented > button:disabled {
