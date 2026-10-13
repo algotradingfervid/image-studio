@@ -1,1 +1,182 @@
-//! Story and shot validation (issues list, consent and adult checks).
+use super::{Character, Issue, Shot, Story};
+
+pub const MIN_SHOT_S: u32 = 5;
+pub const MAX_SHOT_S: u32 = 15;
+pub const MAX_CAST_PER_SHOT: usize = 2;
+pub const WORDS_PER_S: f64 = 2.5;
+pub const TOTAL_TOLERANCE: f64 = 0.15;
+pub const MAX_REFS_PER_SHOT: usize = 6;
+
+const MINOR_TERMS: &[&str] = &[
+    "child", "children", "kid", "kids", "minor", "minors", "teen", "teens", "teenage", "teenager",
+    "schoolgirl", "schoolboy", "underage", "preteen", "toddler", "infant", "baby", "loli", "shota",
+];
+
+fn words(text: &str) -> Vec<String> {
+    text.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(String::from).collect()
+}
+
+/// True when `text` describes someone under 18 (term list, or "N years old" / "N-year-old" / "N yo" with N < 18).
+pub fn mentions_minor(text: &str) -> bool {
+    let w = words(text);
+    if w.iter().any(|x| MINOR_TERMS.contains(&x.as_str())) {
+        return true;
+    }
+    w.windows(2).any(|p| {
+        p[0].parse::<u32>().is_ok_and(|n| n < 18) && matches!(p[1].as_str(), "year" | "years" | "yo" | "yr" | "yrs")
+    })
+}
+
+pub fn validate(story: &Story, shots: &[Shot], cast: &[Character]) -> Vec<Issue> {
+    let mut out = Vec::new();
+    let name = |id: &str| cast.iter().find(|c| c.id == id).map(|c| c.name.clone()).unwrap_or_else(|| id.to_string());
+    let story_issue = |out: &mut Vec<Issue>, m: String| out.push(Issue { shot: None, message: m });
+    for c in cast {
+        if !c.adult {
+            story_issue(&mut out, format!("{} is not confirmed as an adult (18+)", c.name));
+        }
+        if c.source == "real_person" && !c.consent {
+            story_issue(&mut out, format!("{} is a real person without a consent tick", c.name));
+        }
+        if mentions_minor(&c.description) {
+            story_issue(&mut out, format!("{}'s description must describe an adult; stories use adults only", c.name));
+        }
+    }
+    if mentions_minor(&story.brief) || mentions_minor(&story.style) {
+        story_issue(&mut out, "The brief must describe adults only".into());
+    }
+    if shots.is_empty() {
+        story_issue(&mut out, "The story has no shots".into());
+        return out;
+    }
+    let total: u32 = shots.iter().map(|s| s.duration_s).sum();
+    let (lo, hi) = (story.target_s as f64 * (1.0 - TOTAL_TOLERANCE), story.target_s as f64 * (1.0 + TOTAL_TOLERANCE));
+    if (total as f64) < lo || (total as f64) > hi {
+        story_issue(&mut out, format!("Shots add up to {total} s; the target is {} s (±15 %)", story.target_s));
+    }
+    for (i, s) in shots.iter().enumerate() {
+        let n = Some(s.position);
+        let mut push = |m: String| out.push(Issue { shot: n, message: m });
+        if !(MIN_SHOT_S..=MAX_SHOT_S).contains(&s.duration_s) {
+            push(format!("Duration {} s is outside 5–15 s", s.duration_s));
+        }
+        if s.characters.len() > MAX_CAST_PER_SHOT {
+            push(format!("{} characters; at most 2 per shot", s.characters.len()));
+        }
+        for c in &s.characters {
+            if !story.cast.contains(c) {
+                push(format!("{} is not in the cast", name(c)));
+            }
+        }
+        let words_total: usize = s.dialogue.iter().map(|d| words(&d.line).len()).sum();
+        let max_words = (WORDS_PER_S * s.duration_s as f64).floor() as usize;
+        if words_total > max_words {
+            push(format!("Dialogue has {words_total} words; at most {max_words} fit in {} s", s.duration_s));
+        }
+        for d in &s.dialogue {
+            if !s.characters.contains(&d.speaker) {
+                push(format!("{} speaks but is not in this shot", name(&d.speaker)));
+            }
+        }
+        if [&s.action, &s.setting, &s.camera].iter().any(|t| mentions_minor(t)) || s.dialogue.iter().any(|d| mentions_minor(&d.line)) {
+            push("Stories use adults only; remove the reference to a minor".into());
+        }
+        if s.continuity == "continues" {
+            if i == 0 {
+                push("The first shot cannot continue a previous shot".into());
+            } else if !s.characters.iter().any(|c| shots[i - 1].characters.contains(c)) {
+                push("Continues the previous shot but shares no character with it".into());
+            }
+        }
+        let refs: usize = s.characters.iter().filter_map(|id| cast.iter().find(|c| &c.id == id)).map(|c| c.ref_ids.len()).sum();
+        if refs > MAX_REFS_PER_SHOT {
+            push(format!("{refs} reference images; at most 6 reference images per shot"));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stories::DialogueLine;
+
+    fn ch(id: &str, name: &str) -> Character {
+        Character {
+            id: id.into(), name: name.into(), description: "a tall adult".into(), source: "generated".into(),
+            consent: true, adult: true, ref_ids: vec![format!("{id}-ref")], created_at: String::new(), updated_at: String::new(),
+        }
+    }
+    fn story(target_s: u32, cast: &[&str]) -> Story {
+        Story {
+            id: "s1".into(), title: "T".into(), logline: String::new(), brief: "two adults on a roof".into(), target_s,
+            aspect: "16:9".into(), style: "cinematic".into(), cast: cast.iter().map(|c| c.to_string()).collect(),
+            status: "draft".into(), result_image_id: None, created_at: String::new(), updated_at: String::new(),
+        }
+    }
+    fn shot(id: &str, position: u32, duration_s: u32, characters: &[&str], continuity: &str) -> Shot {
+        Shot {
+            id: id.into(), story_id: "s1".into(), position, duration_s,
+            characters: characters.iter().map(|c| c.to_string()).collect(),
+            setting: "roof".into(), camera: "wide".into(), action: "walks".into(), dialogue: vec![],
+            continuity: continuity.into(), approved_take_id: None,
+        }
+    }
+
+#[test] fn valid_story_has_no_issues() {
+    let cast = vec![ch("c1", "Mara")];
+    let shots = vec![shot("a", 1, 10, &["c1"], "cut"), shot("b", 2, 10, &["c1"], "continues")];
+    assert!(validate(&story(20, &["c1"]), &shots, &cast).is_empty());
+}
+#[test] fn duration_out_of_range() {
+    let i = validate(&story(20, &["c1"]), &[shot("a", 1, 3, &["c1"], "cut"), shot("b", 2, 16, &["c1"], "cut")], &[ch("c1","Mara")]);
+    assert!(i.iter().any(|x| x.shot == Some(1) && x.message.contains("5–15")));
+    assert!(i.iter().any(|x| x.shot == Some(2) && x.message.contains("5–15")));
+}
+#[test] fn total_outside_tolerance() {
+    let i = validate(&story(60, &["c1"]), &[shot("a", 1, 10, &["c1"], "cut")], &[ch("c1","Mara")]);
+    assert!(i.iter().any(|x| x.shot.is_none() && x.message.contains("60")));
+}
+#[test] fn dialogue_too_long_and_wrong_speaker() {
+    let mut s = shot("a", 1, 5, &["c1"], "cut");
+    s.dialogue = vec![DialogueLine { speaker: "c2".into(), line: "one two three four five six seven eight nine ten eleven twelve thirteen".into() }];
+    let i = validate(&story(5, &["c1", "c2"]), &[s], &[ch("c1","Mara"), ch("c2","Ivo")]);
+    assert!(i.iter().any(|x| x.message.contains("words")));
+    assert!(i.iter().any(|x| x.message.contains("Ivo") && x.message.contains("not in this shot")));
+}
+#[test] fn cast_limits_and_unknown_character() {
+    let i = validate(&story(8, &["c1"]), &[shot("a", 1, 8, &["c1", "c2", "c3"], "cut")], &[ch("c1","Mara")]);
+    assert!(i.iter().any(|x| x.message.contains("at most 2")));
+    assert!(i.iter().any(|x| x.message.contains("not in the cast")));
+}
+#[test] fn first_shot_cannot_continue_and_continues_needs_shared_character() {
+    let cast = vec![ch("c1","Mara"), ch("c2","Ivo")];
+    let i = validate(&story(16, &["c1","c2"]), &[shot("a",1,8,&["c1"],"continues"), shot("b",2,8,&["c2"],"continues")], &cast);
+    assert!(i.iter().any(|x| x.shot == Some(1) && x.message.contains("first shot")));
+    assert!(i.iter().any(|x| x.shot == Some(2) && x.message.contains("shares no character")));
+}
+#[test] fn minors_rejected() {
+    assert!(mentions_minor("a teen girl on a bike"));
+    assert!(mentions_minor("she is 16 years old"));
+    assert!(mentions_minor("a 15-year-old boy"));
+    assert!(!mentions_minor("she is 30 years old"));
+    assert!(mentions_minor("teenage girl"));
+    let mut s = shot("a", 1, 8, &["c1"], "cut");
+    s.action = "a schoolgirl runs".into();
+    let i = validate(&story(8, &["c1"]), &[s], &[ch("c1","Mara")]);
+    assert!(i.iter().any(|x| x.message.contains("adults")));
+}
+#[test] fn consent_and_adult_gate() {
+    let mut real = ch("c1","Mara"); real.source = "real_person".into(); real.consent = false;
+    let mut kid = ch("c2","Ivo"); kid.adult = false;
+    let i = validate(&story(8, &["c1","c2"]), &[shot("a",1,8,&["c1"],"cut")], &[real, kid]);
+    assert!(i.iter().any(|x| x.message.contains("Mara") && x.message.contains("consent")));
+    assert!(i.iter().any(|x| x.message.contains("Ivo") && x.message.contains("adult")));
+}
+#[test] fn too_many_reference_images() {
+    let mut a = ch("c1","Mara"); a.ref_ids = vec!["1".into(),"2".into(),"3".into(),"4".into()];
+    let mut b = ch("c2","Ivo"); b.ref_ids = vec!["5".into(),"6".into(),"7".into()];
+    let i = validate(&story(8, &["c1","c2"]), &[shot("a",1,8,&["c1","c2"],"cut")], &[a, b]);
+    assert!(i.iter().any(|x| x.message.contains("6 reference images")));
+}
+}
