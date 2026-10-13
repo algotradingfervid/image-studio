@@ -40,8 +40,9 @@ Same layout as the other two tabs:
   the Stories tab is active, the selected story's workspace — Plan (shot list) and Render &
   review (shot cards) — plus **Assemble**. Switching back to Image or Video shows the gallery
   again. Assembled videos appear in the normal gallery.
-- The Save-to switch (gallery / vault) works as on the other tabs; a story's destination is
-  fixed when the story is created.
+- v1 stories save to the general gallery only (Save-to is hidden on the Stories tab; vault
+  stories come later — takes and character images would otherwise need vault metadata).
+  Character reference images come from import or the general gallery.
 
 The steps:
 
@@ -111,7 +112,7 @@ Runs after planning and after every manual edit. Per shot / story:
 | Adult rule | no character/action/dialogue text matches the under-18 term list (child, kid, minor, teen, schoolgirl, schoolboy, underage, "years old" with a number < 18, …) |
 | Consent | every cast character: adult ticked; real_person → consent ticked |
 | Prompt length | compiled prompt ≤ 7,000 chars |
-| References | ≤ 9 images per shot (2 characters × 3 images = 6 max) |
+| References | ≤ 6 images per shot (2 characters × 3 images); `h3ref` maxReferences raised 4 → 6 (node allows 9) |
 
 ## 6. Prompt compiler (Rust)
 
@@ -138,7 +139,7 @@ prompt, reference list and seed are stored with each take.
 
 - Each take = one normal `generate_video` job: model `h3ref`, compiled prompt, the shot's
   character reference images, duration = shot duration, resolution from the aspect, audio on,
-  steps = model default, a random seed, destination = the story's Save-to. Jobs appear in the
+  steps = model default, a random seed, destination general. Jobs appear in the
   existing job list (labelled "Story: {title} · shot N").
 - **Continues previous** (worker change): `generate_video` for `h3ref` accepts an optional
   `initImage`; the graph adds `MiniMaxH3AddGuide(positive, vae, latent, image, frame_idx=0)`
@@ -149,17 +150,16 @@ prompt, reference list and seed are stored with each take.
 - **First task of the build is a GPU spike (~$1):** does ref2va honour the frame-0 guide?
   If not, "Continues previous" is hidden and every shot is a cut; nothing else changes.
 - Takes are stored as video records with `story_id`/`shot_id` set and are hidden from the
-  normal gallery (shown only inside the story). Vault stories seal takes like other vault
-  videos (existing `seal_output`).
+  normal gallery (shown only inside the story).
 
 ## 8. Assembly (Mac, ffmpeg)
 
 - ffmpeg located at `/opt/homebrew/bin/ffmpeg`, `/usr/local/bin/ffmpeg` or PATH; missing →
   message "Install ffmpeg (brew install ffmpeg)".
 - One ffmpeg run: concat filter over the approved takes in shot order, re-encoded H.264
-  (crf 18) + AAC 48 kHz stereo, `loudnorm=I=-14:TP=-1.5:LRA=11`, optional "AI-generated"
-  label (drawtext, bottom-right, small, on by default) and `comment=AI-generated` metadata.
-  Vault stories: inputs decrypted to a private temp dir, output sealed, temp wiped.
+  (crf 18) + AAC 48 kHz stereo, `loudnorm=I=-14:TP=-1.5:LRA=11`, and `comment=AI-generated`
+  metadata. (The installed Homebrew ffmpeg 8.1 has no `drawtext`, so a burned-in label is
+  deferred.)
 - Result saved as a normal gallery video (kind video, `story_id` set, poster = first frame),
   visible in the gallery; re-assembling replaces the story's previous result.
 - A sidecar JSON (shots, prompts, seeds, character ids) is stored with the story record.
@@ -202,6 +202,6 @@ prompt, reference list and seed are stored with each take.
 
 ## 12. Out of scope (later, in this order of likely value)
 
-Voice references (`<Audio N>` per character), draft/final tiers (turbo LoRA), face-similarity
+Vault stories, burned-in AI label, Voice references (`<Audio N>` per character), draft/final tiers (turbo LoRA), face-similarity
 QC, full consent registry (releases, ID, revocation), H3 edit path, colour grading/LUT,
 music bed, multi-pass planning.
