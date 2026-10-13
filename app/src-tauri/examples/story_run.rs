@@ -225,6 +225,7 @@ fn upsert_character(core: &Core, spec: &Spec, ref_id: String) -> Result<Characte
         consent: false,
         adult: true,
         ref_ids: vec![ref_id],
+        ref_paths: vec![],
         created_at: old.map(|c| c.created_at).unwrap_or_else(|| now.clone()),
         updated_at: now,
     };

@@ -5,7 +5,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate, Request, Respond};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn mara() -> Character { Character { id: "c1".into(), name: "Mara".into(), description: "woman in her 30s".into(),
-    source: "generated".into(), consent: false, adult: true, ref_ids: vec!["r1".into()], created_at: "t".into(), updated_at: "t".into() } }
+    source: "generated".into(), consent: false, adult: true, ref_ids: vec!["r1".into()], ref_paths: vec![], created_at: "t".into(), updated_at: "t".into() } }
 fn st(target: u32) -> Story { Story { id: "s1".into(), title: String::new(), logline: String::new(), brief: "A heist on a rooftop".into(),
     target_s: target, aspect: "16:9".into(), style: String::new(), cast: vec!["c1".into()], voices: vec![], status: "draft".into(),
     result_image_id: None, created_at: "t".into(), updated_at: "t".into() } }
@@ -427,7 +427,7 @@ mod render_harness {
             .collect();
         let mara = Character {
             id: "c-mara".into(), name: "Mara".into(), description: "woman in her 30s, short black hair".into(),
-            source: "generated".into(), consent: false, adult: true, ref_ids: refs,
+            source: "generated".into(), consent: false, adult: true, ref_ids: refs, ref_paths: vec![],
             created_at: "t".into(), updated_at: "t".into(),
         };
         let story = Story {
@@ -953,4 +953,31 @@ fn prompt_tuning_rules_are_present_and_example_voices_are_not_copyable() {
     assert!(p.contains("same characters in the same place at the exact moment"), "{p}");
     assert!(p.contains("Spread the dialogue across the shots"), "{p}");
     assert!(p.contains("held final pose"), "{p}");
+}
+
+fn png_10x10() -> Vec<u8> {
+    let img = image::RgbImage::from_pixel(10, 10, image::Rgb([1, 2, 3]));
+    let mut buf = Vec::new();
+    image::DynamicImage::ImageRgb8(img).write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png).unwrap();
+    buf
+}
+
+#[test]
+fn characters_list_with_display_paths_and_edits_keep_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let refs = dir.path().join("references");
+    let r = app_lib::references::import_bytes(&refs, &png_10x10()).unwrap();
+    let db = app_lib::db::Db::open_in_memory().unwrap();
+    let c = Character { id: "c1".into(), name: "Mara".into(), ref_ids: vec![r.ref_id.clone()], ..mara() };
+    app_lib::stories::store::save_character(&db, &c).unwrap();
+    let listed = app_lib::stories::render::with_ref_paths(&refs, app_lib::stories::store::list_characters(&db).unwrap());
+    assert_eq!(listed[0].ref_paths, vec![r.thumb_path.clone()]);
+    let mut edited = listed[0].clone();
+    edited.name = "Mara K".into();
+    edited.ref_ids = vec![];
+    assert!(app_lib::stories::store::check_character(&edited).is_err(), "still needs a reference");
+    edited.ref_ids = vec![r.ref_id.clone()];
+    app_lib::stories::store::save_character(&db, &edited).unwrap();
+    let back = app_lib::stories::store::get_character(&db, "c1").unwrap().unwrap();
+    assert_eq!((back.name.as_str(), back.created_at.as_str()), ("Mara K", "t"));
 }

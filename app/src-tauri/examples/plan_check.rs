@@ -7,7 +7,7 @@ use std::time::Instant;
 fn character(id: &str, name: &str, desc: &str, refs: &[&str]) -> Character {
     Character {
         id: id.into(), name: name.into(), description: desc.into(), source: "generated".into(),
-        consent: true, adult: true, ref_ids: refs.iter().map(|s| s.to_string()).collect(),
+        consent: true, adult: true, ref_ids: refs.iter().map(|s| s.to_string()).collect(), ref_paths: vec![],
         created_at: String::new(), updated_at: String::new(),
     }
 }

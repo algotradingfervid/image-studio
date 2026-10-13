@@ -557,6 +557,8 @@ export interface Character {
   consent: boolean;
   adult: boolean;
   refIds: string[];
+  /** Display path next to each `refIds` entry ("" when the file is gone); filled when read, ignored when saved. */
+  refPaths: string[];
   createdAt: string;
   updatedAt: string;
 }

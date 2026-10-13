@@ -220,6 +220,12 @@ export function StoriesPanel({
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuUp, setMenuUp] = useState(false);
   const [formOpen, setFormOpen] = useState(false);
+  /** The character the form edits; null for a new one. */
+  const [editing, setEditing] = useState<Character | null>(null);
+  const editCharacter = (c: Character) => {
+    setEditing(c);
+    setFormOpen(true);
+  };
   const addBtnRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const menuId = `${id}-cast-menu`;
@@ -434,6 +440,9 @@ export function StoriesPanel({
                   <li key={c.id} className="chip story-cast__chip" title={c.description}>
                     <span className="story-cast__name">{c.name}</span>
                     {c.source === "real_person" && <span className="tag">Real person</span>}
+                    <button type="button" className="chip__x" aria-label={`Edit ${c.name}`} title="Edit character" onClick={() => editCharacter(c)}>
+                      <Icon name="edit" size={12} />
+                    </button>
                     <button type="button" className="chip__x" aria-label={`Remove ${c.name} from the cast`} onClick={() => removeFromCast(c.id)}>
                       <Icon name="x" size={12} />
                     </button>
@@ -476,19 +485,33 @@ export function StoriesPanel({
                   }}
                 >
                   {available.map((c) => (
-                    <button
-                      key={c.id}
-                      type="button"
-                      role="menuitem"
-                      className="menu__item lora-menu__item"
-                      onClick={() => {
-                        addToCast(c.id);
-                        closeMenu();
-                      }}
-                    >
-                      <span className="lora-menu__name">{c.name}</span>
-                      <span className="hint lora-menu__sub">{clip(c.description, 60)}</span>
-                    </button>
+                    <div key={c.id} className="story-cast__menu-row" role="none">
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="menu__item lora-menu__item"
+                        onClick={() => {
+                          addToCast(c.id);
+                          closeMenu();
+                        }}
+                      >
+                        <span className="lora-menu__name">{c.name}</span>
+                        <span className="hint lora-menu__sub">{clip(c.description, 60)}</span>
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="icon-btn"
+                        aria-label={`Edit ${c.name}`}
+                        title="Edit character"
+                        onClick={() => {
+                          setMenuOpen(false);
+                          editCharacter(c);
+                        }}
+                      >
+                        <Icon name="edit" size={14} />
+                      </button>
+                    </div>
                   ))}
                   {available.length === 0 && (
                     <div className="menu__empty">
@@ -618,14 +641,21 @@ export function StoriesPanel({
 
       <CharacterForm
         open={formOpen}
+        character={editing}
         onClose={() => {
+          setEditing(null);
           setFormOpen(false);
           requestAnimationFrame(() => addBtnRef.current?.focus({ preventScroll: true }));
         }}
         onSaved={(c) => {
-          setCharacters((cs) => [...cs.filter((x) => x.id !== c.id), c]);
+          setCharacters((cs) => (cs.some((x) => x.id === c.id) ? cs.map((x) => (x.id === c.id ? c : x)) : [...cs, c]));
+          const edited = !!editing;
+          setEditing(null);
           setFormOpen(false);
-          if (fieldsRef.current.cast.length < MAX_CAST) {
+          // The workspace reloads the cast: the next render compiles with the new references.
+          onSavedRef.current?.();
+          if (edited) toast.success(`${c.name} saved`);
+          else if (fieldsRef.current.cast.length < MAX_CAST) {
             addToCast(c.id);
             toast.success(`${c.name} saved and added to the cast`);
           } else toast.success(`${c.name} saved`, "The cast is full — remove someone to add them.");

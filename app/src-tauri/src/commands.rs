@@ -840,7 +840,8 @@ fn rendered((shot_id, job_id): (String, String)) -> RenderedShot {
 
 #[tauri::command]
 pub fn list_characters(core: CoreState<'_>) -> Res<Vec<Character>> {
-    stories::store::list_characters(&core.db.lock().unwrap())
+    let cs = stories::store::list_characters(&core.db.lock().unwrap())?;
+    Ok(render::with_ref_paths(&core.cfg.references_dir(), cs))
 }
 
 /// New when `id` is empty (id and timestamps assigned); else an update.
@@ -849,6 +850,7 @@ pub fn save_character(core: CoreState<'_>, character: Character) -> Res<Characte
     let mut c = character;
     c.name = c.name.trim().to_string();
     c.description = c.description.trim().to_string();
+    c.ref_paths = Vec::new(); // display only: not stored
     stories::store::check_character(&c)?;
     let now = crate::state::now_rfc3339();
     let db = core.db.lock().unwrap();
@@ -862,7 +864,8 @@ pub fn save_character(core: CoreState<'_>, character: Character) -> Res<Characte
     }
     c.updated_at = now;
     stories::store::save_character(&db, &c)?;
-    Ok(c)
+    drop(db);
+    Ok(render::with_ref_paths(&core.cfg.references_dir(), vec![c]).remove(0))
 }
 
 #[tauri::command]

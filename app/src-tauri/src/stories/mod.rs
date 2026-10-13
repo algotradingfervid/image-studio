@@ -19,6 +19,9 @@ pub struct Character {
     pub consent: bool,
     pub adult: bool,
     pub ref_ids: Vec<String>,
+    /// Display paths next to each `ref_ids` entry: filled when read, ignored when saved.
+    #[serde(default)]
+    pub ref_paths: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }

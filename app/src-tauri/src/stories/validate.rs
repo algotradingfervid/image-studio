@@ -170,7 +170,7 @@ mod tests {
     fn ch(id: &str, name: &str) -> Character {
         Character {
             id: id.into(), name: name.into(), description: "a tall adult".into(), source: "generated".into(),
-            consent: true, adult: true, ref_ids: vec![format!("{id}-ref")], created_at: String::new(), updated_at: String::new(),
+            consent: true, adult: true, ref_ids: vec![format!("{id}-ref")], ref_paths: vec![], created_at: String::new(), updated_at: String::new(),
         }
     }
     fn story(target_s: u32, cast: &[&str]) -> Story {
