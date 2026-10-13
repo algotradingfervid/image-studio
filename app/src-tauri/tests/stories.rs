@@ -5,10 +5,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate, Request, Respond};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn mara() -> Character { Character { id: "c1".into(), name: "Mara".into(), description: "woman in her 30s".into(),
-    source: "generated".into(), consent: false, adult: true, ref_ids: vec!["r1".into()], ref_paths: vec![], created_at: "t".into(), updated_at: "t".into() } }
+    source: "generated".into(), consent: false, adult: true, ref_ids: vec!["r1".into()], ref_paths: vec![], vault: false, created_at: "t".into(), updated_at: "t".into() } }
 fn st(target: u32) -> Story { Story { id: "s1".into(), title: String::new(), logline: String::new(), brief: "A heist on a rooftop".into(),
     target_s: target, aspect: "16:9".into(), style: String::new(), cast: vec!["c1".into()], voices: vec![], status: "draft".into(),
-    result_image_id: None, created_at: "t".into(), updated_at: "t".into() } }
+    result_image_id: None, vault: false, created_at: "t".into(), updated_at: "t".into() } }
 #[test]
 fn partial_voices_are_accepted_and_stale_entries_dropped() {
     use app_lib::stories::{cast_voices, compile::compile_shot, DialogueLine, Shot, Voice};
@@ -428,13 +428,13 @@ mod render_harness {
             .collect();
         let mara = Character {
             id: "c-mara".into(), name: "Mara".into(), description: "woman in her 30s, short black hair".into(),
-            source: "generated".into(), consent: false, adult: true, ref_ids: refs, ref_paths: vec![],
+            source: "generated".into(), consent: false, adult: true, ref_ids: refs, ref_paths: vec![], vault: false,
             created_at: "t".into(), updated_at: "t".into(),
         };
         let story = Story {
             id: "s-1".into(), title: "Rooftop".into(), logline: String::new(), brief: "A heist on a rooftop".into(),
             target_s: shots.iter().map(|s| s.1).sum(), aspect: "16:9".into(), style: String::new(),
-            cast: vec![mara.id.clone()], voices: vec![], status: "planned".into(), result_image_id: None,
+            cast: vec![mara.id.clone()], voices: vec![], status: "planned".into(), result_image_id: None, vault: false,
             created_at: "t".into(), updated_at: "t".into(),
         };
         let list: Vec<Shot> = shots

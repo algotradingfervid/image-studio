@@ -22,6 +22,9 @@ pub struct Character {
     /// Display paths next to each `ref_ids` entry: filled when read, ignored when saved.
     #[serde(default)]
     pub ref_paths: Vec<String>,
+    /// Lives in the vault (sealed record, vault blob references). Fixed at creation.
+    #[serde(default)]
+    pub vault: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -85,8 +88,21 @@ pub struct Story {
     /// "draft" | "planned" | "assembled"
     pub status: String,
     pub result_image_id: Option<String>,
+    /// Lives in the vault (one sealed `StoryDoc`). Fixed at creation.
+    #[serde(default)]
+    pub vault: bool,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// One sealed record per vault story (`vault/stories/<id>.bin`): the story and all its shots.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StoryDoc {
+    pub story: Story,
+    pub shots: Vec<Shot>,
+    #[serde(default)]
+    pub sidecar: Option<serde_json::Value>,
 }
 
 /// A partial story update: only the fields that are set are written.

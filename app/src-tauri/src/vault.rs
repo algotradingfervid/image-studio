@@ -37,12 +37,16 @@
 //!   under another name does not decrypt.
 //! - Item metadata (prompt, model, seed, …) is a JSON record sealed exactly
 //!   like a blob (`vault/items/<uuid>.bin`); media live in
-//!   `vault/blobs/<uuid>.bin`. The SQLite database never sees vault items.
+//!   `vault/blobs/<uuid>.bin`. Vault characters (`vault/characters/<uuid>.bin`)
+//!   and story docs — a story plus its shots (`vault/stories/<uuid>.bin`) —
+//!   are sealed the same way; writing them needs the unlocked vault, only
+//!   item writes work locked. The SQLite database never sees any of them.
 //! - Keys and plaintext live in `Zeroizing` buffers; locking drops the private
 //!   key (zeroized by `x25519-dalek`) and the decrypted item cache. Plaintext
 //!   is never written to disk by this module (no temp files).
 
 use crate::db::{ImageRecord, LoraRef, RunpodTimes, KIND_IMAGE, KIND_VIDEO};
+use crate::stories::{Character, StoryDoc};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine;
 use chacha20poly1305::aead::generic_array::GenericArray;
@@ -53,7 +57,7 @@ use hkdf::Hkdf;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -339,19 +343,49 @@ pub struct VaultStatus {
     pub migration_pending: bool,
 }
 
+/// The private key plus the decrypted index of every sealed record, held
+/// only while unlocked. Stories: vault characters (`vault/characters/`) and
+/// story docs (`vault/stories/`) are cached here like items.
 struct Unlocked {
     secret: StaticSecret, // zeroized on drop (x25519-dalek "zeroize" feature)
     items: BTreeMap<String, VaultItem>,
+    characters: BTreeMap<String, Character>,
+    stories: BTreeMap<String, StoryDoc>,
 }
 
 impl Drop for Unlocked {
     fn drop(&mut self) {
-        // Prompts and settings are sensitive too: wipe the cached records.
+        // Prompts, names and story text are sensitive too: wipe the cached records.
         for item in self.items.values_mut() {
             item.prompt.zeroize();
             item.negative_prompt.zeroize();
         }
+        for c in self.characters.values_mut() {
+            c.name.zeroize();
+            c.description.zeroize();
+        }
+        for d in self.stories.values_mut() {
+            for s in [&mut d.story.title, &mut d.story.logline, &mut d.story.brief, &mut d.story.style] {
+                s.zeroize();
+            }
+            for v in d.story.voices.iter_mut() {
+                v.voice.zeroize();
+            }
+            for sh in d.shots.iter_mut() {
+                for s in [&mut sh.setting, &mut sh.camera, &mut sh.action, &mut sh.sound] {
+                    s.zeroize();
+                }
+                for l in sh.dialogue.iter_mut() {
+                    l.line.zeroize();
+                    l.delivery.zeroize();
+                }
+            }
+            // The planner sidecar is an arbitrary JSON value: dropped, not zeroized.
+            d.sidecar = None;
+        }
         self.items.clear();
+        self.characters.clear();
+        self.stories.clear();
     }
 }
 
@@ -646,6 +680,62 @@ fn write_private(path: &Path, body: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Opens one sealed JSON record (`<uuid>.bin`, sealed like a blob and bound
+/// to its file name): returns the file stem and the decoded value. The caller
+/// checks that the record's own id equals the stem.
+fn read_sealed<T: serde::de::DeserializeOwned>(secret: &StaticSecret, path: &Path) -> Result<(String, T), String> {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let binding = binding_of(stem)?;
+    let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut hb = [0u8; HEADER_LEN];
+    f.read_exact(&mut hb).map_err(|_| "truncated".to_string())?;
+    let header = BlobHeader::parse(&hb, &binding)?;
+    if f.metadata().map(|m| m.len()).unwrap_or(0) != header.file_len()? {
+        return Err(corrupt());
+    }
+    let pt = open_chunks(secret, &mut f, &header, 0, header.chunk_count() - 1)?;
+    let value: T = serde_json::from_slice(&pt).map_err(|_| "not a vault record".to_string())?;
+    Ok((stem.to_string(), value))
+}
+
+/// Decrypts every `*.bin` record in `dir` into a map keyed by `id_of(&value)`,
+/// skipping (and logging by file name only) any file that does not open or
+/// whose id is not its file name.
+fn load_dir<T: serde::de::DeserializeOwned>(
+    secret: &StaticSecret,
+    dir: &Path,
+    id_of: impl Fn(&T) -> &str,
+) -> BTreeMap<String, T> {
+    let mut out = BTreeMap::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("bin") {
+            continue;
+        }
+        let loaded = read_sealed::<T>(secret, &path).and_then(|(stem, value)| {
+            if id_of(&value) == stem {
+                Ok(value)
+            } else {
+                Err("record id does not match its file".into())
+            }
+        });
+        match loaded {
+            Ok(value) => {
+                out.insert(id_of(&value).to_string(), value);
+            }
+            Err(e) => crate::alog!(
+                "vault",
+                "skipping unreadable record {}: {e}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ),
+        }
+    }
+    out
+}
+
 /// Removes `*.tmp` left behind by an interrupted write.
 fn sweep_tmp(dir: &Path) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
@@ -700,7 +790,7 @@ impl Vault {
             .and_then(|s| serde_json::from_str::<VaultFile>(&s).ok())
             .and_then(|f| unb64(&f.public_key).ok())
             .and_then(|k| <[u8; 32]>::try_from(k).ok());
-        for d in [dir.clone(), dir.join("blobs"), dir.join("items")] {
+        for d in [dir.clone(), dir.join("blobs"), dir.join("items"), dir.join("characters"), dir.join("stories")] {
             sweep_tmp(&d);
         }
         Vault {
@@ -736,6 +826,12 @@ impl Vault {
     }
     fn item_path(&self, id: &str) -> PathBuf {
         self.items_dir().join(format!("{id}.bin"))
+    }
+    fn characters_dir(&self) -> PathBuf {
+        self.dir.join("characters")
+    }
+    fn stories_dir(&self) -> PathBuf {
+        self.dir.join("stories")
     }
     /// The migration journal (ids only); exists while a migration is unfinished.
     pub fn journal_path(&self) -> PathBuf {
@@ -821,6 +917,8 @@ impl Vault {
         *self.unlocked.lock().unwrap() = Some(Unlocked {
             secret,
             items: BTreeMap::new(),
+            characters: BTreeMap::new(),
+            stories: BTreeMap::new(),
         });
         self.touch();
         Ok(())
@@ -872,14 +970,23 @@ impl Vault {
     pub fn unlock(&self, password: &[u8]) -> Result<(), String> {
         let _gate = self.unlock_gate.lock().unwrap();
         let (secret, public) = self.open_private_key(password)?;
-        let items = self.load_items(&secret);
+        // One pass over the three record folders: items, characters, story docs.
+        let items = load_dir(&secret, &self.items_dir(), |i: &VaultItem| &i.id);
+        let characters = load_dir(&secret, &self.characters_dir(), |c: &Character| &c.id);
+        let stories = load_dir(&secret, &self.stories_dir(), |d: &StoryDoc| &d.story.id);
         *self.public_key.lock().unwrap() = Some(public);
-        *self.unlocked.lock().unwrap() = Some(Unlocked { secret, items });
+        *self.unlocked.lock().unwrap() = Some(Unlocked {
+            secret,
+            items,
+            characters,
+            stories,
+        });
         self.touch();
         Ok(())
     }
 
-    /// Wipes the private key, the decrypted item cache and the media cache. Idempotent.
+    /// Wipes the private key, the decrypted record caches (items, characters,
+    /// story docs) and the media cache. Idempotent.
     pub fn lock(&self) -> bool {
         self.media_cache.lock().unwrap().clear();
         self.unlocked.lock().unwrap().take().is_some()
@@ -1076,47 +1183,54 @@ impl Vault {
         }
     }
 
-    // ----- items -----
+    // ----- sealed records (items, characters, story docs) -----
 
-    fn load_items(&self, secret: &StaticSecret) -> BTreeMap<String, VaultItem> {
-        let mut items = BTreeMap::new();
-        let Ok(rd) = std::fs::read_dir(self.items_dir()) else {
-            return items;
-        };
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("bin") {
-                continue;
-            }
-            match Self::read_item_file(secret, &path) {
-                Ok(item) => {
-                    items.insert(item.id.clone(), item);
+    /// Seals a JSON record into `dir/<id>.bin` exactly like a blob (public key
+    /// only, so it works locked; the id is bound into the AEAD). Plaintext
+    /// JSON lives in a `Zeroizing` buffer and never touches disk.
+    fn seal_record<T: Serialize>(&self, dir: &Path, id: &str, value: &T) -> Result<(), String> {
+        let binding = binding_of(id)?;
+        let public = self.public_key()?;
+        let json = Zeroizing::new(serde_json::to_vec(value).map_err(|e| e.to_string())?);
+        let sealed = seal_bytes(&public, &json, &binding)?;
+        std::fs::create_dir_all(dir).map_err(|e| format!("Could not write to the vault: {e}"))?;
+        write_private(&dir.join(format!("{id}.bin")), &sealed)
+    }
+
+    /// Removes a sealed record file; a missing file is fine.
+    fn unlink_record(path: &Path) -> Result<(), String> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("Could not delete the vault file: {e}")),
+        }
+    }
+
+    /// Deletes each candidate blob that no item and no character still
+    /// references (a story's takes and a character's reference images may
+    /// share blobs). Failures are logged: a leftover blob is ciphertext.
+    fn gc_blobs(&self, u: &Unlocked, candidates: impl Iterator<Item = BlobRef>) {
+        let used: HashSet<&str> = u
+            .items
+            .values()
+            .flat_map(|i| i.blobs().into_iter().map(|b| b.id.as_str()))
+            .chain(u.characters.values().flat_map(|c| {
+                c.ref_ids
+                    .iter()
+                    .filter_map(|p| p.strip_prefix(VAULT_PATH_PREFIX))
+                    .map(|r| r.split('.').next().unwrap_or(""))
+            }))
+            .collect();
+        for b in candidates {
+            if !used.contains(b.id.as_str()) {
+                if let Err(e) = self.delete_blob(&b.id) {
+                    crate::alog!("vault", "gc: {e}");
                 }
-                Err(e) => crate::alog!("vault", "skipping unreadable item {}: {e}",
-                    path.file_name().unwrap_or_default().to_string_lossy()
-                ),
             }
         }
-        items
     }
 
-    fn read_item_file(secret: &StaticSecret, path: &Path) -> Result<VaultItem, String> {
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let binding = binding_of(stem)?;
-        let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
-        let mut hb = [0u8; HEADER_LEN];
-        f.read_exact(&mut hb).map_err(|_| "truncated".to_string())?;
-        let header = BlobHeader::parse(&hb, &binding)?;
-        if f.metadata().map(|m| m.len()).unwrap_or(0) != header.file_len()? {
-            return Err(corrupt());
-        }
-        let pt = open_chunks(secret, &mut f, &header, 0, header.chunk_count() - 1)?;
-        let item: VaultItem = serde_json::from_slice(&pt).map_err(|_| "not a vault record".to_string())?;
-        if item.id != stem {
-            return Err("record id does not match its file".into());
-        }
-        Ok(item)
-    }
+    // ----- items -----
 
     /// The item that was moved in from general record `source_id`, if any
     /// (lets an interrupted migration resume without duplicating).
@@ -1130,16 +1244,14 @@ impl Vault {
             .cloned())
     }
 
-    /// Seals an item record (works while locked). When unlocked, the cache is updated too.
+    /// Seals an item record (the one write that works while locked: a take or
+    /// film finishing after a lock is still saved). When unlocked, the cache
+    /// is updated too.
     pub fn put_item(&self, item: &VaultItem) -> Result<(), String> {
         if uuid::Uuid::parse_str(&item.id).is_err() {
             return Err("Invalid vault item id".into());
         }
-        let public = self.public_key()?;
-        let json = Zeroizing::new(serde_json::to_vec(item).map_err(|e| e.to_string())?);
-        let sealed = seal_bytes(&public, &json, &binding_of(&item.id)?)?;
-        std::fs::create_dir_all(self.items_dir()).map_err(|e| format!("Could not write to the vault: {e}"))?;
-        write_private(&self.item_path(&item.id), &sealed)?;
+        self.seal_record(&self.items_dir(), &item.id, item)?;
         if let Some(u) = self.unlocked.lock().unwrap().as_mut() {
             u.items.insert(item.id.clone(), item.clone());
         }
@@ -1170,7 +1282,7 @@ impl Vault {
             .ok_or_else(|| "That vault item no longer exists".to_string())
     }
 
-    /// Removes an item and every blob no other item still references.
+    /// Removes an item and every blob no other item and no character still references.
     pub fn delete_item(&self, id: &str) -> Result<VaultItem, String> {
         let item = {
             let mut guard = self.unlocked.lock().unwrap();
@@ -1179,22 +1291,134 @@ impl Vault {
                 .items
                 .remove(id)
                 .ok_or_else(|| "That vault item no longer exists".to_string())?;
-            let still_used: std::collections::HashSet<&str> = u
-                .items
-                .values()
-                .flat_map(|i| i.blobs().into_iter().map(|b| b.id.as_str()))
-                .collect();
-            for b in item.blobs() {
-                if !still_used.contains(b.id.as_str()) {
-                    self.delete_blob(&b.id)?;
-                }
-            }
+            self.gc_blobs(u, item.blobs().into_iter().cloned());
             item
         };
         match std::fs::remove_file(self.item_path(id)) {
             Ok(()) | Err(_) => {}
         }
         Ok(item)
+    }
+
+    /// The takes and the film of a story (items with that `story_id`), newest first.
+    pub fn items_for_story(&self, story_id: &str) -> Result<Vec<VaultItem>, String> {
+        Ok(self
+            .items()?
+            .into_iter()
+            .filter(|i| i.story_id.as_deref() == Some(story_id))
+            .collect())
+    }
+
+    // ----- characters (sealed records; every write needs the unlocked vault) -----
+
+    /// Seals a vault character into `vault/characters/<id>.bin` and updates
+    /// the cache. Reference blobs the previous version used and nothing else
+    /// references any more are deleted.
+    pub fn put_character(&self, c: &Character) -> Result<(), String> {
+        let mut guard = self.unlocked.lock().unwrap();
+        let u = guard.as_mut().ok_or_else(Self::locked_err)?;
+        self.seal_record(&self.characters_dir(), &c.id, c)?;
+        let old = u.characters.insert(c.id.clone(), c.clone());
+        if let Some(old) = old {
+            self.gc_blobs(u, old.ref_ids.iter().filter_map(|p| BlobRef::parse(p)));
+        }
+        Ok(())
+    }
+
+    pub fn character(&self, id: &str) -> Result<Character, String> {
+        let guard = self.unlocked.lock().unwrap();
+        let u = guard.as_ref().ok_or_else(Self::locked_err)?;
+        u.characters
+            .get(id)
+            .cloned()
+            .ok_or_else(|| "That character no longer exists".to_string())
+    }
+
+    /// Every vault character, by name (case-insensitive), as the General store lists them.
+    pub fn characters(&self) -> Result<Vec<Character>, String> {
+        let guard = self.unlocked.lock().unwrap();
+        let u = guard.as_ref().ok_or_else(Self::locked_err)?;
+        let mut v: Vec<Character> = u.characters.values().cloned().collect();
+        v.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(v)
+    }
+
+    /// Removes a character: its file, its cache entry, and every reference
+    /// blob no item or other character still uses.
+    pub fn delete_character(&self, id: &str) -> Result<Character, String> {
+        let mut guard = self.unlocked.lock().unwrap();
+        let u = guard.as_mut().ok_or_else(Self::locked_err)?;
+        if !u.characters.contains_key(id) {
+            return Err("That character no longer exists".into());
+        }
+        // The file first: if it can't be removed the cache stays truthful.
+        Self::unlink_record(&self.characters_dir().join(format!("{id}.bin")))?;
+        let c = u.characters.remove(id).expect("checked above");
+        self.gc_blobs(u, c.ref_ids.iter().filter_map(|p| BlobRef::parse(p)));
+        Ok(c)
+    }
+
+    /// Whether `vault/characters/<id>.bin` exists (file-name check only; works locked).
+    pub fn character_file_exists(&self, id: &str) -> bool {
+        uuid::Uuid::parse_str(id).is_ok() && self.characters_dir().join(format!("{id}.bin")).is_file()
+    }
+
+    // ----- story docs (sealed records; every write needs the unlocked vault) -----
+
+    /// Seals a story and its shots into `vault/stories/<story id>.bin` and updates the cache.
+    pub fn put_story_doc(&self, d: &StoryDoc) -> Result<(), String> {
+        let mut guard = self.unlocked.lock().unwrap();
+        let u = guard.as_mut().ok_or_else(Self::locked_err)?;
+        self.seal_record(&self.stories_dir(), &d.story.id, d)?;
+        u.stories.insert(d.story.id.clone(), d.clone());
+        Ok(())
+    }
+
+    pub fn story_doc(&self, id: &str) -> Result<StoryDoc, String> {
+        let guard = self.unlocked.lock().unwrap();
+        let u = guard.as_ref().ok_or_else(Self::locked_err)?;
+        u.stories
+            .get(id)
+            .cloned()
+            .ok_or_else(|| "That story no longer exists".to_string())
+    }
+
+    /// Every vault story doc, most recently updated first (as the General store lists stories).
+    pub fn story_docs(&self) -> Result<Vec<StoryDoc>, String> {
+        let guard = self.unlocked.lock().unwrap();
+        let u = guard.as_ref().ok_or_else(Self::locked_err)?;
+        let mut v: Vec<StoryDoc> = u.stories.values().cloned().collect();
+        v.sort_by(|a, b| {
+            b.story
+                .updated_at
+                .cmp(&a.story.updated_at)
+                .then_with(|| b.story.created_at.cmp(&a.story.created_at))
+                .then_with(|| b.story.id.cmp(&a.story.id))
+        });
+        Ok(v)
+    }
+
+    /// Removes the story doc only: its takes and film are items the caller deletes.
+    pub fn delete_story_doc(&self, id: &str) -> Result<(), String> {
+        let mut guard = self.unlocked.lock().unwrap();
+        let u = guard.as_mut().ok_or_else(Self::locked_err)?;
+        if !u.stories.contains_key(id) {
+            return Err("That story no longer exists".into());
+        }
+        Self::unlink_record(&self.stories_dir().join(format!("{id}.bin")))?;
+        u.stories.remove(id);
+        Ok(())
+    }
+
+    /// Whether `vault/stories/<id>.bin` exists (file-name check only; works
+    /// locked, so a router can answer `VAULT_LOCKED` instead of "no such story").
+    pub fn story_file_exists(&self, id: &str) -> bool {
+        uuid::Uuid::parse_str(id).is_ok() && self.stories_dir().join(format!("{id}.bin")).is_file()
     }
 
     // ----- vault:// -----
@@ -1403,6 +1627,7 @@ pub fn item_from_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stories::Story;
 
     const PW: &[u8] = b"correct horse battery";
 
@@ -1778,6 +2003,179 @@ mod tests {
         v.lock();
         v.unlock(PW).unwrap();
         assert_eq!(v.items().unwrap().len(), 3);
+    }
+
+    fn vchar(v: &Vault, name: &str) -> Character {
+        let b = v.seal_blob(b"\x89PNG\r\n\x1a\nface", "png").unwrap();
+        Character {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.into(),
+            description: "woman in her 30s, green jacket".into(),
+            source: "generated".into(),
+            consent: false,
+            adult: true,
+            ref_ids: vec![b.path()],
+            ref_paths: vec![],
+            vault: true,
+            created_at: "t".into(),
+            updated_at: "t".into(),
+        }
+    }
+
+    fn vstory(cast: Vec<String>) -> Story {
+        Story {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: "Light Packing".into(),
+            logline: String::new(),
+            brief: "two partners decide to run tonight".into(),
+            target_s: 60,
+            aspect: "16:9".into(),
+            style: String::new(),
+            cast,
+            voices: vec![],
+            status: "draft".into(),
+            result_image_id: None,
+            vault: true,
+            created_at: "t".into(),
+            updated_at: "t".into(),
+        }
+    }
+
+    #[test]
+    fn characters_and_story_docs_seal_round_trip_and_hide_while_locked() {
+        let (_d, v) = vault();
+        v.create(PW, KdfParams::fast()).unwrap();
+        let c = vchar(&v, "Mara");
+        v.put_character(&c).unwrap();
+        let story = vstory(vec![c.id.clone()]);
+        let doc = StoryDoc { story: story.clone(), shots: vec![], sidecar: None };
+        v.put_story_doc(&doc).unwrap();
+        assert_eq!(v.characters().unwrap(), vec![c.clone()]);
+        assert_eq!(v.character(&c.id).unwrap(), c);
+        assert_eq!(v.story_doc(&story.id).unwrap().story.title, "Light Packing");
+        assert!(v.character_file_exists(&c.id) && !v.character_file_exists("nope"));
+        v.lock();
+        assert!(v.characters().unwrap_err().starts_with("VAULT_LOCKED"));
+        assert!(v.character(&c.id).unwrap_err().starts_with("VAULT_LOCKED"));
+        assert!(v.story_doc(&story.id).unwrap_err().starts_with("VAULT_LOCKED"));
+        assert!(v.story_docs().unwrap_err().starts_with("VAULT_LOCKED"));
+        assert!(v.items_for_story(&story.id).unwrap_err().starts_with("VAULT_LOCKED"));
+        assert!(v.put_story_doc(&doc).unwrap_err().starts_with("VAULT_LOCKED"), "edits need the unlocked vault");
+        assert!(v.put_character(&c).unwrap_err().starts_with("VAULT_LOCKED"));
+        assert!(v.delete_story_doc(&story.id).unwrap_err().starts_with("VAULT_LOCKED"));
+        assert!(v.delete_character(&c.id).unwrap_err().starts_with("VAULT_LOCKED"));
+        assert!(v.story_file_exists(&story.id) && !v.story_file_exists("nope"));
+        assert!(v.character_file_exists(&c.id), "file-name check works locked");
+        for f in walk(v.dir()) {
+            let bytes = std::fs::read(&f).unwrap();
+            for needle in [b"Light Packing".as_slice(), b"run tonight", b"green jacket", b"Mara"] {
+                assert!(!contains(&bytes, needle), "{}", f.display());
+            }
+        }
+        v.unlock(PW).unwrap();
+        assert_eq!(v.story_docs().unwrap().len(), 1);
+        assert_eq!(v.story_docs().unwrap()[0], doc, "reloaded from disk on unlock");
+        v.delete_story_doc(&story.id).unwrap();
+        assert!(v.story_docs().unwrap().is_empty());
+        assert!(!v.story_file_exists(&story.id));
+        assert!(v.story_doc(&story.id).is_err());
+        assert!(v.delete_story_doc(&story.id).is_err(), "gone");
+        // Characters list by name, case-insensitively.
+        let zed = vchar(&v, "zed");
+        let ann = vchar(&v, "Ann");
+        v.put_character(&zed).unwrap();
+        v.put_character(&ann).unwrap();
+        let names: Vec<String> = v.characters().unwrap().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["Ann", "Mara", "zed"]);
+    }
+
+    #[test]
+    fn character_blob_gc_keeps_blobs_used_by_items() {
+        let (_d, v) = vault();
+        v.create(PW, KdfParams::fast()).unwrap();
+        let c = vchar(&v, "Mara");
+        let face = BlobRef::parse(&c.ref_ids[0]).unwrap();
+        v.put_character(&c).unwrap();
+        // A take rendered with that reference keeps it alive.
+        let mut take = sample_item(&v.seal_blob(b"\0\0\0\x18ftypisom", "mp4").unwrap());
+        take.references = vec![face.clone()];
+        take.story_id = Some("s".into());
+        take.shot_id = Some("sh".into());
+        v.put_item(&take).unwrap();
+        let mut edited = c.clone();
+        edited.ref_ids = vec![v.seal_blob(b"\x89PNG\r\n\x1a\nother", "png").unwrap().path()];
+        v.put_character(&edited).unwrap();
+        assert!(v.open_blob(&face.id).is_ok(), "still referenced by the take");
+        v.delete_item(&take.id).unwrap();
+        assert!(v.open_blob(&face.id).is_err(), "last user gone");
+        v.delete_character(&edited.id).unwrap();
+        assert!(v.open_blob(&BlobRef::parse(&edited.ref_ids[0]).unwrap().id).is_err());
+        assert!(!v.character_file_exists(&edited.id));
+        assert!(v.characters().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_an_item_keeps_a_blob_a_character_still_references() {
+        let (_d, v) = vault();
+        v.create(PW, KdfParams::fast()).unwrap();
+        let c = vchar(&v, "Mara");
+        let face = BlobRef::parse(&c.ref_ids[0]).unwrap();
+        v.put_character(&c).unwrap();
+        let mut take = sample_item(&v.seal_blob(b"\0\0\0\x18ftypisom", "mp4").unwrap());
+        take.references = vec![face.clone()];
+        v.put_item(&take).unwrap();
+        v.delete_item(&take.id).unwrap();
+        assert!(v.open_blob(&face.id).is_ok(), "the character still lists it");
+        assert!(v.open_blob(&take.media.id).is_err(), "the take's own media is gone");
+        // Two characters sharing a reference: the first deletion keeps it.
+        let mut twin = vchar(&v, "Twin");
+        twin.ref_ids = vec![face.path()];
+        v.put_character(&twin).unwrap();
+        v.delete_character(&c.id).unwrap();
+        assert!(v.open_blob(&face.id).is_ok());
+        v.delete_character(&twin.id).unwrap();
+        assert!(v.open_blob(&face.id).is_err());
+    }
+
+    #[test]
+    fn items_for_story_lists_takes_and_film_newest_first() {
+        let (_d, v) = vault();
+        v.create(PW, KdfParams::fast()).unwrap();
+        let mut take = sample_item(&v.seal_blob(b"\0\0\0\x18ftypisom", "mp4").unwrap());
+        take.story_id = Some("s1".into());
+        take.shot_id = Some("sh1".into());
+        take.created_at = "2026-01-01T00:00:00Z".into();
+        let mut film = sample_item(&v.seal_blob(b"\0\0\0\x18ftypisom", "mp4").unwrap());
+        film.story_id = Some("s1".into());
+        film.created_at = "2026-01-02T00:00:00Z".into();
+        let mut other = sample_item(&v.seal_blob(b"\0\0\0\x18ftypisom", "mp4").unwrap());
+        other.story_id = Some("s2".into());
+        let plain = sample_item(&v.seal_blob(b"\0\0\0\x18ftypisom", "mp4").unwrap());
+        for i in [&take, &film, &other, &plain] {
+            v.put_item(i).unwrap();
+        }
+        let ids: Vec<String> = v.items_for_story("s1").unwrap().into_iter().map(|i| i.id).collect();
+        assert_eq!(ids, vec![film.id.clone(), take.id.clone()]);
+        assert!(v.items_for_story("none").unwrap().is_empty());
+    }
+
+    #[test]
+    fn unreadable_character_and_story_files_are_skipped_and_tmp_swept() {
+        let (_d, v) = vault();
+        v.create(PW, KdfParams::fast()).unwrap();
+        let c = vchar(&v, "Mara");
+        v.put_character(&c).unwrap();
+        v.put_story_doc(&StoryDoc { story: vstory(vec![]), shots: vec![], sidecar: None }).unwrap();
+        std::fs::write(v.characters_dir().join(format!("{}.bin", uuid::Uuid::new_v4())), b"junk").unwrap();
+        std::fs::write(v.stories_dir().join("not-a-uuid.bin"), b"junk").unwrap();
+        std::fs::write(v.characters_dir().join("half.tmp"), b"junk").unwrap();
+        std::fs::write(v.stories_dir().join("half.tmp"), b"junk").unwrap();
+        let fresh = Vault::new(v.dir().to_path_buf(), 10);
+        assert!(!v.characters_dir().join("half.tmp").exists());
+        assert!(!v.stories_dir().join("half.tmp").exists());
+        fresh.unlock(PW).unwrap();
+        assert_eq!(fresh.characters().unwrap(), vec![c]);
+        assert_eq!(fresh.story_docs().unwrap().len(), 1);
     }
 
     #[test]

@@ -226,6 +226,7 @@ fn upsert_character(core: &Core, spec: &Spec, ref_id: String) -> Result<Characte
         adult: true,
         ref_ids: vec![ref_id],
         ref_paths: vec![],
+        vault: false,
         created_at: old.map(|c| c.created_at).unwrap_or_else(|| now.clone()),
         updated_at: now,
     };
@@ -381,6 +382,7 @@ fn ensure_story(core: &Core, cast: &[Character]) -> Result<String, String> {
         voices: vec![],
         status: "draft".into(),
         result_image_id: None,
+        vault: false,
         created_at: now.clone(),
         updated_at: now,
     };

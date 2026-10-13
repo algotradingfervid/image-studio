@@ -72,6 +72,7 @@ fn row_to_character(row: &rusqlite::Row) -> rusqlite::Result<Character> {
         adult: row.get("adult")?,
         ref_ids: from_json(&refs),
         ref_paths: Vec::new(),
+        vault: false,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
@@ -158,6 +159,7 @@ fn row_to_story(row: &rusqlite::Row) -> rusqlite::Result<Story> {
         voices: from_json(&voices),
         status: row.get("status")?,
         result_image_id: row.get("result_image_id")?,
+        vault: false,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
@@ -403,6 +405,7 @@ mod tests {
             adult: true,
             ref_ids: vec!["r1".into()],
             ref_paths: vec![],
+            vault: false,
             created_at: "t".into(),
             updated_at: "t".into(),
         }
@@ -420,6 +423,7 @@ mod tests {
             voices: vec![],
             status: "draft".into(),
             result_image_id: None,
+            vault: false,
             created_at: "t".into(),
             updated_at: "t".into(),
         }

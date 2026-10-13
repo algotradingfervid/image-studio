@@ -7,7 +7,7 @@ use std::time::Instant;
 fn character(id: &str, name: &str, desc: &str, refs: &[&str]) -> Character {
     Character {
         id: id.into(), name: name.into(), description: desc.into(), source: "generated".into(),
-        consent: true, adult: true, ref_ids: refs.iter().map(|s| s.to_string()).collect(), ref_paths: vec![],
+        consent: true, adult: true, ref_ids: refs.iter().map(|s| s.to_string()).collect(), ref_paths: vec![], vault: false,
         created_at: String::new(), updated_at: String::new(),
     }
 }
@@ -35,7 +35,7 @@ async fn main() {
         let story = Story {
             id: format!("s-{name}"), title: String::new(), logline: String::new(), brief: brief.into(), target_s: 60,
             aspect: "16:9".into(), style: String::new(), cast: vec!["mara".into(), "ivo".into()], voices: vec![],
-            status: "draft".into(), result_image_id: None, created_at: String::new(), updated_at: String::new(),
+            status: "draft".into(), result_image_id: None, vault: false, created_at: String::new(), updated_at: String::new(),
         };
         eprintln!("planning {name} ...");
         let t = Instant::now();

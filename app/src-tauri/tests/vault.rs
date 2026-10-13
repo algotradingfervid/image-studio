@@ -830,6 +830,57 @@ fn migration_leaves_story_media_in_general() {
 }
 
 #[test]
+fn unlock_loads_story_docs_and_lock_wipes_them() {
+    use app_lib::stories::{Story, StoryDoc};
+    let h = harness("http://127.0.0.1:1");
+    let v = &h.core.vault;
+    v.create(PW, KdfParams::fast()).unwrap();
+    let story = Story {
+        id: uuid::Uuid::new_v4().to_string(),
+        title: "Light Packing".into(),
+        logline: String::new(),
+        brief: "two partners decide to run tonight".into(),
+        target_s: 60,
+        aspect: "16:9".into(),
+        style: String::new(),
+        cast: vec![],
+        voices: vec![],
+        status: "draft".into(),
+        result_image_id: None,
+        vault: true,
+        created_at: "t".into(),
+        updated_at: "t".into(),
+    };
+    let doc = StoryDoc { story: story.clone(), shots: vec![], sidecar: Some(json!({"planner": "x"})) };
+    v.put_story_doc(&doc).unwrap();
+    // A take of that story is an item, counted by the workspace, not the gallery.
+    let mut take = record("", KIND_VIDEO, Path::new(""), "2026-02-01T00:00:00Z");
+    take.story_id = Some(story.id.clone());
+    take.shot_id = Some("sh1".into());
+    vault_migrate::seal_output(&h.core, &take, &mp4(4), Some(&jpeg(4))).unwrap();
+    v.lock();
+    assert!(v.story_doc(&story.id).unwrap_err().starts_with("VAULT_LOCKED"));
+    assert!(v.story_file_exists(&story.id));
+
+    // A fresh Vault over the same directory loads the doc back on unlock.
+    let fresh = app_lib::vault::Vault::new(v.dir().to_path_buf(), 10);
+    assert!(fresh.story_doc(&story.id).unwrap_err().starts_with("VAULT_LOCKED"));
+    fresh.unlock(PW).unwrap();
+    assert_eq!(fresh.story_doc(&story.id).unwrap(), doc);
+    assert_eq!(fresh.items_for_story(&story.id).unwrap().len(), 1);
+    assert_eq!(fresh.status().item_count, Some(0), "story items are not gallery items");
+    fresh.lock();
+    assert!(fresh.story_docs().is_err());
+    assert_eq!(fresh.status().item_count, None);
+    for p in walk(v.dir()) {
+        let bytes = std::fs::read(&p).unwrap();
+        for needle in [b"Light Packing".as_slice(), b"run tonight", b"planner"] {
+            assert!(!contains(&bytes, needle), "{}", p.display());
+        }
+    }
+}
+
+#[test]
 fn move_to_vault_refuses_story_media() {
     let h = harness("http://127.0.0.1:1");
     seed_story_media(&h);

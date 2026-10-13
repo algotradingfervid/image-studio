@@ -170,14 +170,14 @@ mod tests {
     fn ch(id: &str, name: &str) -> Character {
         Character {
             id: id.into(), name: name.into(), description: "a tall adult".into(), source: "generated".into(),
-            consent: true, adult: true, ref_ids: vec![format!("{id}-ref")], ref_paths: vec![], created_at: String::new(), updated_at: String::new(),
+            consent: true, adult: true, ref_ids: vec![format!("{id}-ref")], ref_paths: vec![], vault: false, created_at: String::new(), updated_at: String::new(),
         }
     }
     fn story(target_s: u32, cast: &[&str]) -> Story {
         Story {
             id: "s1".into(), title: "T".into(), logline: String::new(), brief: "two adults on a roof".into(), target_s,
             aspect: "16:9".into(), style: "cinematic".into(), cast: cast.iter().map(|c| c.to_string()).collect(),
-            voices: vec![], status: "draft".into(), result_image_id: None, created_at: String::new(), updated_at: String::new(),
+            voices: vec![], status: "draft".into(), result_image_id: None, vault: false, created_at: String::new(), updated_at: String::new(),
         }
     }
     fn shot(id: &str, position: u32, duration_s: u32, characters: &[&str], continuity: &str) -> Shot {

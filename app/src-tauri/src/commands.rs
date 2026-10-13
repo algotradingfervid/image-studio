@@ -910,6 +910,7 @@ pub fn create_story(
         voices: vec![],
         status: "draft".into(),
         result_image_id: None,
+        vault: false,
         created_at: now.clone(),
         updated_at: now,
     };
