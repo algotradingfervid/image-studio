@@ -265,6 +265,12 @@ pub struct VaultItem {
     pub source_id: Option<String>,
     #[serde(default)]
     pub added_at: String,
+    /// Stories: set on takes (with `shot_id`) and on the assembled film; such
+    /// items are listed inside their story only, never in the vault gallery.
+    #[serde(default)]
+    pub story_id: Option<String>,
+    #[serde(default)]
+    pub shot_id: Option<String>,
 }
 
 fn default_kind() -> String {
@@ -314,8 +320,8 @@ impl VaultItem {
                 .as_ref()
                 .or(self.poster.as_ref())
                 .map(BlobRef::path),
-            story_id: None,
-            shot_id: None,
+            story_id: self.story_id.clone(),
+            shot_id: self.shot_id.clone(),
         }
     }
 }
@@ -750,7 +756,9 @@ impl Vault {
             exists: self.exists(),
             unlocked: unlocked.is_some(),
             auto_lock_minutes: (self.auto_lock.lock().unwrap().as_secs() / 60) as u32,
-            item_count: unlocked.as_ref().map(|u| u.items.len()),
+            item_count: unlocked
+                .as_ref()
+                .map(|u| u.items.values().filter(|i| i.story_id.is_none()).count()),
             migration_pending: self.journal_path().exists(),
         }
     }
@@ -1147,6 +1155,12 @@ impl Vault {
         Ok(v)
     }
 
+    /// Decrypted items for the gallery: story takes and films are left out
+    /// (they belong to their story's workspace). Newest first.
+    pub fn gallery_items(&self) -> Result<Vec<VaultItem>, String> {
+        Ok(self.items()?.into_iter().filter(|i| i.story_id.is_none()).collect())
+    }
+
     pub fn item(&self, id: &str) -> Result<VaultItem, String> {
         let guard = self.unlocked.lock().unwrap();
         let u = guard.as_ref().ok_or_else(Self::locked_err)?;
@@ -1381,6 +1395,8 @@ pub fn item_from_record(
         references,
         source_id,
         added_at: crate::state::now_rfc3339(),
+        story_id: rec.story_id.clone(),
+        shot_id: rec.shot_id.clone(),
     }
 }
 
@@ -1740,6 +1756,31 @@ mod tests {
     }
 
     #[test]
+    fn vault_gallery_hides_story_items_but_counts_them_internally() {
+        let (_d, v) = vault();
+        v.create(PW, KdfParams::fast()).unwrap();
+        let plain = sample_item(&v.seal_blob(b"\0\0\0\x18ftypisom", "mp4").unwrap());
+        let mut take = sample_item(&v.seal_blob(b"\0\0\0\x18ftypisom", "mp4").unwrap());
+        take.story_id = Some("s1".into());
+        take.shot_id = Some("sh1".into());
+        let mut film = sample_item(&v.seal_blob(b"\0\0\0\x18ftypisom", "mp4").unwrap());
+        film.story_id = Some("s1".into());
+        for i in [&plain, &take, &film] {
+            v.put_item(i).unwrap();
+        }
+        let gallery: Vec<String> = v.gallery_items().unwrap().into_iter().map(|i| i.id).collect();
+        assert_eq!(gallery, vec![plain.id.clone()]);
+        assert_eq!(v.items().unwrap().len(), 3);
+        assert_eq!(v.status().item_count, Some(1));
+        let rec = v.item(&take.id).unwrap().to_record();
+        assert_eq!((rec.story_id.as_deref(), rec.shot_id.as_deref()), (Some("s1"), Some("sh1")));
+        // Records sealed before this change (no story fields) still load.
+        v.lock();
+        v.unlock(PW).unwrap();
+        assert_eq!(v.items().unwrap().len(), 3);
+    }
+
+    #[test]
     fn range_parsing() {
         assert_eq!(parse_range("bytes=0-99", 1000), Some((0, 99)));
         assert_eq!(parse_range("bytes=0-5000", 1000), Some((0, 999)));
@@ -1782,6 +1823,8 @@ mod tests {
             references: vec![],
             source_id: None,
             added_at: String::new(),
+            story_id: None,
+            shot_id: None,
         }
     }
 

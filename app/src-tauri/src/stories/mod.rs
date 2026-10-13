@@ -117,6 +117,7 @@ pub struct StoryView {
     pub cast: Vec<Character>,
     pub shots: Vec<Shot>,
     pub takes: Vec<crate::db::ImageRecord>,
+    pub result: Option<crate::db::ImageRecord>,
     pub issues: Vec<Issue>,
 }
 

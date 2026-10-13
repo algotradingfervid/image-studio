@@ -318,6 +318,7 @@ pub fn run() {
             commands::list_images,
             commands::delete_image,
             commands::export_image,
+            commands::reveal_image,
             commands::seal_reference,
             commands::vault_status,
             commands::vault_create,

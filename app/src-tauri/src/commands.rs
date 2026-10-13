@@ -648,6 +648,16 @@ pub fn export_image(core: CoreState<'_>, id: String, dest_path: String) -> Res<(
         })
 }
 
+/// Shows a General record's file in Finder. Vault items are exported instead.
+#[tauri::command]
+pub fn reveal_image(core: CoreState<'_>, id: String) -> Res<()> {
+    let rec = core.db.lock().unwrap().get_image(&id)?;
+    let Some(rec) = rec else {
+        return Err("Vault films are exported, not shown in Finder".into());
+    };
+    tauri_plugin_opener::reveal_item_in_dir(&rec.path).map_err(|e| format!("Couldn't show the file: {e}"))
+}
+
 // ----- vault (spec v6) -----
 
 fn spawn_migration(core: &Arc<Core>) {
@@ -752,7 +762,7 @@ pub fn vault_set_auto_lock(core: CoreState<'_>, minutes: u32) -> Res<VaultStatus
 #[tauri::command]
 pub fn list_vault_items(core: CoreState<'_>) -> Res<Vec<ImageRecord>> {
     core.vault.touch();
-    Ok(core.vault.items()?.iter().map(|i| i.to_record()).collect())
+    Ok(core.vault.gallery_items()?.iter().map(|i| i.to_record()).collect())
 }
 
 #[tauri::command]

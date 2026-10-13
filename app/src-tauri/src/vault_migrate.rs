@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 /// Stories v1 keeps story media (takes and assembled results) out of the vault.
-const ERR_STORY_MEDIA: &str = "Story videos stay in the general gallery for now";
+const ERR_STORY_MEDIA: &str = "Story videos are managed from the Stories tab";
 
 /// Test hook: `stop_after` simulates a crash after that many items.
 #[derive(Debug, Clone, Default)]

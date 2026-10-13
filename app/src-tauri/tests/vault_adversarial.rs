@@ -91,6 +91,8 @@ fn sample_item(media: &BlobRef, prompt: &str) -> VaultItem {
         init_image: None,
         references: vec![],
         source_id: None,
+        story_id: None,
+        shot_id: None,
         added_at: String::new(),
     }
 }

@@ -49,12 +49,16 @@ pub fn with_ref_paths(refs_dir: &Path, cs: Vec<Character>) -> Vec<Character> {
 /// The story with its cast (cast order), shots, takes (newest first) and every
 /// validation / compile issue.
 pub fn story_view(core: &Core, story_id: &str) -> Result<StoryView, String> {
-    let (story, shots, takes) = {
+    let (story, shots, takes, result) = {
         let db = core.db.lock().unwrap();
         let story = store::get_story(&db, story_id)?.ok_or("That story no longer exists")?;
         let shots = store::list_shots(&db, story_id)?;
         let takes = db.list_takes(story_id)?;
-        (story, shots, takes)
+        let result = match story.result_image_id.as_deref() {
+            Some(id) => db.get_image(id)?,
+            None => None,
+        };
+        (story, shots, takes, result)
     };
     let cast = cast_of(core, &story.cast)?;
     // A fresh draft has no shots yet; it only gets the story-level issues.
@@ -68,7 +72,7 @@ pub fn story_view(core: &Core, story_id: &str) -> Result<StoryView, String> {
             issues.push(Issue { shot: Some(s.position), message: e });
         }
     }
-    Ok(StoryView { story, cast, shots, takes, issues })
+    Ok(StoryView { story, cast, shots, takes, result, issues })
 }
 
 /// The approved take's video bytes (General: the file; vault: Task 7).

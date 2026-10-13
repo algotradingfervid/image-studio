@@ -597,7 +597,7 @@ async fn assemble_requires_all_approved_and_saves_gallery_video() {
     assert!(std::path::Path::new(&out.path).is_file());
     assert!(std::path::Path::new(out.poster_path.as_deref().unwrap()).is_file());
     let (page, _) = h.core.db.lock().unwrap().list_images(100, None).unwrap();
-    assert!(page.iter().any(|r| r.id == out.id));
+    assert!(!page.iter().any(|r| r.id == out.id), "the film lives in its story, not the gallery");
     // Re-assembling replaces the previous result.
     let again = render::assemble_story(&h.core, &story_id).unwrap();
     assert!(!std::path::Path::new(&out.path).exists());
@@ -605,6 +605,7 @@ async fn assemble_requires_all_approved_and_saves_gallery_video() {
     let view = render::story_view(&h.core, &story_id).unwrap();
     assert_eq!(view.story.result_image_id.as_deref(), Some(again.id.as_str()));
     assert_eq!(view.story.status, "assembled");
+    assert_eq!(view.result.map(|r| r.id), Some(again.id));
 }
 
 // ----- fix round 1: no duplicate renders, pre-plan safety gate -----

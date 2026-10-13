@@ -806,8 +806,8 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         if (!ex) return [...js, { ...payload, modelName: "", prompt: "", startedAt: Date.now() }];
         return js.map((j) => (j.jobId === job.jobId ? { ...j, ...payload, ...(sealed ? { prompt: "" } : {}) } : j));
       });
-      // Story takes (shotId) belong to their story's workspace, not the gallery.
-      const outputs = payload.images.filter((r) => !r.shotId);
+      // Story takes and films (storyId) belong to their story's workspace, not the gallery.
+      const outputs = payload.images.filter((r) => !r.shotId && !r.storyId);
       if (outputs.length) {
         prependImages(outputs);
         addVaultLocal(outputs.filter((r) => r.vault));
@@ -887,16 +887,6 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
     })();
   }, [vault.generalEpoch, toast]);
 
-
-  /** New items at the top of the General gallery (e.g. an assembled story): merge page one in. */
-  const refreshGalleryTop = useCallback(async () => {
-    try {
-      const page = await api.listImages({ limit: PAGE, before: null });
-      prependImages([...page.items].reverse());
-    } catch {
-      /* the gallery catches up on the next load */
-    }
-  }, [prependImages]);
 
   // On lock: drop every vault record this screen holds (open lightbox, job card prompts/outputs).
   // The form's own vault values are handled by useVaultLockCycle above.
@@ -1511,15 +1501,11 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
             key={`${storyId ?? "new"}:${planEpoch}`}
             storyId={storyId}
             jobs={jobs}
-            onOpenImage={setStoryItem}
             planning={storyPlanning}
             handle={workspaceRef}
             onRenderingChange={setStoryRendering}
             refreshKey={panelEpoch}
-            onChanged={() => {
-              setStoryEpoch((n) => n + 1);
-              void refreshGalleryTop();
-            }}
+            onChanged={() => setStoryEpoch((n) => n + 1)}
           />
         ) : (
           <>
