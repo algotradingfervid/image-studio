@@ -40,7 +40,7 @@ pub fn story_view(core: &Core, story_id: &str) -> Result<StoryView, String> {
         validate(&story, &shots, &cast)
     };
     for s in &shots {
-        if let Err(e) = compile_shot(&story, s, &cast) {
+        if let Err(e) = compile_shot(&story, s, &cast, s.continuity == "continues") {
             issues.push(Issue { shot: Some(s.position), message: e });
         }
     }
@@ -92,8 +92,7 @@ pub fn render_shot(core: &Arc<Core>, shot_id: &str) -> Result<String, String> {
             None => i.message.clone(),
         });
     }
-    let compiled = compile_shot(&view.story, &shot, &view.cast)?;
-    if compiled.ref_ids.is_empty() {
+    if compile_shot(&view.story, &shot, &view.cast, false)?.ref_ids.is_empty() {
         return Err(format!("Shot {} has no character with reference images", shot.position));
     }
     let mut init_image_id = None;
@@ -116,10 +115,15 @@ pub fn render_shot(core: &Arc<Core>, shot_id: &str) -> Result<String, String> {
         let _ = std::fs::remove_file(&png);
         init_image_id = Some(crate::references::import_bytes(&core.cfg.references_dir(), &frame?)?.ref_id);
     }
+    // A continuing shot's first frame is also the last reference (`<Picture M>` in the prompt)
+    // and stays the worker's frame-0 guide (`initImage`).
+    let compiled = compile_shot(&view.story, &shot, &view.cast, init_image_id.is_some())?;
+    let mut reference_ids = compiled.ref_ids;
+    reference_ids.extend(init_image_id.clone());
     let req = VideoRequest {
         model: VIDEO_MODEL.into(),
         prompt: compiled.prompt,
-        reference_ids: compiled.ref_ids,
+        reference_ids,
         init_image_id,
         duration_s: shot.duration_s as f64,
         fps: FPS,
@@ -330,6 +334,7 @@ pub async fn plan_story(core: &Arc<Core>, story_id: &str) -> Result<StoryView, S
         story.title = out.title.trim().to_string();
     }
     story.logline = out.logline.trim().to_string();
+    story.voices = out.voices;
     story.status = "planned".into();
     story.updated_at = crate::state::now_rfc3339();
     store::save_story(&core.db.lock().unwrap(), &story)?;

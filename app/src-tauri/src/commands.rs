@@ -896,6 +896,7 @@ pub fn create_story(
         aspect,
         style: style.trim().to_string(),
         cast,
+        voices: vec![],
         status: "draft".into(),
         result_image_id: None,
         created_at: now.clone(),
@@ -907,7 +908,7 @@ pub fn create_story(
     render::story_view(&core, &story.id)
 }
 
-/// Saves the editable fields (title, brief, target, aspect, style, cast).
+/// Saves the editable fields (title, brief, target, aspect, style, cast, voices).
 #[tauri::command]
 pub fn update_story(core: CoreState<'_>, story: Story) -> Res<StoryView> {
     let mut s = stories::store::get_story(&core.db.lock().unwrap(), &story.id)?
@@ -918,6 +919,7 @@ pub fn update_story(core: CoreState<'_>, story: Story) -> Res<StoryView> {
     s.aspect = story.aspect;
     s.style = story.style.trim().to_string();
     s.cast = story.cast;
+    s.voices = stories::cast_voices(&s.cast, story.voices);
     s.updated_at = crate::state::now_rfc3339();
     render::check_story(&s)?;
     check_cast_exists(&core, &s.cast)?;

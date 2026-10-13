@@ -202,12 +202,13 @@ CREATE TABLE stories (
   id TEXT PRIMARY KEY, title TEXT NOT NULL, logline TEXT NOT NULL, brief TEXT NOT NULL,
   target_s INTEGER NOT NULL, aspect TEXT NOT NULL, style TEXT NOT NULL, cast_json TEXT NOT NULL,
   status TEXT NOT NULL, result_image_id TEXT, sidecar_json TEXT,
-  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, voices_json TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE shots (
   id TEXT PRIMARY KEY, story_id TEXT NOT NULL, position INTEGER NOT NULL, duration_s INTEGER NOT NULL,
   characters_json TEXT NOT NULL, setting TEXT NOT NULL, camera TEXT NOT NULL, action TEXT NOT NULL,
-  dialogue_json TEXT NOT NULL, continuity TEXT NOT NULL, approved_take_id TEXT
+  dialogue_json TEXT NOT NULL, continuity TEXT NOT NULL, approved_take_id TEXT,
+  sound TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX shots_story ON shots(story_id, position);
 "#,

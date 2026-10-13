@@ -29,6 +29,17 @@ pub struct DialogueLine {
     /// character id
     pub speaker: String,
     pub line: String,
+    /// What the speaker does while saying the line and how (may be empty).
+    #[serde(default)]
+    pub delivery: String,
+}
+
+/// The voice phrase of one character, pasted verbatim at their first line in every shot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Voice {
+    pub character_id: String,
+    pub voice: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -44,6 +55,9 @@ pub struct Shot {
     pub camera: String,
     pub action: String,
     pub dialogue: Vec<DialogueLine>,
+    /// Real sounds of the shot (may be empty: a generic ambience is used).
+    #[serde(default)]
+    pub sound: String,
     /// "cut" | "continues"
     pub continuity: String,
     pub approved_take_id: Option<String>,
@@ -62,6 +76,9 @@ pub struct Story {
     pub style: String,
     /// character ids, cast order
     pub cast: Vec<String>,
+    /// one voice phrase per speaking character
+    #[serde(default)]
+    pub voices: Vec<Voice>,
     /// "draft" | "planned" | "assembled"
     pub status: String,
     pub result_image_id: Option<String>,
@@ -95,6 +112,19 @@ pub async fn resolve_llm_model(base_url: &str, configured: &str) -> Result<Strin
         return Ok(configured.to_string());
     }
     models.into_iter().next().ok_or_else(|| "Load a model in LM Studio first".to_string())
+}
+
+/// The voices to keep for a story: at most one per cast member, non-empty phrases only.
+/// A partial list is fine (a speaker without a voice gets no voice phrase).
+pub fn cast_voices(cast: &[String], voices: Vec<Voice>) -> Vec<Voice> {
+    let mut out: Vec<Voice> = Vec::new();
+    for v in voices {
+        let voice = v.voice.trim().to_string();
+        if !voice.is_empty() && cast.contains(&v.character_id) && !out.iter().any(|o| o.character_id == v.character_id) {
+            out.push(Voice { character_id: v.character_id, voice });
+        }
+    }
+    out
 }
 
 pub fn resolution_for(aspect: &str) -> Result<&'static str, String> {

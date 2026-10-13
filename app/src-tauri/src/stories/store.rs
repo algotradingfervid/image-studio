@@ -144,6 +144,7 @@ pub fn delete_character(db: &Db, id: &str) -> Result<(), String> {
 
 fn row_to_story(row: &rusqlite::Row) -> rusqlite::Result<Story> {
     let cast: String = row.get("cast_json")?;
+    let voices: String = row.get("voices_json")?;
     Ok(Story {
         id: row.get("id")?,
         title: row.get("title")?,
@@ -153,6 +154,7 @@ fn row_to_story(row: &rusqlite::Row) -> rusqlite::Result<Story> {
         aspect: row.get("aspect")?,
         style: row.get("style")?,
         cast: from_json(&cast),
+        voices: from_json(&voices),
         status: row.get("status")?,
         result_image_id: row.get("result_image_id")?,
         created_at: row.get("created_at")?,
@@ -181,12 +183,13 @@ pub fn get_story(db: &Db, id: &str) -> Result<Option<Story>, String> {
 pub fn save_story(db: &Db, s: &Story) -> Result<(), String> {
     db.conn()
         .execute(
-            "INSERT INTO stories (id, title, logline, brief, target_s, aspect, style, cast_json, status, result_image_id, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "INSERT INTO stories (id, title, logline, brief, target_s, aspect, style, cast_json, status, result_image_id, created_at, updated_at, voices_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(id) DO UPDATE SET title = excluded.title, logline = excluded.logline,
                brief = excluded.brief, target_s = excluded.target_s, aspect = excluded.aspect,
                style = excluded.style, cast_json = excluded.cast_json, status = excluded.status,
-               result_image_id = excluded.result_image_id, updated_at = excluded.updated_at",
+               result_image_id = excluded.result_image_id, updated_at = excluded.updated_at,
+               voices_json = excluded.voices_json",
             params![
                 s.id,
                 s.title,
@@ -199,7 +202,8 @@ pub fn save_story(db: &Db, s: &Story) -> Result<(), String> {
                 s.status,
                 s.result_image_id,
                 s.created_at,
-                s.updated_at
+                s.updated_at,
+                to_json(&s.voices)
             ],
         )
         .map_err(e)?;
@@ -240,13 +244,14 @@ fn row_to_shot(row: &rusqlite::Row) -> rusqlite::Result<Shot> {
         camera: row.get("camera")?,
         action: row.get("action")?,
         dialogue: from_json(&dialogue),
+        sound: row.get("sound")?,
         continuity: row.get("continuity")?,
         approved_take_id: row.get("approved_take_id")?,
     })
 }
 
-const INSERT_SHOT: &str = "INSERT INTO shots (id, story_id, position, duration_s, characters_json, setting, camera, action, dialogue_json, continuity, approved_take_id)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
+const INSERT_SHOT: &str = "INSERT INTO shots (id, story_id, position, duration_s, characters_json, setting, camera, action, dialogue_json, continuity, approved_take_id, sound)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
 
 /// A story's shots, by position.
 pub fn list_shots(db: &Db, story_id: &str) -> Result<Vec<Shot>, String> {
@@ -285,7 +290,8 @@ pub fn replace_shots(db: &Db, story_id: &str, shots: &[Shot]) -> Result<(), Stri
                 s.action,
                 to_json(&s.dialogue),
                 s.continuity,
-                s.approved_take_id
+                s.approved_take_id,
+                s.sound
             ],
         )
         .map_err(e)?;
@@ -300,7 +306,7 @@ pub fn update_shot(db: &Db, s: &Shot) -> Result<(), String> {
         .execute(
             "UPDATE shots SET story_id = ?2, position = ?3, duration_s = ?4, characters_json = ?5,
                setting = ?6, camera = ?7, action = ?8, dialogue_json = ?9, continuity = ?10,
-               approved_take_id = ?11
+               approved_take_id = ?11, sound = ?12
              WHERE id = ?1",
             params![
                 s.id,
@@ -313,7 +319,8 @@ pub fn update_shot(db: &Db, s: &Shot) -> Result<(), String> {
                 s.action,
                 to_json(&s.dialogue),
                 s.continuity,
-                s.approved_take_id
+                s.approved_take_id,
+                s.sound
             ],
         )
         .map_err(e)?;
@@ -335,6 +342,7 @@ pub fn merge_shots(story_id: &str, existing: &[Shot], incoming: Vec<Shot>) -> Ve
             && a.camera == b.camera
             && a.action == b.action
             && a.dialogue == b.dialogue
+            && a.sound == b.sound
             && a.continuity == b.continuity
     };
     incoming
@@ -367,7 +375,7 @@ pub fn set_approved(db: &Db, shot_id: &str, take_id: Option<&str>) -> Result<(),
 mod tests {
     use super::*;
     use crate::db::Db;
-    use crate::stories::{Character, DialogueLine, Shot, Story};
+    use crate::stories::{Character, DialogueLine, Shot, Story, Voice};
 
     fn ch(id: &str, name: &str) -> Character {
         Character {
@@ -392,6 +400,7 @@ mod tests {
             aspect: "16:9".into(),
             style: String::new(),
             cast: cast.iter().map(|s| s.to_string()).collect(),
+            voices: vec![],
             status: "draft".into(),
             result_image_id: None,
             created_at: "t".into(),
@@ -411,7 +420,9 @@ mod tests {
             dialogue: vec![DialogueLine {
                 speaker: "c1".into(),
                 line: "Hi".into(),
+                delivery: String::new(),
             }],
+            sound: String::new(),
             continuity: "cut".into(),
             approved_take_id: None,
         }
@@ -474,5 +485,23 @@ mod tests {
         update_shot(&db, &a).unwrap();
         assert_eq!(get_shot(&db, "a").unwrap(), Some(a));
         assert!(update_shot(&db, &shot("zz", "s1", 2)).is_err());
+    }
+
+    #[test]
+    fn voices_sound_and_delivery_round_trip() {
+        let db = Db::open_in_memory().unwrap();
+        let mut s = story("s1", &["c1"]);
+        s.voices = vec![Voice { character_id: "c1".into(), voice: "a low, steady female voice".into() }];
+        save_story(&db, &s).unwrap();
+        assert_eq!(get_story(&db, "s1").unwrap().unwrap().voices, s.voices);
+        let mut a = shot("a", "s1", 1);
+        a.sound = "Rain on concrete.".into();
+        a.dialogue[0].delivery = "says quietly".into();
+        replace_shots(&db, "s1", std::slice::from_ref(&a)).unwrap();
+        assert_eq!(get_shot(&db, "a").unwrap(), Some(a.clone()));
+        a.sound = "Wind.".into();
+        a.dialogue[0].delivery = "shouts".into();
+        update_shot(&db, &a).unwrap();
+        assert_eq!(get_shot(&db, "a").unwrap(), Some(a));
     }
 }
