@@ -71,7 +71,7 @@ The steps:
 
 - Endpoint: OpenAI-compatible chat completions. Settings → Stories: base URL (default
   `http://localhost:1234/v1`, LM Studio) and model id (default
-  `qwen3.8-27b-uncensored-optiq-4bit` = `mlx-community/Qwen3.8-27B-Uncensored-OptiQ-4bit`,
+  `qwen3.8-27b-uncensored-optiq` = `mlx-community/Qwen3.8-27B-Uncensored-OptiQ-4bit`,
   19.8 GB, owner's choice 2026-10-13; if that id is not listed, the first model the server
   lists). Qwen 3 thinking: the request sends `chat_template_kwargs: {"enable_thinking": false}`
   and the client strips any `<think>…</think>` block before parsing. If unreachable: inline message "Start LM Studio's
