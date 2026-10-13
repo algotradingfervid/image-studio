@@ -289,7 +289,8 @@ export function StoriesPanel({
       toast.notify({
         kind: "error",
         title: "Couldn't plan the story",
-        message: /LM Studio/i.test(msg) ? msg : `${msg} — the planner runs on your Mac: ${LM_HINT}`,
+        // The LM Studio hint only for connection failures, not for validation errors.
+        message: !/LM Studio/i.test(msg) && /connect|reach|refused|timed? ?out|network/i.test(msg) ? `${msg} — the planner runs on your Mac: ${LM_HINT}` : msg,
         durationMs: 12000,
       });
       void checkLlm();

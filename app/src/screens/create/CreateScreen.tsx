@@ -1218,6 +1218,12 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
 
   /** Job card thumbnail → open it in the right tab (clearing a filter that hides it). */
   const openFromJob = (id: string) => {
+    // A story take lives in its story, not the gallery: open it in the story lightbox.
+    const take = jobs.flatMap((j) => j.images).find((x) => x.id === id && x.shotId);
+    if (take) {
+      setStoryItem(take);
+      return;
+    }
     const inVault = vault.unlocked && vault.items.some((x) => x.id === id);
     const tab: GalleryTab = inVault ? "vault" : "general";
     const list = inVault ? vault.items : images;
