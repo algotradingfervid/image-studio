@@ -49,6 +49,7 @@ import type {
   Story,
   StoryIssue,
   StoryView,
+  Voice,
   ConnectionTest,
   KeyCheck,
   KeyTestReport,
@@ -1388,6 +1389,8 @@ function mentionsMinor(text: string): boolean {
   return w.some((x, i) => /^\d+$/.test(x) && Number(x) < 18 && ["year", "years", "yo", "yr", "yrs"].includes(w[i + 1] ?? ""));
 }
 
+const MAX_DELIVERY_WORDS = 15;
+
 function validateStory(story: Story, list: Shot[], cast: Character[]): StoryIssue[] {
   const out: StoryIssue[] = [];
   const name = (id: string) => cast.find((c) => c.id === id)?.name ?? id;
@@ -1414,6 +1417,11 @@ function validateStory(story: Story, list: Shot[], cast: Character[]): StoryIssu
     const maxWords = Math.floor(WORDS_PER_S * s.durationS);
     if (wordsTotal > maxWords) push(`Dialogue has ${wordsTotal} words; at most ${maxWords} fit in ${s.durationS} s`);
     for (const d of s.dialogue) if (!s.characters.includes(d.speaker)) push(`${name(d.speaker)} speaks but is not in this shot`);
+    for (const d of s.dialogue) {
+      const n = words(d.delivery ?? "").length;
+      if (n > MAX_DELIVERY_WORDS) push(`Delivery is too long (${n} words; at most ${MAX_DELIVERY_WORDS})`);
+    }
+    if (s.dialogue.some((d) => d.line.includes('"') || (d.delivery ?? "").includes('"'))) push("Remove quotation marks from dialogue");
     if ([s.action, s.setting, s.camera].some(mentionsMinor) || s.dialogue.some((d) => mentionsMinor(d.line)))
       push("Stories use adults only; remove the reference to a minor");
     if (s.continuity === "continues") {
@@ -1513,7 +1521,7 @@ function checkStoryFields(f: { brief: string; targetS: number; aspect: string; s
 const issueText = (i: StoryIssue) => (i.shot != null ? `Shot ${i.shot}: ${i.message}` : i.message);
 
 /** The canned planner output: shot durations sum to the target, shot 1 cuts, shot 2 continues. */
-function cannedPlan(story: Story): { title: string; logline: string; shots: Shot[] } {
+function cannedPlan(story: Story): { title: string; logline: string; voices: Voice[]; shots: Shot[] } {
   const cast = castOf(story);
   const [a, b] = cast;
   const n = Math.max(4, Math.ceil(story.targetS / MAX_SHOT_S));
@@ -1524,6 +1532,15 @@ function cannedPlan(story: Story): { title: string; logline: string; shots: Shot
   const settings = ["rooftop at night, city lights below", "narrow stairwell, flickering light", "empty train platform at dawn", "small diner booth, rain on the window"];
   const cameras = ["wide shot, slow push-in", "medium close-up, handheld", "over-the-shoulder, static", "low angle, slow dolly left"];
   const lines = ["We leave tonight.", "Are you sure about this?", "I have never been more sure.", "Then let's not waste the dark."];
+  const deliveries = ["turns toward the city and says quietly", "stops and answers with a tired half-smile", "looks straight ahead and says firmly", "leans in and says under the breath"];
+  const sounds = [
+    "Light rain patters on wet concrete while distant city traffic hums far below.",
+    "Footsteps echo on metal stairs and a fluorescent tube buzzes overhead.",
+    "A cold wind moves along the empty platform; a distant train horn sounds once.",
+    "Rain taps on the window glass, cutlery clinks softly and a fridge hums behind the counter.",
+  ];
+  const voicePhrases = ["a low, steady voice with a calm pace", "a deep, slightly hoarse voice with a slow pace"];
+  const voices: Voice[] = cast.map((c, i) => ({ characterId: c.id, voice: voicePhrases[i % voicePhrases.length] }));
   const list: Shot[] = durations.map((d, i) => {
     const pair = b && i % 2 === 1 ? [a.id, b.id] : [a.id];
     const speaker = pair[i % pair.length];
@@ -1537,15 +1554,19 @@ function cannedPlan(story: Story): { title: string; logline: string; shots: Shot
       setting: settings[i % settings.length],
       camera: cameras[i % cameras.length],
       action: `${who} moves through the scene, looking around and reacting the whole time; the camera keeps moving with ${i === 0 ? "the opening" : "the action"}.`,
-      dialogue: [{ speaker, line: lines[i % lines.length] }],
+      dialogue: [{ speaker, delivery: deliveries[i % deliveries.length], line: lines[i % lines.length] }],
+      sound: sounds[i % sounds.length],
       continuity: i === 1 ? "continues" : "cut",
       approvedTakeId: null,
     };
   });
   // Shot 2 continues shot 1, so it must share a character with it (it always has `a`).
   const brief = story.brief.trim();
-  const title = brief ? brief.split(/[.!?\n]/)[0].slice(0, 48).trim() : "Untitled story";
-  return { title, logline: `${cast.map((c) => c.name).join(" and ")} — ${brief.slice(0, 120) || "a short story"}`, shots: list };
+  const first = brief ? brief.split(/[.!?\n]/)[0].trim() : "";
+  // At most 48 characters, cut at a word boundary with an ellipsis.
+  const cut = first.length > 48 ? first.slice(0, 48).replace(/\s+\S*$/, "").trim() + "…" : first;
+  const title = cut || "Untitled story";
+  return { title, logline: `${cast.map((c) => c.name).join(" and ")} — ${brief.slice(0, 120) || "a short story"}`, voices, shots: list };
 }
 
 function requireH3ref() {
@@ -1660,6 +1681,7 @@ const storyCommands: Record<string, Handler> = {
       logline: "",
       ...f,
       aspect: f.aspect as Story["aspect"],
+      voices: [],
       status: "draft",
       resultImageId: null,
       createdAt: nowIso(),
@@ -1672,7 +1694,7 @@ const storyCommands: Record<string, Handler> = {
     const s = a.story as Story;
     const old = getStoryOr(s.id);
     checkStoryFields(s);
-    stories.set(s.id, { ...old, title: s.title, brief: s.brief, targetS: s.targetS, aspect: s.aspect, style: s.style, cast: s.cast, updatedAt: nowIso() });
+    stories.set(s.id, { ...old, title: s.title, brief: s.brief, targetS: s.targetS, aspect: s.aspect, style: s.style, cast: s.cast, voices: s.voices ?? old.voices, updatedAt: nowIso() });
     return storyView(s.id);
   },
   delete_story: (a) => {
@@ -1692,9 +1714,13 @@ const storyCommands: Record<string, Handler> = {
     await sleep(1500);
     if (llmDown) throw new Error(LM_STUDIO_HINT);
     const plan = cannedPlan(story);
-    for (const s of storyShots(story.id)) shots.delete(s.id);
+    // Re-planning replaces every shot; their takes go with them.
+    for (const s of storyShots(story.id)) {
+      shots.delete(s.id);
+      for (const t of takes.filter((t) => t.shotId === s.id)) removeRecord(takes, t.id);
+    }
     for (const s of plan.shots) shots.set(s.id, s);
-    stories.set(story.id, { ...story, title: plan.title, logline: plan.logline, status: "planned", updatedAt: nowIso() });
+    stories.set(story.id, { ...story, title: plan.title, logline: plan.logline, voices: plan.voices, status: "planned", updatedAt: nowIso() });
     return storyView(story.id);
   },
   save_shots: (a) => {
@@ -1702,11 +1728,18 @@ const storyCommands: Record<string, Handler> = {
     const story = getStoryOr(storyId);
     const incoming = (a.shots as Shot[]) ?? [];
     const keep = new Set<string>();
-    const text = (s: Shot) => JSON.stringify([s.durationS, s.characters, s.setting, s.camera, s.action, s.dialogue, s.continuity]);
+    const text = (s: Shot) => JSON.stringify([s.durationS, s.characters, s.setting, s.camera, s.action, s.dialogue, s.sound, s.continuity]);
     incoming.forEach((s, i) => {
       const old = s.id ? shots.get(s.id) : undefined;
       const id = old && old.storyId === storyId ? old.id : uid("shot");
-      const next: Shot = { ...s, id, storyId, position: i + 1 };
+      const next: Shot = {
+        ...s,
+        id,
+        storyId,
+        position: i + 1,
+        sound: s.sound ?? "",
+        dialogue: (s.dialogue ?? []).map((d) => ({ ...d, delivery: d.delivery ?? "" })),
+      };
       // Edited text: the approved take no longer matches the shot.
       if (old && text(old) !== text(next)) next.approvedTakeId = null;
       if (!old) next.approvedTakeId = null;

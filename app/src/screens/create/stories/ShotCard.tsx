@@ -14,6 +14,9 @@ export function countWords(text: string): number {
   return text.split(/[^\p{L}\p{N}]+/u).filter(Boolean).length;
 }
 
+/** Mirrors the validator: a line's delivery phrase is at most 15 words. */
+export const MAX_DELIVERY_WORDS = 15;
+
 export const maxWords = (durationS: number) => Math.floor(WORDS_PER_S * durationS);
 
 export const dialogueWords = (s: Shot) => s.dialogue.reduce((n, d) => n + countWords(d.line), 0);
@@ -269,7 +272,7 @@ export function ShotCard(props: ShotCardProps) {
             </label>
             <fieldset className="field shot-card__cont">
               <legend className="field__label">Continuity</legend>
-              <div className="segmented" role="radiogroup" aria-label={`Shot ${n} continuity`}>
+              <div className="segmented segmented--wide shot-card__seg" role="radiogroup" aria-label={`Shot ${n} continuity`}>
                 <button type="button" role="radio" aria-checked={shot.continuity === "cut"} className={shot.continuity === "cut" ? "is-selected" : ""} onClick={() => set({ continuity: "cut" })}>
                   Cut
                 </button>
@@ -327,6 +330,7 @@ export function ShotCard(props: ShotCardProps) {
                 {shot.dialogue.map((d, i) => {
                   const speakers = shot.characters.includes(d.speaker) || !d.speaker ? shot.characters : [...shot.characters, d.speaker];
                   const setLine = (patch: Partial<typeof d>) => set({ dialogue: shot.dialogue.map((x, j) => (j === i ? { ...x, ...patch } : x)) });
+                  const deliveryWords = countWords(d.delivery ?? "");
                   return (
                     <li key={i} className="shot-card__line">
                       <select className="select input" aria-label={`Line ${i + 1} speaker`} value={d.speaker} onChange={(e) => setLine({ speaker: e.target.value })}>
@@ -338,7 +342,14 @@ export function ShotCard(props: ShotCardProps) {
                           </option>
                         ))}
                       </select>
-                      <input className="input" aria-label={`Line ${i + 1}`} value={d.line} onChange={(e) => setLine({ line: e.target.value })} />
+                      <input
+                        className={`input shot-card__delivery ${deliveryWords > MAX_DELIVERY_WORDS ? "is-over" : ""}`}
+                        aria-label={`Line ${i + 1} delivery`}
+                        title={`Delivery: what the speaker does while saying the line, and how (at most ${MAX_DELIVERY_WORDS} words)`}
+                        placeholder="Delivery, e.g. turns to Ivo and says quietly"
+                        value={d.delivery ?? ""}
+                        onChange={(e) => setLine({ delivery: e.target.value })}
+                      />
                       <button
                         type="button"
                         className="icon-btn icon-btn--sm"
@@ -347,6 +358,13 @@ export function ShotCard(props: ShotCardProps) {
                       >
                         <Icon name="x" size={14} />
                       </button>
+                      <input
+                        className="input shot-card__line-text"
+                        aria-label={`Line ${i + 1}`}
+                        placeholder="What is said, word for word (no quotation marks)"
+                        value={d.line}
+                        onChange={(e) => setLine({ line: e.target.value })}
+                      />
                     </li>
                   );
                 })}
@@ -357,11 +375,22 @@ export function ShotCard(props: ShotCardProps) {
               className="link-btn shot-card__add-line"
               disabled={shot.characters.length === 0}
               title={shot.characters.length === 0 ? "Pick a character for this shot first" : undefined}
-              onClick={() => set({ dialogue: [...shot.dialogue, { speaker: shot.characters[0] ?? "", line: "" }] })}
+              onClick={() => set({ dialogue: [...shot.dialogue, { speaker: shot.characters[0] ?? "", delivery: "", line: "" }] })}
             >
               <Icon name="plus" size={13} /> Add line
             </button>
           </fieldset>
+
+          <label className="field">
+            <span className="field__label">Sound</span>
+            <textarea
+              className="input textarea textarea--sm"
+              rows={2}
+              placeholder="Rain on the concrete, distant traffic… (real sounds only; no dialogue or music)"
+              value={shot.sound ?? ""}
+              onChange={(e) => set({ sound: e.target.value })}
+            />
+          </label>
 
           {issues.length > 0 && (
             <ul className="plain shot-card__issues" aria-label={`Shot ${n} problems`}>
