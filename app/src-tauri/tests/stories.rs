@@ -135,6 +135,18 @@ async fn unknown_voice_name_becomes_issue() {
     assert!(out.voices.is_empty());
 }
 
+#[tokio::test]
+async fn planned_minor_voice_becomes_issue() {
+    let s = MockServer::start().await;
+    let bad = good_plan(10).replace("a low, steady female voice with a calm pace", "a young girl's voice");
+    Mock::given(method("POST")).and(path("/v1/chat/completions")).respond_with(reply(&bad)).mount(&s).await;
+    let out = planner::plan(&format!("{}/v1", s.uri()), "m", &st(10), &[mara()]).await.unwrap();
+    assert!(out.issues.iter().any(|i| i.message == "Mara's voice must describe an adult; stories use adults only"), "{:?}", out.issues);
+    let system = planner::system_prompt(&st(10), &[mara()]);
+    assert!(system.contains("Example: \"A medium shot frames Mara in the center;"), "{system}");
+    assert!(!system.contains("the other character"), "{system}");
+}
+
 #[test]
 fn two_character_cast_gets_the_research_example_with_its_names() {
     let ivo = Character { id: "c2".into(), name: "Ivo".into(), ..mara() };

@@ -15,6 +15,10 @@ const MINOR_TERMS: &[&str] = &[
     "toddler", "toddlers", "infant", "infants", "loli", "shota",
 ];
 
+const VOICE_MINOR_TERMS: &[&str] = &[
+    "girl", "girls", "boy", "boys", "girlish", "boyish", "childlike", "childish",
+];
+
 const NUMBER_WORDS: &[&str] = &[
     "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven",
     "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
@@ -70,7 +74,22 @@ pub fn preflight(story: &Story, cast: &[Character]) -> Vec<Issue> {
     if mentions_minor(&story.brief) || mentions_minor(&story.style) {
         story_issue(&mut out, "The brief must describe adults only".into());
     }
+    for v in &story.voices {
+        let name = cast.iter().find(|c| c.id == v.character_id).map(|c| c.name.as_str()).unwrap_or(&v.character_id);
+        if voice_mentions_minor(&v.voice) {
+            story_issue(&mut out, format!("{name}'s voice must describe an adult; stories use adults only"));
+        }
+        if v.voice.contains(DOUBLE_QUOTES) {
+            story_issue(&mut out, format!("{name}'s voice has double quotes; remove them"));
+        }
+    }
     out
+}
+
+/// Voice phrases also refuse "girl"/"boy" words ("a young girl's voice"), which other
+/// fields allow ("girls' night out").
+fn voice_mentions_minor(voice: &str) -> bool {
+    mentions_minor(voice) || words(voice).iter().any(|w| VOICE_MINOR_TERMS.contains(&w.as_str()))
 }
 
 /// `preflight` plus the shot rules.
@@ -244,5 +263,20 @@ mod tests {
     assert!(i.iter().any(|x| x.message.contains("delivery has 16 words")), "{i:?}");
     assert!(i.iter().any(|x| x.message.contains("line has double quotes")), "{i:?}");
     assert!(i.iter().any(|x| x.message.contains("delivery has double quotes")), "{i:?}");
+}
+#[test] fn voice_phrases_must_describe_adults() {
+    let with_voice = |v: &str| Story {
+        voices: vec![crate::stories::Voice { character_id: "c1".into(), voice: v.into() }],
+        ..story(8, &["c1"])
+    };
+    let cast = [ch("c1", "Mara")];
+    for v in ["a young girl's voice", "a teenage boy's voice", "a high, childlike voice"] {
+        let i = preflight(&with_voice(v), &cast);
+        assert!(i.iter().any(|x| x.shot.is_none() && x.message == "Mara's voice must describe an adult; stories use adults only"), "{v}: {i:?}");
+    }
+    assert!(preflight(&with_voice("a low, steady female voice in her 30s"), &cast).is_empty());
+    // validate() (used after planning) runs the same check.
+    let i = validate(&with_voice("a teenage boy's voice"), &[shot("a", 1, 8, &["c1"], "cut")], &cast);
+    assert!(i.iter().any(|x| x.message.contains("voice must describe an adult")), "{i:?}");
 }
 }

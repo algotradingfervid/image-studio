@@ -377,7 +377,8 @@ N/A";
     #[test]
     fn continues_shot_anchors_on_the_extra_last_picture() {
         let (st, sh, cast) = rooftop();
-        let c = compile_shot(&st, &sh, &cast, true).unwrap();        assert_eq!(c.ref_ids, vec!["m1", "m2", "i1"], "the frame is appended by the caller");
+        let c = compile_shot(&st, &sh, &cast, true).unwrap();
+        assert_eq!(c.ref_ids, vec!["m1", "m2", "i1"], "the frame is appended by the caller");
         let p = c.prompt;
         assert!(p.contains("green bomber jacket.\n<Subject 2> is Ivo, the person in <Picture 3>: man in his 40s, grey beard, dark wool coat.\n<Picture 4> is the first frame of [Shot 1], the last frame of the previous shot.\n\nsummary:"), "{p}");
         assert!(p.contains("summary:\n[keyframe completion + reference generation] The target video"), "{p}");

@@ -109,7 +109,14 @@ pub fn system_prompt(story: &Story, cast: &[Character]) -> String {
         Some(b) => EXAMPLE_TWO.replace("{A}", &json_inner(a)).replace("{B}", &json_inner(b)),
         None => EXAMPLE_ONE.replace("{A}", &json_inner(a)),
     };
-    SYSTEM_PROMPT
+    let mut text = SYSTEM_PROMPT.to_string();
+    if b.is_none() {
+        // One-character cast: examples without a second character.
+        text = text
+            .replace("A medium two-shot frames {A} on the left and {B} on the right;", "A medium shot frames {A} in the center;")
+            .replace("turns her head toward {B} and says quietly", "looks down at the street and says quietly");
+    }
+    text
         .replace("{A}", a)
         .replace("{B}", b.unwrap_or("the other character"))
         .replace("{target_s}", &story.target_s.to_string())
@@ -221,7 +228,9 @@ pub async fn plan(base_url: &str, model: &str, story: &Story, cast: &[Character]
             }
             Err(e) => { issues.push(Issue { shot: None, message: e }); (String::new(), String::new(), Vec::new(), Vec::new()) }
         };
-        issues.extend(validate(story, &shots, cast));
+        // The plan's voices are checked too (adults only).
+        let planned = Story { voices: voices.clone(), ..story.clone() };
+        issues.extend(validate(&planned, &shots, cast));
         let outcome = PlanOutcome { title, logline, voices, shots, issues, attempts: attempt };
         if outcome.issues.is_empty() { return Ok(outcome); }
         let errors: Vec<String> = outcome.issues.iter().map(|i| match i.shot {

@@ -132,7 +132,7 @@ Runs after planning and after every manual edit. Per shot / story:
 | Continuity | first shot is `cut`; `continues` requires the previous shot to share ≥ 1 character |
 | Delivery | each dialogue line's `delivery` ≤ 15 words, no double quotes |
 | Line quotes | dialogue `line` has no double quotes (quotes mean on-screen text to H3) |
-| Adult rule | no character/action/dialogue/delivery/sound text matches the under-18 term list (child, kid, minor, teen, schoolgirl, schoolboy, underage, "years old" with a number < 18, …) |
+| Adult rule | no character/action/dialogue/delivery/sound text matches the under-18 term list (child, kid, minor, teen, schoolgirl, schoolboy, underage, "years old" with a number < 18, …); voice phrases (story-level, checked before planning and rendering and on the planned voices) also refuse girl/boy/girlish/boyish/childlike/childish |
 | Consent | every cast character: adult ticked; real_person → consent ticked |
 | Prompt length | compiled prompt ≤ 7,000 chars |
 | References | ≤ 6 character images per shot (2 characters × 3 images); `h3ref` maxReferences is 7 = 6 character images + 1 first frame for a continuing shot (node allows 9) |
