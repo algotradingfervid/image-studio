@@ -1367,3 +1367,12 @@ async fn the_pod_planner_sends_its_bearer_token() {
     let out = planner::plan_with_progress(&format!("{}/v1", s.uri()), "m", Some("pod-tok"), &st(10), &[mara()], &|_| {}).await.unwrap();
     assert!(out.issues.is_empty(), "{:?}", out.issues);
 }
+
+#[tokio::test]
+async fn an_unreachable_pod_planner_does_not_blame_lm_studio() {
+    let dead = "http://127.0.0.1:9/v1";
+    let e = planner::plan_with_progress(dead, "m", Some("tok"), &st(10), &[mara()], &|_| {}).await.unwrap_err();
+    assert_eq!(e, planner::POD_UNREACHABLE);
+    let e = planner::plan(dead, "m", &st(10), &[mara()]).await.unwrap_err();
+    assert_eq!(e, planner::LM_STUDIO_HINT);
+}

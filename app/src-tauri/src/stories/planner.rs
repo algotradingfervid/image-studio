@@ -2,6 +2,8 @@ use super::{validate::validate, Character, DialogueLine, Issue, Shot, Story, Voi
 use serde_json::{json, Value};
 use std::time::Duration;
 
+/// A planner request with a token goes to the video pod; it failing to connect is not an LM Studio problem.
+pub const POD_UNREACHABLE: &str = "Could not reach the planner on the video GPU. Check that the video GPU is running, then plan again.";
 pub const LM_STUDIO_HINT: &str = "Could not reach the local LLM. Start LM Studio's server (Developer → Start server, or `lms server start`) and load a model.";
 const MAX_ATTEMPTS: u32 = 3;
 const TEMPERATURE: f64 = 0.6;
@@ -238,8 +240,8 @@ async fn chat(http: &reqwest::Client, base_url: &str, token: Option<&str>, body:
     if let Some(t) = token { req = req.bearer_auth(t); }
     let send = req.send();
     let mut resp = tokio::time::timeout(IDLE_TIMEOUT, send).await
-        .map_err(|_| "The local LLM did not start answering in time".to_string())?
-        .map_err(|_| LM_STUDIO_HINT.to_string())?;
+        .map_err(|_| "The planner did not start answering in time".to_string())?
+        .map_err(|_| if token.is_some() { POD_UNREACHABLE } else { LM_STUDIO_HINT }.to_string())?;
     let status = resp.status().as_u16();
     let sse = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|t| t.contains("text/event-stream"));
     if status >= 400 || !sse {
@@ -260,8 +262,8 @@ async fn chat(http: &reqwest::Client, base_url: &str, token: Option<&str>, body:
     let (mut finish, mut tokens, mut last_emit) = (None::<String>, 0u32, started);
     'stream: loop {
         let chunk = tokio::time::timeout(IDLE_TIMEOUT, resp.chunk()).await
-            .map_err(|_| "The local LLM stopped answering".to_string())?
-            .map_err(|e| format!("The connection to the local LLM dropped: {e}"))?;
+            .map_err(|_| "The planner stopped answering".to_string())?
+            .map_err(|e| format!("The connection to the planner dropped: {e}"))?;
         let Some(chunk) = chunk else { break };
         buf.extend_from_slice(&chunk);
         while let Some(i) = buf.iter().position(|&b| b == b'\n') {
@@ -326,7 +328,7 @@ pub async fn plan_with_progress(base_url: &str, model: &str, token: Option<&str>
         let reply = match chat(&http, base_url, token, &body, started, &mut report).await? {
             Ok(r) => r,
             Err(err) if structured && err.contains("response_format") => { structured = false; attempt -= 1; continue; }
-            Err(err) => return Err(format!("The local LLM returned an error: {err}")),
+            Err(err) => return Err(format!("The planner returned an error: {err}")),
         };
         if reply.truncated {
             // A cut-off plan is not valid JSON, and retrying only replays the same long reply: keep an earlier
