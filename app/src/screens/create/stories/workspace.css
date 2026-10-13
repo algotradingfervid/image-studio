@@ -1,0 +1,344 @@
+/* ---------- Stories: workspace (Create, Stories tab, right area) ---------- */
+
+.story-ws {
+  container-type: inline-size;
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+  min-width: 0;
+}
+
+.story-ws__loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-3);
+  padding: 40px 0;
+}
+
+.story-ws__empty {
+  padding: 56px 20px;
+}
+
+.story-ws__empty .story-ws__add {
+  margin-top: 14px;
+}
+
+.story-ws__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px 16px;
+}
+
+.story-ws__titles {
+  min-width: 0;
+  flex: 1 1 280px;
+}
+
+.story-ws__title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.story-ws__title-btn {
+  max-width: 100%;
+  padding: 2px 6px;
+  margin-left: -6px;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: none;
+  font: inherit;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.story-ws__title-btn:hover {
+  border-color: var(--line-2);
+}
+
+.story-ws__title-input {
+  max-width: 480px;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.story-ws__logline {
+  margin: 4px 0 0;
+  color: var(--text-2);
+  font-size: 13px;
+}
+
+.story-ws__meta {
+  margin: 4px 0 0;
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+.story-ws__save.is-error {
+  color: var(--danger);
+}
+
+.story-ws__actions {
+  flex: none;
+  flex-wrap: wrap;
+}
+
+.story-ws__issues ul {
+  display: grid;
+  gap: 2px;
+}
+
+.story-ws__shots {
+  display: grid;
+  gap: 12px;
+}
+
+/* ---------- shot card ---------- */
+
+.shot-card {
+  padding: 14px 16px;
+}
+
+.shot-card__head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-bottom: 12px;
+}
+
+.shot-card__title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.shot-card__words {
+  font-size: 12px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.shot-card__words.is-over {
+  color: var(--danger);
+}
+
+.shot-card__order {
+  display: flex;
+  gap: 2px;
+  margin-left: auto;
+}
+
+.shot-card__body {
+  display: grid;
+  grid-template-columns: minmax(220px, 2fr) minmax(0, 3fr);
+  gap: 16px;
+  align-items: start;
+}
+
+@container (max-width: 640px) {
+  .shot-card__body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .shot-card__media {
+    max-width: 420px;
+  }
+}
+
+.shot-card__media {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.shot-card__player {
+  position: relative;
+  width: 100%;
+  max-height: 420px;
+  border-radius: var(--r);
+  overflow: hidden;
+  background: var(--bg-raise);
+  border: 1px solid var(--line);
+}
+
+.shot-card__player video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+
+.shot-card__placeholder {
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 6px;
+  height: 100%;
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+.shot-card__take-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  pointer-events: none;
+}
+
+.shot-card__status {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 6px 8px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.shot-card__status .progress {
+  grid-column: 1 / -1;
+}
+
+.shot-card__hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.shot-card__actions {
+  flex-wrap: wrap;
+}
+
+.shot-card__takes-label {
+  margin: 4px 0 6px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.shot-card__thumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.shot-card__thumb {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 64px;
+  max-height: 96px;
+  padding: 0;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-sm);
+  overflow: hidden;
+  background: var(--bg-raise);
+  color: var(--text-3);
+}
+
+.shot-card__thumb:hover {
+  border-color: var(--accent-line);
+}
+
+.shot-card__thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.shot-card__thumb-ok {
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  display: grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--ok);
+  color: #06140c;
+}
+
+.shot-card__fields {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+/* The fields stack with the grid gap, not the base sheet's sibling margins. */
+.shot-card__fields .field + .field {
+  margin-top: 0;
+}
+
+.shot-card__fields fieldset {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
+.shot-card__row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  align-items: flex-end;
+}
+
+.shot-card__dur {
+  width: 110px;
+}
+
+.shot-card__cont .segmented > button:disabled {
+  opacity: 0.45;
+}
+
+.shot-card__cast {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+}
+
+.shot-card__check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.shot-card__lines {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.shot-card__line {
+  display: grid;
+  grid-template-columns: minmax(90px, 140px) minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: center;
+}
+
+.shot-card__add-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.shot-card__add-line:disabled {
+  opacity: 0.5;
+}
+
+.shot-card__issues {
+  display: grid;
+  gap: 2px;
+}
+
+.shot-card__issues .field-error {
+  margin: 0;
+}
