@@ -34,8 +34,12 @@ pub struct PlanProgress {
     /// A typical full plan for the target length, for a progress bar.
     pub expected_tokens: u32,
     pub elapsed_s: u32,
+    /// "gpu" (the video GPU is starting), "download" / "loading" (the planner model on the GPU),
     /// "waiting" (prompt processing) or "writing".
     pub phase: &'static str,
+    /// What the GPU / model is doing, for the "gpu", "download" and "loading" phases.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 struct Reply { content: String, truncated: bool, tokens: u32 }
@@ -228,9 +232,11 @@ fn to_voices(v: &Value, cast: &[Character], issues: &mut Vec<Issue>) -> Vec<Voic
 
 /// One chat completion, streamed. Outer Err = transport failure (LLM not reachable or silent);
 /// inner Err = HTTP error body. A server that ignores `stream` and answers with plain JSON works too.
-async fn chat(http: &reqwest::Client, base_url: &str, body: &Value, started: std::time::Instant,
+async fn chat(http: &reqwest::Client, base_url: &str, token: Option<&str>, body: &Value, started: std::time::Instant,
               progress: &mut (dyn FnMut(u32, &'static str) + Send)) -> Result<Result<Reply, String>, String> {
-    let send = http.post(format!("{base_url}/chat/completions")).json(body).send();
+    let mut req = http.post(format!("{base_url}/chat/completions")).json(body);
+    if let Some(t) = token { req = req.bearer_auth(t); }
+    let send = req.send();
     let mut resp = tokio::time::timeout(IDLE_TIMEOUT, send).await
         .map_err(|_| "The local LLM did not start answering in time".to_string())?
         .map_err(|_| LM_STUDIO_HINT.to_string())?;
@@ -287,11 +293,12 @@ async fn chat(http: &reqwest::Client, base_url: &str, body: &Value, started: std
 }
 
 pub async fn plan(base_url: &str, model: &str, story: &Story, cast: &[Character]) -> Result<PlanOutcome, String> {
-    plan_with_progress(base_url, model, story, cast, &|_| {}).await
+    plan_with_progress(base_url, model, None, story, cast, &|_| {}).await
 }
 
 /// Plans the story, reporting `PlanProgress` as the reply streams in.
-pub async fn plan_with_progress(base_url: &str, model: &str, story: &Story, cast: &[Character],
+/// `token`: Bearer token for the server (the video pod's API token; LM Studio needs none).
+pub async fn plan_with_progress(base_url: &str, model: &str, token: Option<&str>, story: &Story, cast: &[Character],
                                 on_progress: &(dyn Fn(&PlanProgress) + Send + Sync)) -> Result<PlanOutcome, String> {
     let http = reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).build().map_err(|e| e.to_string())?;
     let max_tokens = max_tokens_for(story.target_s);
@@ -313,10 +320,10 @@ pub async fn plan_with_progress(base_url: &str, model: &str, story: &Story, cast
             body["response_format"] = json!({"type": "json_schema", "json_schema": {"name": "story_plan", "strict": true, "schema": schema()}});
         }
         let report = |tokens: u32, phase: &'static str| on_progress(&PlanProgress {
-            attempt, max_attempts: MAX_ATTEMPTS, tokens, expected_tokens, elapsed_s: started.elapsed().as_secs() as u32, phase });
+            attempt, max_attempts: MAX_ATTEMPTS, tokens, expected_tokens, elapsed_s: started.elapsed().as_secs() as u32, phase, detail: None });
         report(0, "waiting");
         let mut report = report;
-        let reply = match chat(&http, base_url, &body, started, &mut report).await? {
+        let reply = match chat(&http, base_url, token, &body, started, &mut report).await? {
             Ok(r) => r,
             Err(err) if structured && err.contains("response_format") => { structured = false; attempt -= 1; continue; }
             Err(err) => return Err(format!("The local LLM returned an error: {err}")),

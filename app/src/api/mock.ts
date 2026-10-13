@@ -45,6 +45,7 @@ import type {
   ApproveResult,
   Character,
   LlmStatus,
+  PlanProgress,
   RenderAllResult,
   RenderedShot,
   StoryPatch,
@@ -1382,7 +1383,8 @@ const shots = new Map<string, Shot>();
 const takes: ImageRecord[] = [];
 /** Assembled story films: storyId set, shotId null; also never in `images`. */
 const films: ImageRecord[] = [];
-const llm = { baseUrl: LLM_DEFAULT_URL, model: LLM_DEFAULT_MODEL };
+// ?planner=pod: plans run on the video GPU (fake GPU-start and model-load phases before writing).
+const llm = { baseUrl: LLM_DEFAULT_URL, model: LLM_DEFAULT_MODEL, onPod: params.get("planner") === "pod" };
 const llmDown = params.get("llm") === "down";
 
 const nowIso = () => new Date().toISOString();
@@ -1682,9 +1684,10 @@ function renderShotInternal(shotId: string): string {
 const shotHasTakes = (shotId: string) => takes.some((t) => t.shotId === shotId);
 
 function llmStatusNow(): LlmStatus {
+  if (llm.onPod) return { baseUrl: "", model: "qwen3.8-27b-uncensored", reachable: true, models: [], error: null, onPod: true };
   const models = llmDown ? [] : [LLM_DEFAULT_MODEL, "qwen3-8b"];
   const model = models.length && !models.includes(llm.model) ? models[0] : llm.model;
-  return { baseUrl: llm.baseUrl, model, reachable: !llmDown, models, error: llmDown ? LM_STUDIO_HINT : null };
+  return { baseUrl: llm.baseUrl, model, reachable: !llmDown, models, error: llmDown ? LM_STUDIO_HINT : null, onPod: false };
 }
 
 function removeRecord(list: ImageRecord[], id: string) {
@@ -1818,6 +1821,19 @@ const storyCommands: Record<string, Handler> = {
     // ?planMs= stretches the fake LLM call (to exercise edits made while planning).
     const planMs = Number(params.get("planMs")) || 1500;
     const expectedTokens = story.targetS * 40;
+    if (llm.onPod) {
+      const steps: [PlanProgress["phase"], string][] = [
+        ["gpu", "Creating pod"],
+        ["gpu", "Pulling image"],
+        ["download", "Downloading the planner model · 12.4 of 27.8 GB"],
+        ["loading", "Loading the planner model"],
+      ];
+      for (const [i, [phase, detail]] of steps.entries()) {
+        emit("story-plan-progress", { storyId: story.id, progress: { attempt: 0, maxAttempts: 0, tokens: 0, expectedTokens: 0, elapsedS: i * 30, phase, detail } });
+        await sleep(planMs / 6);
+      }
+    }
+    if (llm.onPod && llmDown) throw new Error("The planner model failed to start on the video GPU: out of memory");
     for (let i = 0; i <= 10; i++) {
       const phase = i === 0 ? "waiting" : "writing";
       emit("story-plan-progress", { storyId: story.id, progress: { attempt: 1, maxAttempts: 3, tokens: Math.round((expectedTokens * i) / 10), expectedTokens, elapsedS: Math.round((planMs * i) / 10000), phase } });
@@ -1945,6 +1961,11 @@ const storyCommands: Record<string, Handler> = {
   },
   llm_status: async () => {
     await sleep(300);
+    return llmStatusNow();
+  },
+  save_planner_location: async (a) => {
+    llm.onPod = !!a.onPod;
+    await sleep(200);
     return llmStatusNow();
   },
   save_llm_settings: async (a) => {

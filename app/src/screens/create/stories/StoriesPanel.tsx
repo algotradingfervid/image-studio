@@ -4,6 +4,7 @@ import type { Character, Destination, LlmStatus, PlanProgress, Story } from "../
 import { Dialog } from "../../../components/Dialog";
 import { Icon } from "../../../components/Icon";
 import { radioKeys } from "../../../components/radio";
+import { useGpu } from "../../../state/gpu";
 import { useToast } from "../../../state/toast";
 import { LOCK_DISCARD_TOAST, useVault } from "../../../state/vault";
 import { useMoreBelow } from "../Controls";
@@ -46,6 +47,9 @@ const clock = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2,
 
 /** "Attempt 1 of 3 · writing 1,840 of ~4,600 tokens · 1:42" */
 function progressLine(p: PlanProgress | null, elapsedS: number): string {
+  if (p?.detail && (p.phase === "gpu" || p.phase === "download" || p.phase === "loading")) {
+    return `${p.phase === "gpu" ? `Video GPU: ${p.detail}` : p.detail} · ${clock(elapsedS)}`;
+  }
   const attempt = p && p.maxAttempts > 1 && p.attempt > 1 ? `Attempt ${p.attempt} of ${p.maxAttempts} · ` : "";
   const what =
     !p || p.phase === "waiting"
@@ -389,8 +393,14 @@ export function StoriesPanel({
   ].filter(Boolean);
   const blocked = blockers.length > 0;
 
+  const gpu = useGpu();
+  const onPod = !!llm?.onPod;
+  /** Planning on the video GPU starts it when it's off: the button says so, and the start is confirmed first. */
+  const planStartsGpu = onPod && gpu.profiles.video.needsStart;
+
   const runPlan = async () => {
     setConfirmReplan(false);
+    if (onPod && !(await gpu.confirmStart("plan the story", "video", { confirmLabel: "Start GPU & plan" }))) return;
     setPlanError(null);
     setProgress(null);
     setPlanStarted(Date.now());
@@ -426,7 +436,7 @@ export function StoriesPanel({
         title: "Couldn't plan the story",
         actions: locked ? [{ label: "Unlock", onClick: () => vault.requestUnlock() }] : undefined,
         // The LM Studio hint only for connection failures, not for validation errors.
-        message: !/LM Studio/i.test(msg) && /connect|reach|refused|timed? ?out|network/i.test(msg) ? `${msg} — the planner runs on your Mac: ${LM_HINT}` : msg,
+        message: !onPod && !/LM Studio/i.test(msg) && /connect|reach|refused|timed? ?out|network/i.test(msg) ? `${msg} — the planner runs on your Mac: ${LM_HINT}` : msg,
         durationMs: 12000,
       });
       void checkLlm();
@@ -456,6 +466,8 @@ export function StoriesPanel({
 
   const llmLine = llmChecking && !llm && !llmError ? (
     <>Checking the planner…</>
+  ) : llm?.onPod ? (
+    <>Planner: Qwen3.8 27B on the video GPU{planStartsGpu ? " (starts the GPU)" : ""}</>
   ) : llm?.reachable ? (
     <>
       Planner: <span title={llm.model}>{clip(llm.model, 22)}</span> via LM Studio
@@ -787,7 +799,13 @@ export function StoriesPanel({
         <div className="panel__foot">
           <button type="submit" className="btn btn--generate" disabled={blocked || planning || replanWaits} aria-describedby={`${id}-plan-hint`}>
             <Icon name={planning ? "refresh" : "story"} size={18} className={planning ? "spin" : undefined} />
-            <span>{planning ? "Planning… (local LLM)" : story && story.status !== "draft" ? "Plan again" : "Plan story"}</span>
+            <span>
+              {planning
+                ? onPod
+                  ? "Planning… (video GPU)"
+                  : "Planning… (local LLM)"
+                : `${planStartsGpu ? "Start GPU & " : ""}${story && story.status !== "draft" ? "Plan again" : "Plan story"}`}
+            </span>
             <span className="kbd-group" aria-hidden>
               <kbd>⌘</kbd>
               <kbd>↵</kbd>

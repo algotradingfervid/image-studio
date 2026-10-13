@@ -471,7 +471,21 @@ function StoriesPlannerSettings() {
     void check(true);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const dirty = !!status && (url.trim() !== status.baseUrl || model.trim() !== status.model);
+  const [moving, setMoving] = useState(false);
+  const setLocation = async (onPod: boolean) => {
+    if (moving || status?.onPod === onPod) return;
+    setMoving(true);
+    setError(null);
+    try {
+      apply(await api.savePlannerLocation(onPod));
+    } catch (err) {
+      setError(api.errorMessage(err));
+    } finally {
+      setMoving(false);
+    }
+  };
+
+  const dirty = !!status && !status.onPod && (url.trim() !== status.baseUrl || model.trim() !== status.model);
   const listed = !!status?.reachable && status.models.length > 0;
   const options = listed ? (status!.models.includes(model) || !model ? status!.models : [model, ...status!.models]) : [];
 
@@ -497,12 +511,25 @@ function StoriesPlannerSettings() {
         <Icon name="video" /> Stories planner
         {status && (
           <span className={`badge ${status.reachable ? "badge--ok" : "badge--warn"} vault-settings__state`}>
-            {status.reachable ? "Connected" : "Not reachable"}
+            {status.onPod ? "Video GPU" : status.reachable ? "Connected" : "Not reachable"}
           </span>
         )}
       </h2>
-      <p className="hint">Stories plans its shot lists with a local LLM on this Mac (LM Studio or any OpenAI-compatible server). Nothing is sent to the cloud.</p>
-      {!status && !error ? (
+      <div className="field" role="radiogroup" aria-label="Where plans are written">
+        <span className="field__label">Where plans are written</span>
+        <label className="story-check">
+          <input type="radio" name="planner-location" checked={!!status?.onPod} disabled={!status || moving} onChange={() => void setLocation(true)} />
+          <span>
+            Video GPU (RunPod) — Qwen3.8 27B FP8 with vLLM, about a minute per plan. Planning starts the video GPU
+            (asks first) and the model takes about 44 GB of its memory.
+          </span>
+        </label>
+        <label className="story-check">
+          <input type="radio" name="planner-location" checked={!!status && !status.onPod} disabled={!status || moving} onChange={() => void setLocation(false)} />
+          <span>This Mac (LM Studio) — nothing leaves the Mac, but a long story can take 5–10 minutes.</span>
+        </label>
+      </div>
+      {status?.onPod ? null : !status && !error ? (
         <p className="hint">Checking the local LLM…</p>
       ) : (
         <form onSubmit={save} aria-label="Stories planner">

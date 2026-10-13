@@ -644,6 +644,7 @@ async fn mock_llm(core: &app_lib::state::Core, shots_json: String) -> MockServer
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "m"}]}))).mount(&s).await;
     Mock::given(method("POST")).and(path("/v1/chat/completions")).respond_with(reply(&shots_json)).mount(&s).await;
     core.settings.save_llm(Some(format!("{}/v1", s.uri())), Some("m".into())).unwrap();
+    core.settings.save_planner_location(false).unwrap();
     s
 }
 
@@ -1306,6 +1307,7 @@ mod repo_tests {
         Mock::given(method("POST")).and(path("/v1/chat/completions"))
             .respond_with(LockThenReply(core.clone(), super::good_plan(10))).mount(&s).await;
         core.settings.save_llm(Some(format!("{}/v1", s.uri())), Some("m".into())).unwrap();
+    core.settings.save_planner_location(false).unwrap();
         assert_eq!(
             render::plan_story(&core, &story.id).await.unwrap_err(),
             "VAULT_LOCKED: The vault locked while planning; unlock and plan again"
@@ -1348,10 +1350,20 @@ async fn a_streamed_reply_is_assembled_and_reports_progress() {
     let t = ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream");
     Mock::given(method("POST")).and(path("/v1/chat/completions")).respond_with(t).mount(&s).await;
     let seen = std::sync::Mutex::new(Vec::new());
-    let out = planner::plan_with_progress(&format!("{}/v1", s.uri()), "m", &st(10), &[mara()],
+    let out = planner::plan_with_progress(&format!("{}/v1", s.uri()), "m", None, &st(10), &[mara()],
         &|p| seen.lock().unwrap().push((p.attempt, p.tokens, p.phase))).await.unwrap();
     assert!(out.issues.is_empty(), "{:?}", out.issues);
     let seen = seen.lock().unwrap();
     assert_eq!(seen.first(), Some(&(1, 0, "waiting")));
     assert_eq!(seen.last(), Some(&(1, 2, "writing")));
+}
+
+#[tokio::test]
+async fn the_pod_planner_sends_its_bearer_token() {
+    use wiremock::matchers::header;
+    let s = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/v1/chat/completions")).and(header("authorization", "Bearer pod-tok"))
+        .respond_with(reply(&good_plan(10))).mount(&s).await;
+    let out = planner::plan_with_progress(&format!("{}/v1", s.uri()), "m", Some("pod-tok"), &st(10), &[mara()], &|_| {}).await.unwrap();
+    assert!(out.issues.is_empty(), "{:?}", out.issues);
 }

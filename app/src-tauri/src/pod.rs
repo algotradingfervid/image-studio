@@ -63,6 +63,12 @@ pub const VIDEO_GPU_TYPE: &str = crate::settings::DEFAULT_VIDEO_GPU_TYPES[0];
 /// restart); the app terminates pods rather than stopping them anyway.
 pub const CONTAINER_DISK_GB_IMAGE: u32 = 100;
 pub const CONTAINER_DISK_GB_VIDEO: u32 = 150;
+/// Video pod disk when it also serves the planner LLM (+ ~28 GB of FP8 weights in /models-local/llm).
+pub const CONTAINER_DISK_GB_VIDEO_LLM: u32 = 200;
+/// GPU memory (GB) the pod's vLLM takes for the planner (`LLM_GPU_GB`): 28 GB of weights + KV cache + MTP.
+pub const LLM_GPU_GB: u32 = 44;
+/// Context the pod's vLLM allows (`LLM_MAX_LEN`): a plan prompt (~2k) plus up to 14k output, with repair turns.
+pub const LLM_MAX_LEN: u32 = 32768;
 /// ComfyUI log level on the pod (`COMFY_LOG_LEVEL`, read by worker/boot/boot.py;
 /// its default is DEBUG, which floods the log with per-layer lines).
 pub const COMFY_LOG_LEVEL: &str = "INFO";
@@ -610,6 +616,18 @@ pub fn create_payload_for(
         "ports": ["8000/http"],
         "env": env,
     })
+}
+
+/// Adds the planner LLM to a video pod's create payload (worker/src/llm.py reads these).
+pub fn with_planner_llm(mut body: Value) -> Value {
+    if let Some(env) = body.get_mut("env").and_then(Value::as_object_mut) {
+        env.insert("LLM_MODEL".into(), json!(crate::settings::POD_LLM_MODEL));
+        env.insert("LLM_SERVED_NAME".into(), json!(crate::settings::POD_LLM_SERVED_NAME));
+        env.insert("LLM_GPU_GB".into(), json!(LLM_GPU_GB.to_string()));
+        env.insert("LLM_MAX_LEN".into(), json!(LLM_MAX_LEN.to_string()));
+    }
+    body["disk"] = json!(CONTAINER_DISK_GB_VIDEO_LLM);
+    body
 }
 
 /// Image-profile payload (see `create_payload_for`).
@@ -1218,6 +1236,7 @@ async fn create_with_fallback(
                 &worker_ref,
                 &prefetch,
             );
+            let body = if p == Profile::Video && core.settings.planner_on_pod() { with_planner_llm(body) } else { body };
             for attempt in 1..=GPU_ATTEMPTS_PER_ROUND {
                 if !is_current(core, p, epoch) {
                     return Err(stopped());

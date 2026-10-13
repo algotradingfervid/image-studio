@@ -137,6 +137,33 @@ pub struct Health {
     /// Pod only: the pod's self-terminate watchdog (absent on older images).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watchdog: Option<Watchdog>,
+    /// Pod only: the planner LLM (video pod with `LLM_MODEL`; absent on older images).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm: Option<LlmHealth>,
+}
+
+/// `llm` from the pod's `/health`: `{state, model, downloadedBytes, totalBytes, error}`.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmHealth {
+    /// "off", "downloading", "starting", "ready" or "failed".
+    pub state: String,
+    pub model: Option<String>,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub error: Option<String>,
+}
+
+pub fn parse_llm(v: &Value) -> Option<LlmHealth> {
+    let l = v.get("llm")?.as_object()?;
+    let s = |k: &str| l.get(k).and_then(Value::as_str).map(str::to_string);
+    Some(LlmHealth {
+        state: s("state").unwrap_or_else(|| "off".into()),
+        model: s("model"),
+        downloaded_bytes: l.get("downloadedBytes").and_then(Value::as_u64).unwrap_or(0),
+        total_bytes: l.get("totalBytes").and_then(Value::as_u64).unwrap_or(0),
+        error: s("error"),
+    })
 }
 
 /// `watchdog` from the pod's `/health`:
@@ -364,6 +391,7 @@ impl RunpodClient {
             ready: v.get("ready").and_then(Value::as_bool),
             gpu: v.get("gpu").and_then(Value::as_str).map(str::to_string),
             watchdog: parse_watchdog(&v),
+            llm: parse_llm(&v),
         })
     }
 }

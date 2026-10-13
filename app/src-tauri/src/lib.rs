@@ -352,6 +352,7 @@ pub fn run() {
             commands::assemble_story,
             commands::llm_status,
             commands::save_llm_settings,
+            commands::save_planner_location,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

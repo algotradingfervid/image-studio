@@ -844,6 +844,8 @@ pub struct LlmStatus {
     pub reachable: bool,
     pub models: Vec<String>,
     pub error: Option<String>,
+    /// Plans run on the video GPU (vLLM) rather than LM Studio; the fields above then describe the pod's model.
+    pub on_pod: bool,
 }
 
 fn rendered((shot_id, job_id): (String, String)) -> RenderedShot {
@@ -988,6 +990,11 @@ pub async fn assemble_story(core: CoreState<'_>, story_id: String) -> Res<StoryV
 }
 
 async fn llm_status_of(core: &Core) -> LlmStatus {
+    if core.settings.planner_on_pod() {
+        // Nothing to probe until the video GPU runs; plan_story starts it and waits for the model.
+        return LlmStatus { base_url: String::new(), model: crate::settings::POD_LLM_SERVED_NAME.into(), reachable: true,
+            models: vec![], error: None, on_pod: true };
+    }
     let base_url = core.settings.llm_base_url();
     let model = core.settings.llm_model();
     let (reachable, models, error) = match stories::planner::list_models(&base_url).await {
@@ -995,7 +1002,14 @@ async fn llm_status_of(core: &Core) -> LlmStatus {
         Ok(models) => (true, models, None),
         Err(e) => (false, vec![], Some(e)),
     };
-    LlmStatus { base_url, model, reachable, models, error }
+    LlmStatus { base_url, model, reachable, models, error, on_pod: false }
+}
+
+/// Where the Stories planner runs: the video GPU (`on_pod`) or LM Studio on this Mac.
+#[tauri::command]
+pub async fn save_planner_location(core: CoreState<'_>, on_pod: bool) -> Res<LlmStatus> {
+    core.settings.save_planner_location(on_pod)?;
+    Ok(llm_status_of(&core).await)
 }
 
 #[tauri::command]

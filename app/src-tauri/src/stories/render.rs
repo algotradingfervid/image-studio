@@ -7,6 +7,7 @@ use super::{
 };
 use crate::db::{ImageRecord, KIND_VIDEO};
 use crate::jobs::{self, Destination, VideoRequest};
+use crate::pod::{self, Profile};
 use crate::state::Core;
 use crate::vault::{BlobRef, ERR_LOCKED};
 use crate::vault_migrate;
@@ -496,6 +497,46 @@ pub fn check_story(story: &Story) -> Result<(), String> {
     Ok(())
 }
 
+/// How long the planner model may take to download and load on a running video pod.
+const POD_LLM_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// The video pod's planner endpoint `(base_url, model, token)`: starts the video GPU if needed
+/// (the button says "Start GPU & Plan"), then waits for its vLLM to be ready, reporting each step.
+async fn pod_planner(core: &Arc<Core>, story_id: &str) -> Result<(String, String, Option<String>), String> {
+    let started = std::time::Instant::now();
+    let emit = |phase: &'static str, detail: String| core.sink.story_plan_progress(story_id, &planner::PlanProgress {
+        attempt: 0, max_attempts: 0, tokens: 0, expected_tokens: 0, elapsed_s: started.elapsed().as_secs() as u32,
+        phase, detail: Some(detail) });
+    let pod_id = pod::ensure_running_as(core, Profile::Video, pod::StartOrigin::User,
+        &mut |p| emit("gpu", p.to_string()), &|| false).await?;
+    // Started for planning: the pod stays up for the renders that follow.
+    pod::mark_served(core, Profile::Video);
+    let client = pod::pod_client(core, &pod_id)?;
+    let gb = |b: u64| b as f64 / 1e9;
+    loop {
+        pod::touch_for(core, Profile::Video);
+        if let Ok(h) = client.health().await {
+            match h.llm {
+                Some(l) if l.state == "ready" => break,
+                Some(l) if l.state == "failed" => {
+                    return Err(format!("The planner model failed to start on the video GPU: {}", l.error.unwrap_or_default()))
+                }
+                Some(l) if l.state == "downloading" && l.total_bytes > 0 => emit("download",
+                    format!("Downloading the planner model · {:.1} of {:.1} GB", gb(l.downloaded_bytes), gb(l.total_bytes))),
+                Some(l) if l.state == "downloading" || l.state == "starting" => emit("loading", "Loading the planner model".into()),
+                _ => return Err("The video GPU is running without the planner model (it was started before planning \
+                    moved to the GPU, or runs older worker code). Stop the video GPU and plan again.".into()),
+            }
+        }
+        if started.elapsed() > POD_LLM_READY_TIMEOUT {
+            return Err("The planner model did not get ready on the video GPU in 20 minutes".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    let base = format!("{}/v1", pod::proxy_base(&core.cfg.pod_proxy_template, &pod_id));
+    Ok((base, crate::settings::POD_LLM_SERVED_NAME.to_string(), Some(core.settings.pod_token()?)))
+}
+
 /// Plans the shots with the local LLM (replaces the shot list). The
 /// story-level safety checks run first; nothing is sent to the LLM when they fail.
 pub async fn plan_story(core: &Arc<Core>, story_id: &str) -> Result<StoryView, String> {
@@ -510,10 +551,19 @@ pub async fn plan_story(core: &Arc<Core>, story_id: &str) -> Result<StoryView, S
         let mut renders = core.story_renders.lock().unwrap();
         refuse_rendering(core, &mut renders, &view.shots)?;
     }
-    let base = core.settings.llm_base_url();
-    let model = resolve_llm_model(&base, &core.settings.llm_model()).await?;
-    let out = planner::plan_with_progress(&base, &model, &view.story, &view.cast,
-        &|p| core.sink.story_plan_progress(story_id, p)).await?;
+    let (base, model, token) = if core.settings.planner_on_pod() {
+        pod_planner(core, story_id).await?
+    } else {
+        let base = core.settings.llm_base_url();
+        let model = resolve_llm_model(&base, &core.settings.llm_model()).await?;
+        (base, model, None)
+    };
+    let out = planner::plan_with_progress(&base, &model, token.as_deref(), &view.story, &view.cast,
+        &|p| core.sink.story_plan_progress(story_id, p)).await;
+    if core.settings.planner_on_pod() {
+        pod::touch_for(core, Profile::Video);
+    }
+    let out = out?;
     // A vault story whose vault locked meanwhile can't take the plan (it was only in memory).
     let mid_plan = |e: String| {
         if e.starts_with(ERR_LOCKED) {

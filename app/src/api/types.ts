@@ -545,8 +545,9 @@ export interface PlanProgress {
   /** A typical full plan for the target length. */
   expectedTokens: number;
   elapsedS: number;
-  /** "waiting" while the prompt is processed, then "writing". */
-  phase: "waiting" | "writing";
+  /** "gpu" / "download" / "loading" while the video GPU and its planner model start (see `detail`), "waiting" while the prompt is processed, then "writing". */
+  phase: "gpu" | "download" | "loading" | "waiting" | "writing";
+  detail?: string;
 }
 
 export const isTaskActive = (t: Task | null | undefined): t is Task =>
@@ -667,4 +668,6 @@ export interface LlmStatus {
   reachable: boolean;
   models: string[];
   error: string | null;
+  /** Plans run on the video GPU (vLLM); `model` is the pod's model and nothing is probed until the GPU runs. */
+  onPod: boolean;
 }

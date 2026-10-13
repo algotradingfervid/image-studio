@@ -174,3 +174,26 @@ async fn start_sends_prefetch_and_names_the_cuda_filter_when_no_host_fits() {
         assert_eq!(b["disk"], 100);
     }
 }
+
+#[test]
+fn a_video_pod_that_plans_gets_the_llm_env_and_a_bigger_disk() {
+    let body = pod::create_payload_for(Profile::Video, &vol(), "G", "tok", 30, None, "img", "main", "");
+    assert!(body["env"].get("LLM_MODEL").is_none(), "off unless added");
+    let body = pod::with_planner_llm(body);
+    assert_eq!(body["env"]["LLM_MODEL"], "orcarouter/Qwen3.8-27B-Uncensored-FP8");
+    assert_eq!(body["env"]["LLM_SERVED_NAME"], "qwen3.8-27b-uncensored");
+    assert_eq!(body["env"]["LLM_GPU_GB"], "44");
+    assert_eq!(body["env"]["LLM_MAX_LEN"], "32768");
+    assert_eq!(body["env"]["MODE"], "pod", "the rest of the env is kept");
+    assert_eq!(body["disk"], 200);
+}
+
+#[test]
+fn health_llm_is_parsed_defensively() {
+    use app_lib::runpod::parse_llm;
+    let v = serde_json::json!({"llm": {"state": "downloading", "model": "q", "downloadedBytes": 5, "totalBytes": 10, "error": null}});
+    let l = parse_llm(&v).unwrap();
+    assert_eq!((l.state.as_str(), l.downloaded_bytes, l.total_bytes, l.error), ("downloading", 5, 10, None));
+    assert!(parse_llm(&serde_json::json!({"ready": true})).is_none(), "older pods have no llm");
+    assert!(parse_llm(&serde_json::json!({"llm": "x"})).is_none());
+}

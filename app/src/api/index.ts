@@ -254,3 +254,5 @@ export const revealImage = (id: string) => call<void>("reveal_image", { id });
 export const llmStatus = () => call<LlmStatus>("llm_status");
 export const saveLlmSettings = (baseUrl: string | null, model: string | null) =>
   call<LlmStatus>("save_llm_settings", { baseUrl, model });
+/** Plans on the video GPU (`onPod`) or with LM Studio on this Mac. */
+export const savePlannerLocation = (onPod: boolean) => call<LlmStatus>("save_planner_location", { onPod });

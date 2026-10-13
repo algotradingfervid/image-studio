@@ -244,10 +244,17 @@ pub struct AppConfig {
     pub llm_base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_model: Option<String>,
+    /// Where the Stories planner runs: "pod" (vLLM on the video GPU, default) or "local" (LM Studio).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner_location: Option<String>,
 }
 
 pub const DEFAULT_LLM_BASE_URL: &str = "http://localhost:1234/v1";
 pub const DEFAULT_LLM_MODEL: &str = "qwen3.8-27b-uncensored-optiq";
+/// The planner model the video pod serves with vLLM (`LLM_MODEL`; gated on HF, the pod's HF_TOKEN has access).
+pub const POD_LLM_MODEL: &str = "orcarouter/Qwen3.8-27B-Uncensored-FP8";
+/// The name the pod's vLLM serves it under (`LLM_SERVED_NAME`).
+pub const POD_LLM_SERVED_NAME: &str = "qwen3.8-27b-uncensored";
 
 /// Trimmed value, or `default` when unset or blank.
 fn str_or(v: Option<&String>, default: &str) -> String {
@@ -423,6 +430,17 @@ impl Settings {
 
     pub fn llm_model(&self) -> String {
         str_or(self.config.lock().unwrap().llm_model.as_ref(), DEFAULT_LLM_MODEL)
+    }
+
+    /// The planner runs on the video pod unless the settings file says `"plannerLocation": "local"`.
+    pub fn planner_on_pod(&self) -> bool {
+        self.config.lock().unwrap().planner_location.as_deref().map(str::trim) != Some("local")
+    }
+
+    pub fn save_planner_location(&self, on_pod: bool) -> Result<(), String> {
+        let mut cfg = self.config.lock().unwrap();
+        cfg.planner_location = Some(if on_pod { "pod" } else { "local" }.into());
+        self.write_config(&cfg)
     }
 
     pub fn save_llm(&self, base_url: Option<String>, model: Option<String>) -> Result<(), String> {
