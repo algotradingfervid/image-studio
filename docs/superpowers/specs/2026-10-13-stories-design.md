@@ -23,17 +23,27 @@ v1 is done when, in the real app:
 - **The LLM writes content; code writes prompts.** The planner never produces H3 prompt text.
   Character descriptions, `<Picture N>` numbering, style and limits are filled in by code, so
   they cannot drift between shots (from the PDF).
-- **Reuse the app.** Rendering goes through the existing job queue, H3 Character model
+- **Reuse the app.** Stories is a Create tab beside Image and Video. Rendering goes through the existing job queue, H3 Character model
   (`h3ref`), GPU start/stop/retry, paid-GPU confirmation, Save-to (gallery/vault) and gallery.
 - **Adults only, always.** Hard rule in the planner prompt, the validator and the character form.
 - **Simple consent gate.** A character is `generated` (AI-made images) or `real_person`;
   a real person requires the owner to tick "I have this person's consent to use their likeness".
   Untick → the character cannot be planned or rendered. (Full consent registry: later.)
 
-## 3. User flow — the Stories screen
+## 3. User flow — the Stories tab on Create
 
-A fourth top-level screen, **Stories**, beside Create / Models / Settings. Left: list of
-stories (+ New story). Right: the selected story in four steps.
+A third tab in Create's mode switch: **Image · Video · Stories** (owner, 2026-10-13).
+Same layout as the other two tabs:
+- **Left panel** (where the Image form / Video panel sit): story picker (+ New story) and the
+  Cast and Brief steps, with **Plan story** at the bottom.
+- **Right area**: the job list stays on top as today; below it, in place of the gallery while
+  the Stories tab is active, the selected story's workspace — Plan (shot list) and Render &
+  review (shot cards) — plus **Assemble**. Switching back to Image or Video shows the gallery
+  again. Assembled videos appear in the normal gallery.
+- The Save-to switch (gallery / vault) works as on the other tabs; a story's destination is
+  fixed when the story is created.
+
+The steps:
 
 1. **Cast** — pick 1–2 characters for this story from the character library, or create one:
    - name (unique), 1–3 reference images (import file / gallery / vault — same pickers as
@@ -170,8 +180,10 @@ prompt, reference list and seed are stored with each take.
   r2v; fixture + tests.
 - Rust: `stories/` module — `planner.rs` (LLM client + repair loop), `validate.rs`,
   `compile.rs`, `assemble.rs` (ffmpeg), `store.rs` (tables), commands in `commands.rs`.
-- TS: `screens/stories/` (StoriesScreen, CastStep, BriefStep, PlanStep, RenderStep,
-  CharacterForm), `api` types + mock (canned plan, instant renders).
+- TS: `CreateMode` gains `"stories"` (Controls.tsx `MODES`, persisted like the others);
+  `screens/create/stories/` (StoriesPanel = left panel: picker, CastStep, BriefStep,
+  CharacterForm; StoryWorkspace = right area: PlanStep, RenderStep, Assemble), wired into
+  CreateScreen like VideoPanel; `api` types + mock (canned plan, instant renders).
 - Settings: LLM base URL + model.
 
 ## 11. Testing
