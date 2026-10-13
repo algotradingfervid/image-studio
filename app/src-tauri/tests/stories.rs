@@ -111,6 +111,76 @@ async fn all_unparseable_replies_error() {
     assert!(e.contains("nothing usable"), "{e}");
 }
 
+// ----- command-layer helpers -----
+
+#[test]
+fn check_character_names_each_problem() {
+    use app_lib::stories::store::check_character;
+    let good = Character { ref_ids: vec!["r1".into(), "r2".into()], ..mara() };
+    check_character(&good).unwrap();
+    let err = |f: fn(&mut Character)| {
+        let mut c = good.clone();
+        f(&mut c);
+        check_character(&c).unwrap_err()
+    };
+    assert!(err(|c| c.name = "  ".into()).contains("name"));
+    assert!(err(|c| c.name = "x".repeat(41)).contains("40 characters"));
+    assert!(err(|c| c.description = "x".repeat(201)).contains("200 characters"));
+    assert!(err(|c| c.ref_ids = vec![]).contains("reference image"));
+    assert!(err(|c| c.ref_ids = vec!["a".into(), "b".into(), "c".into(), "d".into()]).contains("at most 3 reference images"));
+    assert_eq!(err(|c| c.adult = false), "Mara is not confirmed as an adult (18+)");
+    assert_eq!(err(|c| c.source = "real_person".into()), "Mara is a real person without a consent tick");
+    assert!(err(|c| c.description = "a teen".into()).contains("adult"));
+    assert!(err(|c| c.source = "robot".into()).contains("source"));
+    let real = Character { source: "real_person".into(), consent: true, ..good.clone() };
+    check_character(&real).unwrap();
+}
+
+#[test]
+fn merge_shots_renumbers_keeps_ids_and_clears_edited_approvals() {
+    use app_lib::stories::{store::merge_shots, Shot};
+    let shot = |id: &str, pos: u32, approved: Option<&str>| Shot {
+        id: id.into(), story_id: "s1".into(), position: pos, duration_s: 8, characters: vec!["c1".into()],
+        setting: "roof".into(), camera: "wide".into(), action: "walks".into(), dialogue: vec![],
+        continuity: "cut".into(), approved_take_id: approved.map(String::from),
+    };
+    let existing = vec![shot("a", 1, Some("ta")), shot("b", 2, Some("tb"))];
+    let mut edited_b = shot("b", 9, Some("tb"));
+    edited_b.action = "runs".into();
+    // Incoming approvals are ignored; the stored ones are kept unless the text changed.
+    let incoming = vec![edited_b, shot("", 0, Some("bogus")), shot("a", 5, None)];
+    let out = merge_shots("s1", &existing, incoming);
+    assert_eq!(out.iter().map(|s| s.position).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(out[0].id, "b");
+    assert_eq!(out[0].approved_take_id, None, "edited text clears the approval");
+    assert!(!out[1].id.is_empty());
+    assert_eq!(out[1].approved_take_id, None);
+    assert_eq!(out[2].id, "a");
+    assert_eq!(out[2].approved_take_id.as_deref(), Some("ta"), "moved but unchanged keeps it");
+    assert!(out.iter().all(|s| s.story_id == "s1"));
+}
+
+#[tokio::test]
+async fn llm_model_resolution() {
+    use app_lib::stories::resolve_llm_model;
+    let s = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "qwen3-27b"}, {"id": "gemma"}]})))
+        .mount(&s).await;
+    let base = format!("{}/v1", s.uri());
+    assert_eq!(resolve_llm_model(&base, "gemma").await.unwrap(), "gemma");
+    assert_eq!(resolve_llm_model(&base, "not-loaded").await.unwrap(), "qwen3-27b");
+
+    let empty = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []}))).mount(&empty).await;
+    let e = resolve_llm_model(&format!("{}/v1", empty.uri()), "m").await.unwrap_err();
+    assert_eq!(e, "Load a model in LM Studio first");
+
+    let e = resolve_llm_model("http://127.0.0.1:9/v1", "m").await.unwrap_err();
+    assert_eq!(e, planner::LM_STUDIO_HINT);
+}
+
 // ----- render orchestration (mocked video pod) -----
 
 mod render_harness {

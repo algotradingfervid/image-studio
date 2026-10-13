@@ -87,6 +87,16 @@ pub struct StoryView {
     pub issues: Vec<Issue>,
 }
 
+/// The model to plan with: `configured` when LM Studio lists it, else the
+/// first listed model. Unreachable → `planner::LM_STUDIO_HINT`.
+pub async fn resolve_llm_model(base_url: &str, configured: &str) -> Result<String, String> {
+    let models = planner::list_models(base_url).await?;
+    if models.iter().any(|m| m == configured) {
+        return Ok(configured.to_string());
+    }
+    models.into_iter().next().ok_or_else(|| "Load a model in LM Studio first".to_string())
+}
+
 pub fn resolution_for(aspect: &str) -> Result<&'static str, String> {
     match aspect {
         "16:9" => Ok("1344x768"),

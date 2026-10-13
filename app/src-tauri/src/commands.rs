@@ -12,6 +12,7 @@ use crate::runpod::Health;
 use crate::settings::{Backend, SavePodSettings, SaveSettings, SettingsView};
 use crate::state::Core;
 use crate::status::{self, LoraView, StatusView};
+use crate::stories::{self, render, Character, Shot, Story, StoryView};
 use crate::tasks::{self, DeletePreview, DeleteResult, Task};
 use crate::vault::{KdfParams, VaultStatus};
 use crate::vault_migrate::{self, MigrateOptions};
@@ -804,4 +805,286 @@ pub fn delete_vault_item(core: CoreState<'_>, id: String) -> Res<()> {
 #[tauri::command]
 pub fn vault_touch(core: CoreState<'_>) {
     core.vault.touch();
+}
+
+// ----- stories -----
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderedShot {
+    pub shot_id: String,
+    pub job_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApproveResult {
+    pub view: StoryView,
+    pub queued: Option<RenderedShot>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmStatus {
+    pub base_url: String,
+    pub model: String,
+    pub reachable: bool,
+    pub models: Vec<String>,
+    pub error: Option<String>,
+}
+
+fn rendered((shot_id, job_id): (String, String)) -> RenderedShot {
+    RenderedShot { shot_id, job_id }
+}
+
+/// Deletes image records and the files the app wrote for them (videos/, images/).
+fn remove_records(core: &Core, recs: &[ImageRecord]) -> Res<()> {
+    let db = core.db.lock().unwrap();
+    let owned = [core.cfg.images_dir(), core.cfg.videos_dir()];
+    for rec in recs {
+        db.delete_image(&rec.id)?;
+        for f in std::iter::once(&rec.path).chain(rec.poster_path.as_ref()) {
+            let p = PathBuf::from(f);
+            if owned.iter().any(|d| p.starts_with(d)) {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Replaces a story's shots and deletes the takes of shots that are gone.
+fn store_shots(core: &Core, story_id: &str, shots: &[Shot]) -> Res<()> {
+    let orphans: Vec<ImageRecord> = {
+        let db = core.db.lock().unwrap();
+        stories::store::replace_shots(&db, story_id, shots)?;
+        db.list_takes(story_id)?
+            .into_iter()
+            .filter(|t| !shots.iter().any(|s| t.shot_id.as_deref() == Some(s.id.as_str())))
+            .collect()
+    };
+    remove_records(core, &orphans)
+}
+
+/// Brief, cast, target and aspect checks shared by create/update/plan.
+fn check_story(story: &Story) -> Res<()> {
+    if story.brief.trim().is_empty() {
+        return Err("Write a brief first".into());
+    }
+    if story.cast.is_empty() {
+        return Err("Add at least one character to the cast first".into());
+    }
+    if story.target_s == 0 {
+        return Err("Choose a target length".into());
+    }
+    stories::resolution_for(&story.aspect)?;
+    Ok(())
+}
+
+/// Every cast id must be a saved character.
+fn check_cast_exists(core: &Core, cast: &[String]) -> Res<()> {
+    let db = core.db.lock().unwrap();
+    for id in cast {
+        if stories::store::get_character(&db, id)?.is_none() {
+            return Err("A cast character no longer exists".into());
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn list_characters(core: CoreState<'_>) -> Res<Vec<Character>> {
+    stories::store::list_characters(&core.db.lock().unwrap())
+}
+
+/// New when `id` is empty (id and timestamps assigned); else an update.
+#[tauri::command]
+pub fn save_character(core: CoreState<'_>, character: Character) -> Res<Character> {
+    let mut c = character;
+    c.name = c.name.trim().to_string();
+    c.description = c.description.trim().to_string();
+    stories::store::check_character(&c)?;
+    let now = crate::state::now_rfc3339();
+    let db = core.db.lock().unwrap();
+    if c.id.is_empty() {
+        c.id = uuid::Uuid::new_v4().to_string();
+        c.created_at = now.clone();
+    } else if let Some(old) = stories::store::get_character(&db, &c.id)? {
+        c.created_at = old.created_at;
+    } else if c.created_at.is_empty() {
+        c.created_at = now.clone();
+    }
+    c.updated_at = now;
+    stories::store::save_character(&db, &c)?;
+    Ok(c)
+}
+
+#[tauri::command]
+pub fn delete_character(core: CoreState<'_>, id: String) -> Res<()> {
+    stories::store::delete_character(&core.db.lock().unwrap(), &id)
+}
+
+#[tauri::command]
+pub fn list_stories(core: CoreState<'_>) -> Res<Vec<Story>> {
+    stories::store::list_stories(&core.db.lock().unwrap())
+}
+
+#[tauri::command]
+pub fn create_story(
+    core: CoreState<'_>,
+    brief: String,
+    target_s: u32,
+    aspect: String,
+    style: String,
+    cast: Vec<String>,
+) -> Res<StoryView> {
+    let now = crate::state::now_rfc3339();
+    let story = Story {
+        id: uuid::Uuid::new_v4().to_string(),
+        title: String::new(),
+        logline: String::new(),
+        brief: brief.trim().to_string(),
+        target_s,
+        aspect,
+        style: style.trim().to_string(),
+        cast,
+        status: "draft".into(),
+        result_image_id: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    check_story(&story)?;
+    check_cast_exists(&core, &story.cast)?;
+    stories::store::save_story(&core.db.lock().unwrap(), &story)?;
+    render::story_view(&core, &story.id)
+}
+
+/// Saves the editable fields (title, brief, target, aspect, style, cast).
+#[tauri::command]
+pub fn update_story(core: CoreState<'_>, story: Story) -> Res<StoryView> {
+    let mut s = stories::store::get_story(&core.db.lock().unwrap(), &story.id)?
+        .ok_or("That story no longer exists")?;
+    s.title = story.title.trim().to_string();
+    s.brief = story.brief.trim().to_string();
+    s.target_s = story.target_s;
+    s.aspect = story.aspect;
+    s.style = story.style.trim().to_string();
+    s.cast = story.cast;
+    s.updated_at = crate::state::now_rfc3339();
+    check_story(&s)?;
+    check_cast_exists(&core, &s.cast)?;
+    stories::store::save_story(&core.db.lock().unwrap(), &s)?;
+    render::story_view(&core, &s.id)
+}
+
+/// Deletes the story, its shots, its takes and its assembled video.
+#[tauri::command]
+pub fn delete_story(core: CoreState<'_>, id: String) -> Res<()> {
+    let recs: Vec<ImageRecord> = {
+        let db = core.db.lock().unwrap();
+        let story = stories::store::get_story(&db, &id)?;
+        let mut recs = db.list_takes(&id)?;
+        if let Some(r) = story.and_then(|s| s.result_image_id) {
+            recs.extend(db.get_image(&r)?);
+        }
+        recs
+    };
+    remove_records(&core, &recs)?;
+    stories::store::delete_story(&core.db.lock().unwrap(), &id)
+}
+
+#[tauri::command]
+pub fn get_story(core: CoreState<'_>, id: String) -> Res<StoryView> {
+    render::story_view(&core, &id)
+}
+
+/// Plans the shots with the local LLM (replaces the shot list).
+#[tauri::command]
+pub async fn plan_story(core: CoreState<'_>, id: String) -> Res<StoryView> {
+    let view = render::story_view(&core, &id)?;
+    check_story(&view.story)?;
+    let base = core.settings.llm_base_url();
+    let model = stories::resolve_llm_model(&base, &core.settings.llm_model()).await?;
+    let out = stories::planner::plan(&base, &model, &view.story, &view.cast).await?;
+    let mut story = view.story;
+    if !out.title.trim().is_empty() {
+        story.title = out.title.trim().to_string();
+    }
+    story.logline = out.logline.trim().to_string();
+    story.status = "planned".into();
+    story.updated_at = crate::state::now_rfc3339();
+    stories::store::save_story(&core.db.lock().unwrap(), &story)?;
+    store_shots(&core, &id, &out.shots)?;
+    render::story_view(&core, &id)
+}
+
+/// Saves the edited shot list in the given order (see `store::merge_shots`).
+#[tauri::command]
+pub fn save_shots(core: CoreState<'_>, story_id: String, shots: Vec<Shot>) -> Res<StoryView> {
+    let existing = {
+        let db = core.db.lock().unwrap();
+        stories::store::get_story(&db, &story_id)?.ok_or("That story no longer exists")?;
+        stories::store::list_shots(&db, &story_id)?
+    };
+    let merged = stories::store::merge_shots(&story_id, &existing, shots);
+    store_shots(&core, &story_id, &merged)?;
+    render::story_view(&core, &story_id)
+}
+
+#[tauri::command]
+pub async fn render_shot(core: CoreState<'_>, shot_id: String) -> Res<JobStarted> {
+    let job_id = render::render_shot(&core, &shot_id)?;
+    Ok(JobStarted { job_id })
+}
+
+#[tauri::command]
+pub async fn render_story(core: CoreState<'_>, story_id: String) -> Res<Vec<RenderedShot>> {
+    Ok(render::render_story(&core, &story_id)?.into_iter().map(rendered).collect())
+}
+
+#[tauri::command]
+pub async fn approve_take(core: CoreState<'_>, shot_id: String, take_id: String) -> Res<ApproveResult> {
+    let queued = render::approve_take(&core, &shot_id, &take_id)?.map(rendered);
+    let story_id = stories::store::get_shot(&core.db.lock().unwrap(), &shot_id)?
+        .ok_or("That shot no longer exists")?
+        .story_id;
+    Ok(ApproveResult { view: render::story_view(&core, &story_id)?, queued })
+}
+
+/// ffmpeg concat of the approved takes (off the async runtime).
+#[tauri::command]
+pub async fn assemble_story(core: CoreState<'_>, story_id: String) -> Res<StoryView> {
+    let c = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        render::assemble_story(&c, &story_id)?;
+        render::story_view(&c, &story_id)
+    })
+    .await
+    .map_err(|e| format!("Assembling stopped: {e}"))?
+}
+
+async fn llm_status_of(core: &Core) -> LlmStatus {
+    let base_url = core.settings.llm_base_url();
+    let model = core.settings.llm_model();
+    let (reachable, models, error) = match stories::planner::list_models(&base_url).await {
+        Ok(models) if models.is_empty() => (true, models, Some("Load a model in LM Studio first".to_string())),
+        Ok(models) => (true, models, None),
+        Err(e) => (false, vec![], Some(e)),
+    };
+    LlmStatus { base_url, model, reachable, models, error }
+}
+
+#[tauri::command]
+pub async fn llm_status(core: CoreState<'_>) -> Res<LlmStatus> {
+    Ok(llm_status_of(&core).await)
+}
+
+#[tauri::command]
+pub async fn save_llm_settings(
+    core: CoreState<'_>,
+    base_url: Option<String>,
+    model: Option<String>,
+) -> Res<LlmStatus> {
+    core.settings.save_llm(base_url, model)?;
+    Ok(llm_status_of(&core).await)
 }
