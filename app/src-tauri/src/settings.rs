@@ -239,7 +239,15 @@ pub struct AppConfig {
     /// Vault auto-lock minutes (spec v6; default 10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault_auto_lock_minutes: Option<u32>,
+    /// Local LLM (LM Studio) used by the Stories planner; OpenAI-compatible base URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_model: Option<String>,
 }
+
+pub const DEFAULT_LLM_BASE_URL: &str = "http://localhost:1234/v1";
+pub const DEFAULT_LLM_MODEL: &str = "qwen3.8-27b-uncensored-optiq";
 
 /// Trimmed value, or `default` when unset or blank.
 fn str_or(v: Option<&String>, default: &str) -> String {
@@ -407,6 +415,21 @@ impl Settings {
                 crate::vault::MIN_AUTO_LOCK_MINUTES,
                 crate::vault::MAX_AUTO_LOCK_MINUTES,
             )
+    }
+
+    pub fn llm_base_url(&self) -> String {
+        str_or(self.config.lock().unwrap().llm_base_url.as_ref(), DEFAULT_LLM_BASE_URL)
+    }
+
+    pub fn llm_model(&self) -> String {
+        str_or(self.config.lock().unwrap().llm_model.as_ref(), DEFAULT_LLM_MODEL)
+    }
+
+    pub fn save_llm(&self, base_url: Option<String>, model: Option<String>) -> Result<(), String> {
+        let mut cfg = self.config.lock().unwrap();
+        cfg.llm_base_url = base_url.map(|s| s.trim().trim_end_matches('/').to_string()).filter(|s| !s.is_empty());
+        cfg.llm_model = model.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        self.write_config(&cfg)
     }
 
     pub fn save_vault_auto_lock(&self, minutes: u32) -> Result<(), String> {
