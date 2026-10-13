@@ -478,6 +478,35 @@ async fn generate_cancel() {
 }
 
 #[tokio::test]
+async fn jobs_queued_together_are_submitted_in_queue_order() {
+    let server = MockServer::start().await;
+    let h = harness(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/proxy/pod1/run"))
+        .respond_with(RunIds(AtomicUsize::new(0)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex("/proxy/pod1/status/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(completed(1)))
+        .mount(&server)
+        .await;
+    let ids: Vec<String> = (0..4)
+        .map(|i| jobs::generate(&h.core, req(1, Some(100 + i))).unwrap())
+        .collect();
+    for _ in 0..4 {
+        wait_job(&h.sink).await;
+    }
+    let seeds: Vec<u64> = worker_requests(&server)
+        .await
+        .iter()
+        .filter(|r| r.url.path().ends_with("/run"))
+        .map(|r| r.body_json::<Value>().unwrap()["input"]["seed"].as_u64().unwrap())
+        .collect();
+    assert_eq!(seeds, vec![100, 101, 102, 103], "jobs {ids:?}");
+}
+
+#[tokio::test]
 async fn generate_count_three_uses_consecutive_seeds() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
