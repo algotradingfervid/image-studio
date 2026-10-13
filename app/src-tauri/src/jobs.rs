@@ -18,7 +18,8 @@ use base64::Engine;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// ComfyUI accepts seeds up to 2^64-1, but JS numbers are only exact up to
@@ -48,6 +49,75 @@ impl JobKind {
             JobKind::Image => Profile::Image,
             JobKind::Video => Profile::Video,
         }
+    }
+}
+
+/// Submission order (Stories "Render all" on a cold pod): jobs queued together
+/// wake together when the pod is ready and would race their `/run` calls. A
+/// ticket is taken at queue time, in the caller's order; a job submits only
+/// when it holds the lowest outstanding ticket of its profile. Dropping the
+/// ticket (submitted, failed to start, cancelled) lets the next one through.
+#[derive(Default)]
+pub struct SubmitGate {
+    next: AtomicU64,
+    pending: std::sync::Mutex<HashMap<Profile, BTreeSet<u64>>>,
+    notify: tokio::sync::Notify,
+}
+
+pub struct Ticket {
+    gate: Arc<SubmitGate>,
+    profile: Profile,
+    n: u64,
+}
+
+impl SubmitGate {
+    pub fn take(self: Arc<Self>, profile: Profile) -> Ticket {
+        let n = self.next.fetch_add(1, Ordering::SeqCst);
+        self.pending
+            .lock()
+            .unwrap()
+            .entry(profile)
+            .or_default()
+            .insert(n);
+        Ticket {
+            gate: self,
+            profile,
+            n,
+        }
+    }
+}
+
+impl Ticket {
+    pub fn n(&self) -> u64 {
+        self.n
+    }
+
+    /// Resolves when every earlier ticket of this profile has been released.
+    pub async fn wait_turn(&self) {
+        loop {
+            // Registered before the check, so a release between the check and the await is not missed.
+            let notified = self.gate.notify.notified();
+            let first = self
+                .gate
+                .pending
+                .lock()
+                .unwrap()
+                .get(&self.profile)
+                .and_then(|s| s.first().copied());
+            if first == Some(self.n) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        if let Some(s) = self.gate.pending.lock().unwrap().get_mut(&self.profile) {
+            s.remove(&self.n);
+        }
+        self.gate.notify.notify_waiters();
     }
 }
 
@@ -814,6 +884,8 @@ pub fn generate_video(core: &Arc<Core>, req: VideoRequest) -> Result<String, Str
 fn start_job(core: &Arc<Core>, plan: Plan) -> Result<String, String> {
     let profile = plan.kind.profile();
     crate::worker::precheck_for(core, profile)?;
+    // Taken in call order (for `render_story`, shot order); see `SubmitGate`.
+    let ticket = core.submit_gate.clone().take(profile);
     // Before any pod start: the next pod prefetches this model to local disk.
     crate::pod::record_last_model(core, profile, &plan.record.model);
     let job_id = uuid::Uuid::new_v4().to_string();
@@ -872,7 +944,7 @@ fn start_job(core: &Arc<Core>, plan: Plan) -> Result<String, String> {
             crate::worker::client_for(&core2, profile, &mut on_phase, &cancelled).await
         };
         match client {
-            Ok(client) => run_job(core2, id2, client, plan).await,
+            Ok(client) => run_job(core2, id2, client, plan, ticket).await,
             Err(_) if cancel_requested(&core2, &id2) => finish_cancelled(&core2, &id2, profile).await,
             Err(e) => finish(&core2, &id2, JobState::Failed, Some(e)),
         }
@@ -1174,7 +1246,7 @@ async fn cancel_all(client: &RunpodClient, subs: &[Sub]) {
     }
 }
 
-async fn run_job(core: Arc<Core>, id: String, client: RunpodClient, plan: Plan) {
+async fn run_job(core: Arc<Core>, id: String, client: RunpodClient, plan: Plan, ticket: Ticket) {
     let mut subs: Vec<Sub> = plan
         .seeds
         .iter()
@@ -1188,7 +1260,10 @@ async fn run_job(core: Arc<Core>, id: String, client: RunpodClient, plan: Plan) 
         })
         .collect();
 
-    // Submit one RunPod job per image.
+    // Submit one RunPod job per image, after every job queued earlier on this
+    // profile has submitted (all `/run`s of a multi-seed job go out together).
+    ticket.wait_turn().await;
+    crate::alog!("job", "{} submitting (ticket {})", short(&id), ticket.n());
     for i in 0..subs.len() {
         if cancel_requested(&core, &id) {
             cancel_all(&client, &subs).await;
@@ -1217,6 +1292,7 @@ async fn run_job(core: Arc<Core>, id: String, client: RunpodClient, plan: Plan) 
             }
         }
     }
+    drop(ticket);
 
     loop {
         tokio::time::sleep(core.cfg.poll_interval).await;
@@ -1320,6 +1396,50 @@ async fn run_job(core: Arc<Core>, id: String, client: RunpodClient, plan: Plan) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tickets_submit_in_queue_order_whatever_the_wake_order() {
+        let gate = Arc::new(SubmitGate::default());
+        let t0 = gate.clone().take(Profile::Video);
+        let t1 = gate.clone().take(Profile::Video);
+        let t2 = gate.clone().take(Profile::Video);
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        // Wake order 2, 1, 0 (the pod-ready race), submission must still be 0, 1, 2.
+        for (delay, t) in [(0u64, t2), (5, t1), (10, t0)] {
+            let order = order.clone();
+            tasks.push(tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                t.wait_turn().await;
+                order.lock().unwrap().push(t.n());
+                drop(t);
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn dropped_ticket_unblocks_the_next_and_profiles_are_independent() {
+        let gate = Arc::new(SubmitGate::default());
+        let video0 = gate.clone().take(Profile::Video);
+        let video1 = gate.clone().take(Profile::Video);
+        let image = gate.clone().take(Profile::Image);
+        tokio::time::timeout(std::time::Duration::from_millis(100), image.wait_turn())
+            .await
+            .expect("image profile not blocked by video");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), video1.wait_turn())
+                .await
+                .is_err()
+        );
+        drop(video0); // a job that failed before submitting
+        tokio::time::timeout(std::time::Duration::from_millis(100), video1.wait_turn())
+            .await
+            .expect("released by drop");
+    }
 
     #[test]
     fn seed_expansion() {

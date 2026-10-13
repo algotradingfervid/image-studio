@@ -108,6 +108,8 @@ pub struct Core {
     /// Stories: shot id → job id of its latest render. An entry counts only
     /// while that job is still in `jobs` (see `stories::render`).
     pub story_renders: Mutex<HashMap<String, String>>,
+    /// Per-profile submission order of queued jobs (see `jobs::SubmitGate`).
+    pub submit_gate: Arc<crate::jobs::SubmitGate>,
 }
 
 impl Core {
@@ -137,6 +139,7 @@ impl Core {
             refresh_lock: tokio::sync::Mutex::new(()),
             video_refresh_lock: tokio::sync::Mutex::new(()),
             story_renders: Mutex::new(HashMap::new()),
+            submit_gate: Arc::default(),
         }))
     }
 
