@@ -44,7 +44,9 @@ import type {
   ApproveResult,
   Character,
   LlmStatus,
+  RenderAllResult,
   RenderedShot,
+  StoryPatch,
   Shot,
   Story,
   StoryIssue,
@@ -1266,7 +1268,7 @@ async function runVideoStages(job: Job, input: GenerateVideoInput, steps: number
 }
 
 /** `take`: a Stories shot render — the record is tagged and kept out of the gallery (`takes`). */
-async function runVideoJob(jobId: string, input: GenerateVideoInput, take?: { storyId: string; shotId: string }) {
+async function runVideoJob(jobId: string, input: GenerateVideoInput, take?: { storyId: string; shotId: string; label: string }) {
   const m = videoModels.find((x) => x.id === input.model)!;
   const steps = input.steps || m.defaults.steps || 30;
   const cfg = input.cfg ?? m.defaults.cfg ?? 5;
@@ -1281,6 +1283,7 @@ async function runVideoJob(jobId: string, input: GenerateVideoInput, take?: { st
         : null;
   const destination: Destination = input.destination === "vault" ? "vault" : "general";
   const job: Job = { jobId, kind: "video", status: "queued", total: 1, completed: 0, progress: null, images: [], error: null, destination };
+  if (take) job.label = take.label;
   const cancelled = () => jobCancel.has(jobId);
   const stop = (status: Job["status"], error: string | null = null) => {
     job.status = status;
@@ -1334,6 +1337,8 @@ async function runVideoJob(jobId: string, input: GenerateVideoInput, take?: { st
     initImage: initPath,
     references: (input.referenceIds ?? []).map((id) => refs.get(id) ?? "").filter(Boolean),
   });
+  // Like save_video: a take whose shot was removed meanwhile is discarded.
+  if (take && !shots.has(take.shotId)) return stop("failed", "The shot was removed while it rendered; its take was discarded");
   if (take) {
     rec.storyId = take.storyId;
     rec.shotId = take.shotId;
@@ -1411,6 +1416,7 @@ function validateStory(story: Story, list: Shot[], cast: Character[]): StoryIssu
   list.forEach((s, i) => {
     const push = (message: string) => out.push({ shot: s.position, message });
     if (!(s.durationS >= MIN_SHOT_S && s.durationS <= MAX_SHOT_S)) push(`Duration ${s.durationS} s is outside 5–15 s`);
+    if (!s.characters.length) push(`Shot ${s.position} needs at least one character`);
     if (s.characters.length > MAX_CAST_PER_SHOT) push(`${s.characters.length} characters; at most 2 per shot`);
     for (const c of s.characters) if (!story.cast.includes(c)) push(`${name(c)} is not in the cast`);
     const wordsTotal = s.dialogue.reduce((n, d) => n + words(d.line).length, 0);
@@ -1518,7 +1524,34 @@ function checkStoryFields(f: { brief: string; targetS: number; aspect: string; s
   for (const id of f.cast) if (!characters.has(id)) throw new Error("A cast character no longer exists");
 }
 
-const issueText = (i: StoryIssue) => (i.shot != null ? `Shot ${i.shot}: ${i.message}` : i.message);
+const issueText = (i: StoryIssue) => (i.shot != null && !i.message.startsWith(`Shot ${i.shot} `) ? `Shot ${i.shot}: ${i.message}` : i.message);
+
+/** Mirror of `core.story_renders`: shot id → job id of a story render still running. */
+const storyRenders = new Map<string, string>();
+const isRenderingShot = (shotId: string) => {
+  const job = storyRenders.get(shotId);
+  if (job && !activeJobs.has(job)) storyRenders.delete(shotId);
+  return storyRenders.has(shotId);
+};
+/** Delete / re-plan / removing a shot: refused while an affected shot renders. */
+function refuseRendering(list: Shot[]) {
+  const s = list.find((x) => isRenderingShot(x.id));
+  if (s) throw new Error(`Wait for shot ${s.position} to finish rendering`);
+}
+
+/** Mirror of render.rs job_label. */
+function storyJobLabel(story: Story, position: number): string {
+  let name = story.title.trim();
+  if (!name) {
+    const brief = story.brief.trim();
+    if ([...brief].length > 40) {
+      const cut = [...brief].slice(0, 40).join("");
+      const i = cut.lastIndexOf(" ");
+      name = `${(i > 0 ? cut.slice(0, i) : cut).replace(/[ ,;:.]+$/, "")}…`;
+    } else name = brief;
+  }
+  return `Story: ${name} · shot ${position}`;
+}
 
 /** The canned planner output: shot durations sum to the target, shot 1 cuts, shot 2 continues. */
 function cannedPlan(story: Story): { title: string; logline: string; voices: Voice[]; shots: Shot[] } {
@@ -1580,9 +1613,12 @@ function requireH3ref() {
 function renderShotInternal(shotId: string): string {
   const shot = shots.get(shotId);
   if (!shot) throw new Error("That shot no longer exists");
+  if (isRenderingShot(shotId)) throw new Error(`Shot ${shot.position} is already rendering`);
   const view = storyView(shot.storyId);
   checkCast(view.story);
-  if (view.issues.length) throw new Error(issueText(view.issues[0]));
+  // Story-wide issues and this shot's own block it; another shot's don't.
+  const issue = view.issues.find((i) => i.shot === null || i.shot === shot.position);
+  if (issue) throw new Error(issueText(issue));
   const compiled = compileShot(view.story, shot, view.cast);
   if (!compiled.refIds.length) throw new Error(`Shot ${shot.position} has no character with reference images`);
   let initImageId: string | undefined;
@@ -1609,7 +1645,9 @@ function renderShotInternal(shotId: string): string {
     destination: "general",
   };
   const jobId = uid("job");
-  void runVideoJob(jobId, input, { storyId: shot.storyId, shotId: shot.id });
+  // runVideoJob registers the job in activeJobs before its first await.
+  storyRenders.set(shot.id, jobId);
+  void runVideoJob(jobId, input, { storyId: shot.storyId, shotId: shot.id, label: storyJobLabel(view.story, shot.position) });
   return jobId;
 }
 
@@ -1691,16 +1729,34 @@ const storyCommands: Record<string, Handler> = {
     return storyView(story.id);
   },
   update_story: (a) => {
-    const s = a.story as Story;
-    const old = getStoryOr(s.id);
-    checkStoryFields(s);
-    stories.set(s.id, { ...old, title: s.title, brief: s.brief, targetS: s.targetS, aspect: s.aspect, style: s.style, cast: s.cast, voices: s.voices ?? old.voices, updatedAt: nowIso() });
-    return storyView(s.id);
+    // Mirror of render::update_story: only the fields the patch sets are written.
+    const id = String(a.id);
+    const p = (a.patch ?? {}) as StoryPatch;
+    const old = getStoryOr(id);
+    if (p.aspect !== undefined && p.aspect !== old.aspect && takes.some((t) => t.storyId === id))
+      throw new Error("Change the aspect before rendering; this story already has takes");
+    const next: Story = { ...old };
+    if (p.title !== undefined) next.title = p.title.trim();
+    if (p.brief !== undefined) next.brief = p.brief.trim();
+    if (p.targetS !== undefined) next.targetS = p.targetS;
+    if (p.aspect !== undefined) next.aspect = p.aspect;
+    if (p.style !== undefined) next.style = p.style.trim();
+    if (p.cast !== undefined) next.cast = p.cast;
+    // One non-empty phrase per cast member (drops the voices of characters who left).
+    next.voices = (p.voices ?? old.voices)
+      .map((v) => ({ characterId: v.characterId, voice: v.voice.trim() }))
+      .filter((v, i, all) => v.voice && next.cast.includes(v.characterId) && all.findIndex((x) => x.characterId === v.characterId) === i);
+    if (!next.brief) throw new Error("Write a brief first");
+    if (!next.cast.length) throw new Error("Add at least one character to the cast first");
+    checkStoryFields(next);
+    stories.set(id, { ...next, updatedAt: nowIso() });
+    return storyView(id);
   },
   delete_story: (a) => {
     const id = String(a.id);
     const story = stories.get(id);
     if (!story) return;
+    refuseRendering(storyShots(id));
     for (const s of storyShots(id)) shots.delete(s.id);
     for (const t of takes.filter((t) => t.storyId === id)) removeRecord(takes, t.id);
     if (story.resultImageId) removeRecord(images, story.resultImageId);
@@ -1711,22 +1767,29 @@ const storyCommands: Record<string, Handler> = {
     const story = getStoryOr(String(a.id));
     checkCast(story);
     if (!story.brief.trim()) throw new Error("Write a brief first");
-    await sleep(1500);
+    refuseRendering(storyShots(story.id));
+    // ?planMs= stretches the fake LLM call (to exercise edits made while planning).
+    await sleep(Number(params.get("planMs")) || 1500);
     if (llmDown) throw new Error(LM_STUDIO_HINT);
-    const plan = cannedPlan(story);
+    refuseRendering(storyShots(story.id));
+    // Built on the story as stored now, not as it was when planning began.
+    const latest = getStoryOr(story.id);
+    const plan = cannedPlan(latest);
     // Re-planning replaces every shot; their takes go with them.
     for (const s of storyShots(story.id)) {
       shots.delete(s.id);
       for (const t of takes.filter((t) => t.shotId === s.id)) removeRecord(takes, t.id);
     }
     for (const s of plan.shots) shots.set(s.id, s);
-    stories.set(story.id, { ...story, title: plan.title, logline: plan.logline, voices: plan.voices, status: "planned", updatedAt: nowIso() });
+    stories.set(story.id, { ...latest, title: plan.title, logline: plan.logline, voices: plan.voices, status: "planned", updatedAt: nowIso() });
     return storyView(story.id);
   },
   save_shots: (a) => {
     const storyId = String(a.storyId);
     const story = getStoryOr(storyId);
     const incoming = (a.shots as Shot[]) ?? [];
+    // Removing a shot that is rendering is refused (nothing is changed).
+    refuseRendering(storyShots(storyId).filter((s) => !incoming.some((x) => x.id === s.id)));
     const keep = new Set<string>();
     const text = (s: Shot) => JSON.stringify([s.durationS, s.characters, s.setting, s.camera, s.action, s.dialogue, s.sound, s.continuity]);
     incoming.forEach((s, i) => {
@@ -1755,14 +1818,23 @@ const storyCommands: Record<string, Handler> = {
     return storyView(storyId);
   },
   render_shot: (a) => ({ jobId: renderShotInternal(String(a.shotId)) }),
-  render_story: (a) => {
+  render_story: (a): RenderAllResult => {
+    // Mirror of render::render_story: a shot that can't render doesn't stop the others.
     const view = storyView(String(a.storyId));
     const out: RenderedShot[] = [];
+    const errors: string[] = [];
     for (const s of view.shots) {
       const prevOk = s.continuity === "cut" || view.shots.some((p) => p.position + 1 === s.position && p.approvedTakeId);
-      if (!shotHasTakes(s.id) && prevOk) out.push({ shotId: s.id, jobId: renderShotInternal(s.id) });
+      if (shotHasTakes(s.id) || isRenderingShot(s.id) || !prevOk) continue;
+      try {
+        out.push({ shotId: s.id, jobId: renderShotInternal(s.id) });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        errors.push(msg.startsWith("Shot ") ? msg : `Shot ${s.position}: ${msg}`);
+      }
     }
-    return out;
+    const error = !errors.length ? null : out.length ? `Queued ${out.length} shot(s); ${errors.join("; ")}` : errors.join("; ");
+    return { queued: out, error };
   },
   approve_take: (a): ApproveResult => {
     const shotId = String(a.shotId);
@@ -2172,8 +2244,13 @@ const commands: Record<string, Handler> = {
   delete_image: async (a) => {
     if (vault.items.some((x) => x.id === a.id)) return commands.delete_vault_item(a);
     await sleep(150);
-    const idx = images.findIndex((im) => im.id === a.id);
+    const id = String(a.id);
+    const idx = images.findIndex((im) => im.id === id);
     if (idx >= 0) images.splice(idx, 1);
+    // Story takes live outside `images`; a story forgets a take or result it pointed at (Rust: delete_record).
+    removeRecord(takes, id);
+    for (const s of shots.values()) if (s.approvedTakeId === id) shots.set(s.id, { ...s, approvedTakeId: null });
+    for (const s of stories.values()) if (s.resultImageId === id) stories.set(s.id, { ...s, resultImageId: null, status: "planned" });
   },
   // ---------- vault (spec v6) ----------
   vault_status: () => vaultStatus(),

@@ -518,14 +518,16 @@ async fn continues_shot_requires_approved_previous() {
 async fn render_story_skips_waiting_continues_shots() {
     let (h, _server) = video_harness().await;
     let (story_id, shot_ids) = seed_story(&h.core, &[("cut", 8), ("continues", 8), ("cut", 8)]);
-    let queued = render::render_story(&h.core, &story_id).unwrap();
+    let all = render::render_story(&h.core, &story_id).unwrap();
+    assert_eq!(all.error, None);
+    let queued = all.queued;
     let ids: Vec<&str> = queued.iter().map(|q| q.0.as_str()).collect();
     assert_eq!(ids, vec![shot_ids[0].as_str(), shot_ids[2].as_str()]);
     for (_, job) in &queued {
         wait_video(&h, job).await;
     }
     // Shots with takes are not re-rendered.
-    assert!(render::render_story(&h.core, &story_id).unwrap().is_empty());
+    assert!(render::render_story(&h.core, &story_id).unwrap().queued.is_empty());
 }
 
 #[tokio::test]
@@ -622,9 +624,9 @@ async fn second_render_of_a_shot_is_refused_while_the_first_runs() {
 async fn render_story_twice_queues_each_shot_once() {
     let (h, server) = video_harness().await;
     let (story_id, _) = seed_story(&h.core, &[("cut", 8), ("cut", 8)]);
-    let first = render::render_story(&h.core, &story_id).unwrap();
+    let first = render::render_story(&h.core, &story_id).unwrap().queued;
     assert_eq!(first.len(), 2);
-    assert!(render::render_story(&h.core, &story_id).unwrap().is_empty());
+    assert!(render::render_story(&h.core, &story_id).unwrap().queued.is_empty());
     for (_, job) in &first {
         wait_video(&h, job).await;
     }
@@ -701,4 +703,202 @@ async fn story_view_of_a_fresh_draft_reports_cast_issues() {
     let view = render::story_view(&h.core, &story_id).unwrap();
     let msgs: Vec<&str> = view.issues.iter().map(|i| i.message.as_str()).collect();
     assert_eq!(msgs, vec!["Mara is not confirmed as an adult (18+)"], "no 'no shots' issue on a draft");
+}
+
+// ----- final review fixes -----
+
+fn set_shot(core: &app_lib::state::Core, shot_id: &str, f: &dyn Fn(&mut app_lib::stories::Shot)) {
+    let db = core.db.lock().unwrap();
+    let mut s = app_lib::stories::store::get_shot(&db, shot_id).unwrap().unwrap();
+    f(&mut s);
+    app_lib::stories::store::update_shot(&db, &s).unwrap();
+}
+
+/// Waits for `job_id` to end (any final state) and returns its last update.
+async fn wait_end(h: &render_harness::Harness, job_id: &str) -> app_lib::jobs::Job {
+    use app_lib::jobs::JobState;
+    for _ in 0..1000 {
+        let done = h.sink.jobs.lock().unwrap().iter().rev()
+            .find(|j| j.job_id == job_id && matches!(j.status, JobState::Completed | JobState::Failed | JobState::Cancelled))
+            .cloned();
+        if let Some(j) = done {
+            return j;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("job {job_id} did not finish");
+}
+
+#[tokio::test]
+async fn update_story_patch_writes_only_the_given_fields() {
+    use app_lib::stories::{StoryPatch, Voice};
+    let (h, _server) = video_harness().await;
+    let (story_id, _) = seed_story(&h.core, &[("cut", 8)]);
+    let voice = Voice { character_id: "c-mara".into(), voice: "a low, steady voice".into() };
+    // The workspace saves the voices only.
+    let v = render::update_story(&h.core, &story_id, StoryPatch { voices: Some(vec![voice.clone()]), ..Default::default() }).unwrap();
+    assert_eq!(v.story.voices, vec![voice.clone()]);
+    assert_eq!(v.story.brief, "A heist on a rooftop");
+    // The panel then saves its fields from a copy that predates the voice edit: the voices stay.
+    let v = render::update_story(&h.core, &story_id, StoryPatch {
+        brief: Some("  A chase on a rooftop ".into()), target_s: Some(8), aspect: Some("16:9".into()),
+        style: Some("35 mm".into()), cast: Some(vec!["c-mara".into()]), ..Default::default()
+    }).unwrap();
+    assert_eq!(v.story.voices, vec![voice]);
+    assert_eq!((v.story.brief.as_str(), v.story.title.as_str(), v.story.style.as_str()), ("A chase on a rooftop", "Rooftop", "35 mm"));
+    // A title-only rename keeps the brief.
+    let v = render::update_story(&h.core, &story_id, StoryPatch { title: Some(" Night run ".into()), ..Default::default() }).unwrap();
+    assert_eq!((v.story.title.as_str(), v.story.brief.as_str()), ("Night run", "A chase on a rooftop"));
+    // Validated as before.
+    let e = render::update_story(&h.core, &story_id, StoryPatch { brief: Some(" ".into()), ..Default::default() }).unwrap_err();
+    assert_eq!(e, "Write a brief first");
+    let e = render::update_story(&h.core, &story_id, StoryPatch { cast: Some(vec!["nobody".into()]), ..Default::default() }).unwrap_err();
+    assert_eq!(e, "A cast character no longer exists");
+    // Leaving the cast drops the character's voice.
+    {
+        let db = h.core.db.lock().unwrap();
+        let mara = app_lib::stories::store::get_character(&db, "c-mara").unwrap().unwrap();
+        let ivo = Character { id: "c-ivo".into(), name: "Ivo".into(), ..mara };
+        app_lib::stories::store::save_character(&db, &ivo).unwrap();
+    }
+    let v = render::update_story(&h.core, &story_id, StoryPatch { cast: Some(vec!["c-ivo".into()]), ..Default::default() }).unwrap();
+    assert!(v.story.voices.is_empty(), "{:?}", v.story.voices);
+}
+
+#[tokio::test]
+async fn aspect_cannot_change_once_the_story_has_takes() {
+    use app_lib::stories::StoryPatch;
+    let (h, _server) = video_harness().await;
+    let (story_id, shot_ids) = seed_story(&h.core, &[("cut", 8)]);
+    let aspect = |a: &str| StoryPatch { aspect: Some(a.into()), ..Default::default() };
+    // No takes yet: fine (and back).
+    render::update_story(&h.core, &story_id, aspect("9:16")).unwrap();
+    render::update_story(&h.core, &story_id, aspect("16:9")).unwrap();
+    wait_video(&h, &render::render_shot(&h.core, &shot_ids[0]).unwrap()).await;
+    let e = render::update_story(&h.core, &story_id, aspect("9:16")).unwrap_err();
+    assert_eq!(e, "Change the aspect before rendering; this story already has takes");
+    // Sending the unchanged aspect is not a change.
+    let v = render::update_story(&h.core, &story_id, StoryPatch { aspect: Some("16:9".into()), brief: Some("New brief".into()), ..Default::default() }).unwrap();
+    assert_eq!(v.story.brief, "New brief");
+}
+
+#[tokio::test]
+async fn shot_without_characters_is_an_issue_and_render_all_reports_it_after_queueing_the_rest() {
+    let (h, _server) = video_harness().await;
+    let (story_id, shot_ids) = seed_story(&h.core, &[("cut", 8), ("cut", 8), ("cut", 8)]);
+    set_shot(&h.core, &shot_ids[1], &|s| {
+        s.characters.clear();
+        s.dialogue.clear();
+    });
+    let view = render::story_view(&h.core, &story_id).unwrap();
+    let issues: Vec<(Option<u32>, &str)> = view.issues.iter().map(|i| (i.shot, i.message.as_str())).collect();
+    assert_eq!(issues, vec![(Some(2), "Shot 2 needs at least one character")]);
+    let all = render::render_story(&h.core, &story_id).unwrap();
+    let ids: Vec<&str> = all.queued.iter().map(|q| q.0.as_str()).collect();
+    assert_eq!(ids, vec![shot_ids[0].as_str(), shot_ids[2].as_str()], "the valid shots render");
+    assert_eq!(all.error.as_deref(), Some("Queued 2 shot(s); Shot 2 needs at least one character"));
+    // The broken shot itself is refused.
+    let e = render::render_shot(&h.core, &shot_ids[1]).unwrap_err();
+    assert_eq!(e, "Shot 2 needs at least one character");
+    for (_, job) in &all.queued {
+        wait_video(&h, job).await;
+    }
+}
+
+#[tokio::test]
+async fn story_render_jobs_carry_a_story_and_shot_label() {
+    let (h, _server) = video_harness().await;
+    let (story_id, shot_ids) = seed_story(&h.core, &[("cut", 8), ("cut", 8)]);
+    let job = render::render_shot(&h.core, &shot_ids[1]).unwrap();
+    wait_video(&h, &job).await;
+    let labels: Vec<Option<String>> = h.sink.jobs.lock().unwrap().iter().filter(|j| j.job_id == job).map(|j| j.label.clone()).collect();
+    assert!(!labels.is_empty() && labels.iter().all(|l| l.as_deref() == Some("Story: Rooftop · shot 2")), "{labels:?}");
+    let last = h.sink.jobs.lock().unwrap().iter().rev().find(|j| j.job_id == job).cloned().unwrap();
+    assert_eq!(serde_json::to_value(&last).unwrap()["label"], "Story: Rooftop · shot 2");
+    // Untitled: the start of the brief.
+    {
+        let db = h.core.db.lock().unwrap();
+        let mut s = app_lib::stories::store::get_story(&db, &story_id).unwrap().unwrap();
+        s.title = String::new();
+        s.brief = "A long night on the rooftops of the old harbour district, with rain".into();
+        app_lib::stories::store::save_story(&db, &s).unwrap();
+    }
+    let job = render::render_shot(&h.core, &shot_ids[0]).unwrap();
+    let j = wait_end(&h, &job).await;
+    assert_eq!(j.label.as_deref(), Some("Story: A long night on the rooftops of the old… · shot 1"));
+}
+
+#[test]
+fn unlabelled_jobs_serialize_without_a_label() {
+    let j = app_lib::jobs::Job {
+        job_id: "j".into(), kind: app_lib::jobs::JobKind::Video, destination: Default::default(),
+        status: app_lib::jobs::JobState::Queued, total: 1, completed: 0, progress: None, images: vec![],
+        error: None, gpu_release: None, label: None,
+    };
+    assert!(serde_json::to_value(&j).unwrap().get("label").is_none());
+}
+
+#[tokio::test]
+async fn deleting_replanning_or_removing_a_rendering_shot_is_refused() {
+    use app_lib::stories::store;
+    let (h, _server) = video_harness().await;
+    let (story_id, shot_ids) = seed_story(&h.core, &[("cut", 8), ("cut", 8)]);
+    let llm = mock_llm(&h.core, good_plan(16)).await;
+    let job = render::render_shot(&h.core, &shot_ids[1]).unwrap();
+    let wait = "Wait for shot 2 to finish rendering";
+    assert_eq!(render::delete_story(&h.core, &story_id).unwrap_err(), wait);
+    assert_eq!(render::plan_story(&h.core, &story_id).await.unwrap_err(), wait);
+    assert!(llm.received_requests().await.unwrap().is_empty(), "refused before planning");
+    let shots = store::list_shots(&h.core.db.lock().unwrap(), &story_id).unwrap();
+    // Removing the rendering shot is refused; editing the other one is fine.
+    assert_eq!(render::save_shots(&h.core, &story_id, vec![shots[0].clone()]).unwrap_err(), wait);
+    let mut edited = shots.clone();
+    edited[0].action = "Mara looks down.".into();
+    render::save_shots(&h.core, &story_id, edited).unwrap();
+    assert_eq!(store::list_shots(&h.core.db.lock().unwrap(), &story_id).unwrap().len(), 2, "nothing was removed");
+    wait_video(&h, &job).await;
+    // Done rendering: all allowed again.
+    render::save_shots(&h.core, &story_id, vec![shots[0].clone()]).unwrap();
+    render::delete_story(&h.core, &story_id).unwrap();
+    assert!(store::get_story(&h.core.db.lock().unwrap(), &story_id).unwrap().is_none());
+    assert!(h.core.db.lock().unwrap().list_takes(&story_id).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_take_for_a_shot_that_is_gone_is_discarded_with_its_files() {
+    use app_lib::jobs::JobState;
+    let (h, _server) = video_harness().await;
+    let (story_id, shot_ids) = seed_story(&h.core, &[("cut", 8)]);
+    let job = render::render_shot(&h.core, &shot_ids[0]).unwrap();
+    // Removed behind the app's back (the commands refuse this while it renders).
+    app_lib::stories::store::replace_shots(&h.core.db.lock().unwrap(), &story_id, &[]).unwrap();
+    let j = wait_end(&h, &job).await;
+    assert_eq!(j.status, JobState::Failed, "{:?}", j.error);
+    assert!(j.error.as_deref().unwrap_or_default().contains("The shot was removed while it rendered"), "{:?}", j.error);
+    assert!(j.images.is_empty());
+    assert!(h.core.db.lock().unwrap().list_takes(&story_id).unwrap().is_empty());
+    let left: Vec<_> = std::fs::read_dir(h.core.cfg.videos_dir()).map(|d| d.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[tokio::test]
+async fn deleting_an_approved_take_or_the_result_clears_the_links() {
+    use app_lib::stories::store;
+    let (h, _server) = video_harness().await;
+    let (story_id, shot_ids) = seed_story(&h.core, &[("cut", 8)]);
+    let take = wait_video(&h, &render::render_shot(&h.core, &shot_ids[0]).unwrap()).await;
+    render::approve_take(&h.core, &shot_ids[0], &take.id).unwrap();
+    let db = h.core.db.lock().unwrap();
+    h.core.cfg.delete_record(&db, &take).unwrap();
+    assert_eq!(store::get_shot(&db, &shot_ids[0]).unwrap().unwrap().approved_take_id, None);
+    // The assembled result (a gallery record) the same way.
+    let mut result = take.clone();
+    result.id = "result-1".into();
+    result.shot_id = None;
+    result.path = h.core.cfg.videos_dir().join("result-1.mp4").to_string_lossy().into();
+    db.insert_image(&result).unwrap();
+    store::set_result(&db, &story_id, "result-1", "{}").unwrap();
+    h.core.cfg.delete_record(&db, &result).unwrap();
+    let s = store::get_story(&db, &story_id).unwrap().unwrap();
+    assert_eq!((s.result_image_id, s.status.as_str()), (None, "planned"));
 }

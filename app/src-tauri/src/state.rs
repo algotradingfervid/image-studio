@@ -185,8 +185,10 @@ impl CoreConfig {
         }
     }
 
-    /// Deletes a general record's row, then its files.
+    /// Deletes a general record's row, then its files. A story that approved
+    /// it as a take, or assembled it, forgets it.
     pub fn delete_record(&self, db: &Db, rec: &ImageRecord) -> Result<(), String> {
+        crate::stories::store::clear_image_refs(db, &rec.id)?;
         db.delete_image(&rec.id)?;
         self.remove_record_files(rec);
         Ok(())

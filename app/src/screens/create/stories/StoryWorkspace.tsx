@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type JSX } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type JSX, type MutableRefObject } from "react";
 import * as api from "../../../api";
-import type { ImageRecord, Job, Shot, Story, StoryView, Voice } from "../../../api";
+import type { ImageRecord, Job, Shot, Story, StoryPatch, StoryView, Voice } from "../../../api";
 import { Dialog } from "../../../components/Dialog";
 import { Icon } from "../../../components/Icon";
 import { useGpu } from "../../../state/gpu";
@@ -51,12 +51,31 @@ const toWire = (shots: Shot[]): Shot[] =>
     continuity: i === 0 ? "cut" : s.continuity,
   }));
 
-export function StoryWorkspace(props: {
+/** What the screen can ask of the open workspace (the left panel's Plan story uses it). */
+export interface WorkspaceHandle {
+  storyId: string;
+  /** Send every pending edit (shots, voices, title) now and wait until all have landed. */
+  flush: () => Promise<void>;
+  /** A plan replaced the story: drop pending edits; nothing is sent when the workspace goes. */
+  discard: () => void;
+}
+
+interface WorkspaceProps {
   storyId: string | null;
   jobs: JobView[];
   onOpenImage: (im: ImageRecord) => void;
   onChanged?: () => void;
-}): JSX.Element {
+  /** The story is being planned from the left panel: everything is read-only. */
+  planning?: boolean;
+  /** Set to the open workspace's handle (null while none is open). */
+  handle?: MutableRefObject<WorkspaceHandle | null>;
+  /** Whether any of the story's shots is rendering (the panel blocks Delete / Plan again meanwhile). */
+  onRenderingChange?: (rendering: boolean) => void;
+  /** Changes when the story was saved elsewhere (the panel): reload it. */
+  refreshKey?: number;
+}
+
+export function StoryWorkspace(props: WorkspaceProps): JSX.Element {
   if (!props.storyId) {
     return (
       <div className="empty story-ws__empty">
@@ -76,12 +95,11 @@ function Workspace({
   jobs,
   onOpenImage,
   onChanged,
-}: {
-  storyId: string;
-  jobs: JobView[];
-  onOpenImage: (im: ImageRecord) => void;
-  onChanged?: () => void;
-}) {
+  planning = false,
+  handle,
+  onRenderingChange,
+  refreshKey,
+}: WorkspaceProps & { storyId: string }) {
   const toast = useToast();
   const gpu = useGpu();
   const [view, setView] = useState<StoryView | null>(null);
@@ -90,7 +108,6 @@ function Workspace({
   const [saveState, setSaveState] = useState<"idle" | "pending" | "saving" | "error">("idle");
   const [rendering, setRenderingState] = useState<Record<string, string>>(() => renderingStore.get(storyId) ?? {});
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const [busy, setBusy] = useState<null | "plan" | "render" | "assemble" | "approve">(null);
   const [confirm, setConfirm] = useState<null | { kind: "replan" } | { kind: "delete"; index: number; key: string }>(null);
   const [titleDraft, setTitleDraft] = useState<string | null>(null);
   /** Unsaved voice phrases (character id → phrase); null = show the saved ones. */
@@ -125,6 +142,13 @@ function Workspace({
   const onChangedRef = useRef(onChanged);
   onChangedRef.current = onChanged;
   const alive = useRef(true);
+  /** Set by `discard()`: a plan replaced the story, so pending edits are never sent. */
+  const discarded = useRef(false);
+  const [busy, setBusy] = useState<null | "plan" | "render" | "assemble" | "approve">(null);
+  /** While a plan runs (from here or the panel) nothing can be edited. */
+  const readOnly = planning || busy === "plan";
+  const readOnlyRef = useRef(readOnly);
+  readOnlyRef.current = readOnly;
   useEffect(() => {
     // Set on (re)mount too: StrictMode's simulated unmount would otherwise leave it false.
     alive.current = true;
@@ -182,6 +206,14 @@ function Workspace({
     void refetch();
   }, [refetch]);
 
+  // The panel saved the story (brief, length, aspect, style, cast): show its cast, target and issues.
+  const firstRefresh = useRef(refreshKey);
+  useEffect(() => {
+    if (firstRefresh.current === refreshKey) return;
+    firstRefresh.current = refreshKey;
+    void refetch();
+  }, [refreshKey, refetch]);
+
   // ---- saving shot edits (debounced) ----
   const save = useCallback(async () => {
     timer.current = null;
@@ -224,16 +256,19 @@ function Workspace({
   }, [save]);
 
   // ---- story updates: voices (debounced like shot edits) and title, one at a time ----
-  /** Queue a story update; `make` builds the payload from the latest story when its turn comes. */
+  /**
+   * Queue a story update; `make` builds the patch (only the fields this workspace edits) from the
+   * latest story when its turn comes.
+   */
   const runStoryOp = useCallback(
-    (make: (base: Story) => Story | null, onDone?: (res: StoryView) => void, onError?: (e: unknown) => void) => {
+    (make: (base: Story) => StoryPatch | null, onDone?: (res: StoryView) => void, onError?: (e: unknown) => void) => {
       const op = async () => {
         const base = storyRef.current;
-        const payload = base ? make(base) : null;
-        if (!payload) return;
+        const patch = base ? make(base) : null;
+        if (!patch) return;
         const n = nextSeq();
         try {
-          const res = await api.updateStory(payload);
+          const res = await api.updateStory(storyId, patch);
           if (!alive.current) return;
           if (isFresh(n)) {
             storyRef.current = res.story;
@@ -251,7 +286,7 @@ function Workspace({
       storyOps.current = mine;
       return mine;
     },
-    [nextSeq, isFresh],
+    [storyId, nextSeq, isFresh],
   );
 
   const runVoiceSave = useCallback(() => {
@@ -260,7 +295,7 @@ function Workspace({
     return runStoryOp(
       (base) => {
         const draft = voiceDraftRef.current;
-        return draft ? { ...base, voices: voicesFrom(draft, base) } : null;
+        return draft ? { voices: voicesFrom(draft, base) } : null;
       },
       () => {
         setVoiceError(false);
@@ -300,6 +335,7 @@ function Workspace({
 
   const edit = useCallback(
     (list: Shot[]) => {
+      if (readOnlyRef.current) return;
       const next = list[0]?.continuity === "continues" ? [{ ...list[0], continuity: "cut" as const }, ...list.slice(1)] : list;
       version.current += 1;
       setShots(next);
@@ -311,11 +347,11 @@ function Workspace({
     [runSave],
   );
 
-  // Leaving the story: send what's pending.
+  // Leaving the story: send what's pending (unless a plan replaced it).
   useEffect(
     () => () => {
       let p: Promise<unknown> | null = inflight.current;
-      if (timer.current !== null) {
+      if (timer.current !== null && !discarded.current) {
         window.clearTimeout(timer.current);
         timer.current = null;
         const wire = toWire(shotsRef.current);
@@ -334,6 +370,27 @@ function Workspace({
     },
     [storyId],
   );
+
+  /** A plan replaced the story: pending edits are dropped and never sent (not even on unmount). */
+  const discard = useCallback(() => {
+    discarded.current = true;
+    if (timer.current !== null) window.clearTimeout(timer.current);
+    timer.current = null;
+    if (voiceTimer.current !== null) window.clearTimeout(voiceTimer.current);
+    voiceTimer.current = null;
+    version.current += 1;
+    voiceVersion.current += 1;
+    voiceDraftRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    if (!handle) return;
+    const mine: WorkspaceHandle = { storyId, flush, discard };
+    handle.current = mine;
+    return () => {
+      if (handle.current === mine) handle.current = null;
+    };
+  }, [handle, storyId, flush, discard]);
 
   // ---- job tracking ----
   useEffect(() => {
@@ -397,6 +454,12 @@ function Workspace({
   const blocked = issueCount > 0 ? "Fix the problems listed on the shots first" : null;
   const allApproved = shots.length > 0 && shots.every((s) => !!s.approvedTakeId);
   const anyRendering = Object.keys(rendering).length > 0;
+  const onRenderingChangeRef = useRef(onRenderingChange);
+  onRenderingChangeRef.current = onRenderingChange;
+  useEffect(() => {
+    onRenderingChangeRef.current?.(anyRendering);
+  }, [anyRendering]);
+  useEffect(() => () => onRenderingChangeRef.current?.(false), []);
 
   // ---- actions ----
   const renderOne = async (shot: Shot) => {
@@ -420,9 +483,13 @@ function Workspace({
     try {
       await flush();
       if (!(await gpu.confirmStart("render the story's shots", "video", { licence: H3_LICENCE }))) return;
-      const started = await api.renderStory(storyId);
-      if (!started.length) toast.info("Nothing to render", "Every shot that can render has a take. Use Reroll for a new take.");
-      track(started);
+      const { queued, error } = await api.renderStory(storyId);
+      // Every queued render is tracked, also when another shot couldn't start.
+      track(queued);
+      if (error) {
+        toast.error(queued.length ? "Some shots couldn't render" : "Couldn't render the story", error);
+        void refetch();
+      } else if (!queued.length) toast.info("Nothing to render", "Every shot that can render has a take. Use Reroll for a new take.");
     } catch (e) {
       toast.error("Couldn't render the story", e);
     } finally {
@@ -529,14 +596,14 @@ function Workspace({
     setTitleDraft(null);
     if (title === story.title) return;
     await runStoryOp(
-      (base) => ({ ...base, title }),
+      () => ({ title }),
       () => onChangedRef.current?.(),
       (e) => toast.error("Couldn't rename the story", e),
     );
   };
 
   const editVoice = (characterId: string, voice: string) => {
-    if (!story) return;
+    if (!story || readOnlyRef.current) return;
     const current = voiceDraft ?? Object.fromEntries(story.voices.map((x) => [x.characterId, x.voice]));
     const next = { ...current, [characterId]: voice };
     voiceVersion.current += 1;
@@ -546,21 +613,21 @@ function Workspace({
     voiceTimer.current = window.setTimeout(() => void runVoiceSave(), SAVE_DEBOUNCE_MS);
   };
 
-  // Leaving the story: send pending voice edits.
+  // Leaving the story: send pending voice edits (unless a plan replaced them).
   useEffect(
     () => () => {
-      if (voiceTimer.current === null) return;
+      if (voiceTimer.current === null || discarded.current) return;
       window.clearTimeout(voiceTimer.current);
       voiceTimer.current = null;
       const base = storyRef.current;
       const draft = voiceDraftRef.current;
       if (!base || !draft) return;
       const t = toastRef.current;
-      // After any story update still running, built from the latest story.
+      // After any story update still running; only the voices are sent.
       const p = (storyOps.current ?? Promise.resolve())
         .then(() => {
           const latest = storyRef.current ?? base;
-          return api.updateStory({ ...latest, voices: voicesFrom(draft, latest) });
+          return api.updateStory(storyId, { voices: voicesFrom(draft, latest) });
         })
         .catch((e) => t.error("Couldn't save the voices", e));
       const prev = pendingSaves.get(storyId);
@@ -623,6 +690,13 @@ function Workspace({
 
   return (
     <div className="story-ws">
+      {/* Read-only while a plan runs: a disabled fieldset disables every control inside it. */}
+      <fieldset className="story-ws__lock" disabled={readOnly} aria-busy={readOnly}>
+      {planning && (
+        <p className="notice notice--inline" role="status">
+          <Icon name="refresh" className="spin" /> Planning the story… editing is paused until the new shot list arrives.
+        </p>
+      )}
       <header className="story-ws__head">
         <div className="story-ws__titles">
           {titleDraft === null ? (
@@ -763,6 +837,8 @@ function Workspace({
           </li>
         </ol>
       )}
+
+      </fieldset>
 
       <Dialog
         open={confirm?.kind === "replan"}

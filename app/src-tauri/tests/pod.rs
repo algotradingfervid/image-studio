@@ -645,6 +645,7 @@ async fn auto_stops_after_idle_minutes() {
         images: vec![],
         error: None,
         gpu_release: None,
+        label: None,
     };
     h.core
         .jobs
@@ -1494,6 +1495,7 @@ async fn a_generation_queued_during_the_download_keeps_the_pod() {
         images: vec![],
         error: None,
         gpu_release: None,
+        label: None,
     };
     h.core.jobs.lock().unwrap().insert("j".into(), JobEntry { job, cancel: false });
     gate.store(true, Ordering::SeqCst);

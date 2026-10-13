@@ -49,6 +49,10 @@ export function StoriesPanel({
   onSelectStory,
   onPlanned,
   refreshKey,
+  beforePlan,
+  onPlanningChange,
+  onSaved,
+  rendering = false,
 }: {
   hidden: boolean;
   active: boolean;
@@ -58,6 +62,14 @@ export function StoriesPanel({
   onPlanned?: () => void;
   /** Changes when the story was edited elsewhere (the workspace): reload the list. */
   refreshKey?: number;
+  /** Runs before a saved story is planned: the workspace sends its pending edits. */
+  beforePlan?: (storyId: string) => Promise<void>;
+  /** Planning started / ended (the workspace is read-only meanwhile). */
+  onPlanningChange?: (planning: boolean) => void;
+  /** The panel saved the story's fields (the workspace reloads it). */
+  onSaved?: () => void;
+  /** A shot of the selected story is rendering: Delete story and Plan again wait. */
+  rendering?: boolean;
 }) {
   const id = useId();
   const toast = useToast();
@@ -111,6 +123,8 @@ export function StoriesPanel({
   fieldsRef.current = fields;
   const storyRef = useRef(story);
   storyRef.current = story;
+  const onSavedRef = useRef(onSaved);
+  onSavedRef.current = onSaved;
   /** The user changed a saved story's fields since the last save. */
   const dirty = useRef(false);
   const timer = useRef<number | undefined>(undefined);
@@ -136,10 +150,18 @@ export function StoriesPanel({
     if (!dirty.current || !s) return;
     dirty.current = false;
     try {
-      const v = await api.updateStory({ ...s, ...fieldsRef.current });
+      // Only the fields this panel edits: the workspace's voices and title are never sent from here.
+      const { brief, targetS, aspect, style, cast } = fieldsRef.current;
+      const v = await api.updateStory(s.id, { brief, targetS, aspect, style, cast });
       upsert(v.story);
+      onSavedRef.current?.();
     } catch (e) {
       toast.error("Couldn't save the story", e);
+      // A story with takes keeps its aspect: show the saved one again and save the other fields.
+      if (/aspect/i.test(api.errorMessage(e)) && fieldsRef.current.aspect !== s.aspect) {
+        dirty.current = true;
+        setFields((f) => ({ ...f, aspect: s.aspect }));
+      }
     }
   }, [toast]);
 
@@ -269,6 +291,8 @@ export function StoriesPanel({
   const runPlan = async () => {
     setConfirmReplan(false);
     setPlanning(true);
+    // The workspace goes read-only first, so no edit starts after its flush below.
+    onPlanningChange?.(true);
     try {
       let sid = storyRef.current?.id;
       if (!sid) {
@@ -280,6 +304,8 @@ export function StoriesPanel({
         onSelectStory(sid);
       } else {
         await saveNow();
+        // The workspace's pending shot / voice edits land before the plan replaces them.
+        await beforePlan?.(sid);
       }
       const planned = await api.planStory(sid);
       upsert(planned.story);
@@ -296,11 +322,15 @@ export function StoriesPanel({
       void checkLlm();
     } finally {
       setPlanning(false);
+      onPlanningChange?.(false);
     }
   };
 
+  /** A plan replaces every shot: not while one renders (the core refuses it too). */
+  const replanWaits = !!story && rendering;
+
   const plan = () => {
-    if (planning || blocked) return;
+    if (planning || blocked || replanWaits) return;
     // A planned story's shot list is replaced by a new plan: confirm first.
     if (story && story.status !== "draft") return setConfirmReplan(true);
     void runPlan();
@@ -352,7 +382,13 @@ export function StoriesPanel({
                 Story
               </label>
               {story && (
-                <button type="button" className="link-btn link-btn--danger story-delete" onClick={() => setConfirmDelete(true)}>
+                <button
+                  type="button"
+                  className="link-btn link-btn--danger story-delete"
+                  disabled={rendering || planning}
+                  title={rendering ? "Wait for the shots to finish rendering" : undefined}
+                  onClick={() => setConfirmDelete(true)}
+                >
                   Delete story
                 </button>
               )}
@@ -563,7 +599,7 @@ export function StoriesPanel({
         </div>
 
         <div className="panel__foot">
-          <button type="submit" className="btn btn--generate" disabled={blocked || planning} aria-describedby={`${id}-plan-hint`}>
+          <button type="submit" className="btn btn--generate" disabled={blocked || planning || replanWaits} aria-describedby={`${id}-plan-hint`}>
             <Icon name={planning ? "refresh" : "story"} size={18} className={planning ? "spin" : undefined} />
             <span>{planning ? "Planning… (local LLM)" : story && story.status !== "draft" ? "Plan again" : "Plan story"}</span>
             <span className="kbd-group" aria-hidden>
@@ -574,6 +610,7 @@ export function StoriesPanel({
           <p id={`${id}-plan-hint`} className={`hint panel__hint ${blocked || plannerDown ? "panel__hint--block" : ""}`} aria-live="polite">
             {blocked ? `${blockers.join(" · ")}.` : null}
             {blocked ? " " : null}
+            {!blocked && replanWaits ? "Wait for the shots to finish rendering. " : null}
             <span className="story-llm">{llmLine}</span>
           </p>
         </div>

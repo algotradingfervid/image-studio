@@ -482,6 +482,8 @@ export interface Job {
   destination?: Destination;
   /** Set on a cancelled job when the app stopped the GPU that was starting only for it. */
   gpuRelease?: GpuRelease;
+  /** Stories: what the card shows instead of the model and prompt ("Story: Rooftop · shot 2"). */
+  label?: string;
 }
 
 export type TaskStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
@@ -617,9 +619,18 @@ export interface StoryView {
   issues: StoryIssue[];
 }
 
+/** `update_story`: only the fields that are set are written. */
+export type StoryPatch = Partial<Pick<Story, "title" | "brief" | "targetS" | "aspect" | "style" | "cast" | "voices">>;
+
 export interface RenderedShot {
   shotId: string;
   jobId: string;
+}
+
+/** `render_story`: the shots queued, and why the others couldn't start (null when all did). */
+export interface RenderAllResult {
+  queued: RenderedShot[];
+  error: string | null;
 }
 
 export interface ApproveResult {

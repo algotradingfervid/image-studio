@@ -3,7 +3,7 @@
 use super::{
     compile::compile_shot, ffmpeg, planner, resolution_for, resolve_llm_model, store,
     validate::{preflight, validate},
-    Character, Issue, Shot, Story, StoryView,
+    Character, Issue, Shot, Story, StoryPatch, StoryView,
 };
 use crate::db::{ImageRecord, KIND_VIDEO};
 use crate::jobs::{self, Destination, VideoRequest};
@@ -74,6 +74,43 @@ pub fn is_rendering(core: &Core, shot_id: &str) -> bool {
     rendering(core, &mut core.story_renders.lock().unwrap(), shot_id)
 }
 
+/// Refuses while any of `shots` is rendering (its take would land on a shot
+/// or story that is gone). Called with the `story_renders` lock held so no
+/// render starts between this check and the change.
+fn refuse_rendering(core: &Core, renders: &mut HashMap<String, String>, shots: &[Shot]) -> Result<(), String> {
+    match shots.iter().find(|s| rendering(core, renders, &s.id)) {
+        Some(s) => Err(format!("Wait for shot {} to finish rendering", s.position)),
+        None => Ok(()),
+    }
+}
+
+/// An issue as an error message ("Shot N: …" unless it already names its shot).
+fn issue_text(i: &Issue) -> String {
+    match i.shot {
+        Some(n) if !i.message.starts_with(&format!("Shot {n} ")) => format!("Shot {n}: {}", i.message),
+        _ => i.message.clone(),
+    }
+}
+
+/// The job card label of a shot render: "Story: {title or brief start} · shot N".
+fn job_label(story: &Story, position: u32) -> String {
+    const MAX: usize = 40;
+    let title = story.title.trim();
+    let name = if !title.is_empty() {
+        title.to_string()
+    } else {
+        let brief = story.brief.trim();
+        if brief.chars().count() > MAX {
+            let cut: String = brief.chars().take(MAX).collect();
+            let cut = cut.rsplit_once(' ').map(|(a, _)| a).filter(|a| !a.is_empty()).unwrap_or(&cut);
+            format!("{}…", cut.trim_end_matches([' ', ',', ';', ':', '.']))
+        } else {
+            brief.to_string()
+        }
+    };
+    format!("Story: {name} · shot {position}")
+}
+
 /// Queues one H3 Character job for the shot; returns the job id. Refused
 /// while an earlier render of the shot is still running.
 pub fn render_shot(core: &Arc<Core>, shot_id: &str) -> Result<String, String> {
@@ -86,11 +123,9 @@ pub fn render_shot(core: &Arc<Core>, shot_id: &str) -> Result<String, String> {
         return Err(busy());
     }
     let view = story_view(core, &shot.story_id)?;
-    if let Some(i) = view.issues.first() {
-        return Err(match i.shot {
-            Some(n) => format!("Shot {n}: {}", i.message),
-            None => i.message.clone(),
-        });
+    // Story-wide issues and this shot's own block it; another shot's don't.
+    if let Some(i) = view.issues.iter().find(|i| i.shot.is_none() || i.shot == Some(shot.position)) {
+        return Err(issue_text(i));
     }
     if compile_shot(&view.story, &shot, &view.cast, false)?.ref_ids.is_empty() {
         return Err(format!("Shot {} has no character with reference images", shot.position));
@@ -131,6 +166,7 @@ pub fn render_shot(core: &Arc<Core>, shot_id: &str) -> Result<String, String> {
         audio: true,
         destination: Destination::General,
         story_take: Some((shot.story_id.clone(), shot.id.clone())),
+        label: Some(job_label(&view.story, shot.position)),
         ..Default::default()
     };
     // Checked again under the lock: another call may have queued it meanwhile.
@@ -145,10 +181,11 @@ pub fn render_shot(core: &Arc<Core>, shot_id: &str) -> Result<String, String> {
 
 /// Renders every shot that has no takes yet, isn't rendering and can start
 /// now: `cut` shots, and `continues` shots whose previous shot is approved.
-/// Returns (shot_id, job_id).
-pub fn render_story(core: &Arc<Core>, story_id: &str) -> Result<Vec<(String, String)>, String> {
+/// A shot that can't render doesn't stop the others; its reason is in `error`.
+pub fn render_story(core: &Arc<Core>, story_id: &str) -> Result<RenderAll, String> {
     let view = story_view(core, story_id)?;
     let mut out = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
     for s in &view.shots {
         let has_takes = view.takes.iter().any(|t| t.shot_id.as_deref() == Some(s.id.as_str()))
             || is_rendering(core, &s.id);
@@ -160,12 +197,25 @@ pub fn render_story(core: &Arc<Core>, story_id: &str) -> Result<Vec<(String, Str
         if !has_takes && prev_ok {
             match render_shot(core, &s.id) {
                 Ok(job) => out.push((s.id.clone(), job)),
-                Err(e) if out.is_empty() => return Err(e),
-                Err(e) => return Err(format!("Queued {} shot(s); shot {}: {e}", out.len(), s.position)),
+                Err(e) if e.starts_with("Shot ") => errors.push(e),
+                Err(e) => errors.push(format!("Shot {}: {e}", s.position)),
             }
         }
     }
-    Ok(out)
+    let error = match (errors.is_empty(), out.len()) {
+        (true, _) => None,
+        (false, 0) => Some(errors.join("; ")),
+        (false, n) => Some(format!("Queued {n} shot(s); {}", errors.join("; "))),
+    };
+    Ok(RenderAll { queued: out, error })
+}
+
+/// What "Render all" queued, and why the shots it couldn't render didn't start.
+#[derive(Debug, Default)]
+pub struct RenderAll {
+    /// (shot_id, job_id)
+    pub queued: Vec<(String, String)>,
+    pub error: Option<String>,
 }
 
 /// Approves `take_id` for the shot. When the next shot continues this one and
@@ -291,8 +341,15 @@ pub fn delete_records(core: &Core, recs: &[crate::db::ImageRecord]) -> Result<()
 }
 
 /// Replaces a story's shots and deletes the takes of shots that are gone.
+/// Refused while a shot that would go is rendering.
 pub fn store_shots(core: &Core, story_id: &str, shots: &[Shot]) -> Result<(), String> {
     let orphans: Vec<ImageRecord> = {
+        let mut renders = core.story_renders.lock().unwrap();
+        let gone: Vec<Shot> = store::list_shots(&core.db.lock().unwrap(), story_id)?
+            .into_iter()
+            .filter(|old| !shots.iter().any(|s| s.id == old.id))
+            .collect();
+        refuse_rendering(core, &mut renders, &gone)?;
         let db = core.db.lock().unwrap();
         store::replace_shots(&db, story_id, shots)?;
         db.list_takes(story_id)?
@@ -301,6 +358,89 @@ pub fn store_shots(core: &Core, story_id: &str, shots: &[Shot]) -> Result<(), St
             .collect()
     };
     delete_records(core, &orphans)
+}
+
+/// Saves the edited shot list in the given order (see `store::merge_shots`).
+pub fn save_shots(core: &Core, story_id: &str, shots: Vec<Shot>) -> Result<StoryView, String> {
+    let existing = {
+        let db = core.db.lock().unwrap();
+        store::get_story(&db, story_id)?.ok_or("That story no longer exists")?;
+        store::list_shots(&db, story_id)?
+    };
+    let merged = store::merge_shots(story_id, &existing, shots);
+    store_shots(core, story_id, &merged)?;
+    story_view(core, story_id)
+}
+
+/// Every cast id must be a saved character.
+pub fn check_cast_exists(core: &Core, cast: &[String]) -> Result<(), String> {
+    let db = core.db.lock().unwrap();
+    for id in cast {
+        if store::get_character(&db, id)?.is_none() {
+            return Err("A cast character no longer exists".into());
+        }
+    }
+    Ok(())
+}
+
+/// Writes only the fields `patch` sets (title, brief, target, aspect, style,
+/// cast, voices), validated like a new story. The aspect can't change once
+/// the story has takes (they would no longer assemble).
+pub fn update_story(core: &Core, id: &str, patch: StoryPatch) -> Result<StoryView, String> {
+    let (mut s, has_takes) = {
+        let db = core.db.lock().unwrap();
+        let s = store::get_story(&db, id)?.ok_or("That story no longer exists")?;
+        let has_takes = !db.list_takes(id)?.is_empty();
+        (s, has_takes)
+    };
+    if let Some(aspect) = patch.aspect {
+        if aspect != s.aspect && has_takes {
+            return Err("Change the aspect before rendering; this story already has takes".into());
+        }
+        s.aspect = aspect;
+    }
+    if let Some(t) = patch.title {
+        s.title = t.trim().to_string();
+    }
+    if let Some(b) = patch.brief {
+        s.brief = b.trim().to_string();
+    }
+    if let Some(t) = patch.target_s {
+        s.target_s = t;
+    }
+    if let Some(st) = patch.style {
+        s.style = st.trim().to_string();
+    }
+    if let Some(c) = patch.cast {
+        s.cast = c;
+    }
+    // Also drops the voices of characters who left the cast.
+    let voices = patch.voices.unwrap_or_else(|| std::mem::take(&mut s.voices));
+    s.voices = super::cast_voices(&s.cast, voices);
+    s.updated_at = crate::state::now_rfc3339();
+    check_story(&s)?;
+    check_cast_exists(core, &s.cast)?;
+    store::save_story(&core.db.lock().unwrap(), &s)?;
+    story_view(core, id)
+}
+
+/// Deletes the story, its shots, its takes and its assembled video. Refused
+/// while one of its shots is rendering.
+pub fn delete_story(core: &Core, id: &str) -> Result<(), String> {
+    let mut renders = core.story_renders.lock().unwrap();
+    let shots = store::list_shots(&core.db.lock().unwrap(), id)?;
+    refuse_rendering(core, &mut renders, &shots)?;
+    let recs: Vec<ImageRecord> = {
+        let db = core.db.lock().unwrap();
+        let story = store::get_story(&db, id)?;
+        let mut recs = db.list_takes(id)?;
+        if let Some(r) = story.and_then(|s| s.result_image_id) {
+            recs.extend(db.get_image(&r)?);
+        }
+        recs
+    };
+    delete_records(core, &recs)?;
+    store::delete_story(&core.db.lock().unwrap(), id)
 }
 
 /// Brief, cast, target and aspect checks for saving a story.
@@ -326,10 +466,18 @@ pub async fn plan_story(core: &Arc<Core>, story_id: &str) -> Result<StoryView, S
         return Err(i.message.clone());
     }
     check_story(&view.story)?;
+    // A plan replaces every shot: not while one renders (checked again when storing).
+    {
+        let mut renders = core.story_renders.lock().unwrap();
+        refuse_rendering(core, &mut renders, &view.shots)?;
+    }
     let base = core.settings.llm_base_url();
     let model = resolve_llm_model(&base, &core.settings.llm_model()).await?;
     let out = planner::plan(&base, &model, &view.story, &view.cast).await?;
-    let mut story = view.story;
+    // The shots first: refused, with nothing changed, if a render started meanwhile.
+    store_shots(core, story_id, &out.shots)?;
+    // Built on the story as stored now, not as it was when planning began.
+    let mut story = store::get_story(&core.db.lock().unwrap(), story_id)?.ok_or("That story no longer exists")?;
     if !out.title.trim().is_empty() {
         story.title = out.title.trim().to_string();
     }
@@ -338,6 +486,5 @@ pub async fn plan_story(core: &Arc<Core>, story_id: &str) -> Result<StoryView, S
     story.status = "planned".into();
     story.updated_at = crate::state::now_rfc3339();
     store::save_story(&core.db.lock().unwrap(), &story)?;
-    store_shots(core, story_id, &out.shots)?;
     story_view(core, story_id)
 }
