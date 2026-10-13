@@ -8,6 +8,7 @@ serverless, so the app only swaps its base URL and token:
   POST /cancel/{id}      -> {id, status}
   GET  /health           -> {jobs, workers, ready, gpu, comfyui, watchdog, code?}
   GET  /ping             -> {status: "ok"}  (no auth; liveness)
+  GET|POST /v1/{tail}    -> proxied to the planner LLM (vLLM, 127.0.0.1:8001)
 
 Every route is also served under /v2/{anything}/..., the serverless URL shape.
 All routes except /ping need `Authorization: Bearer $API_TOKEN`.
@@ -25,8 +26,12 @@ runs while no real generate job has been submitted, never counts as activity
 for the idle watchdog, and a real job waits at most for the warm-up already
 running. GET /health adds `localModels` and `warmup`.
 
+Planner LLM (llm.py, only when LLM_MODEL is set): downloaded and started with
+vLLM at boot; GET /health adds `llm`, and /v1/... is streamed through to it
+(503 until it is ready). The warm-up waits while vLLM downloads or starts.
+
 Idle watchdog: when no authenticated request has arrived for IDLE_MINUTES
-(and no job is active or recently finished), the pod terminates itself through
+(and no job or /v1 request is active or recently finished), the pod terminates itself through
 the RunPod API (see Terminator). It never exits the process; a failed
 terminate is retried every RETRY_S while the pod stays idle.
 """
@@ -52,11 +57,13 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
+import aiohttp
 import requests
 from aiohttp import web
 
 import cuda_info
 import handler as worker
+import llm as llm_mod
 import local_models
 from registry import load_registry
 
@@ -435,6 +442,7 @@ class IdleWatchdog:
         self.armed_key: str | None = None      # env var name, never the value
         self.armed_error: str | None = None
         self.armed_check = "pending"           # pending | read | failed | disabled
+        self.in_flight = 0                     # /v1 proxy requests being streamed
 
     # ---- arm check -------------------------------------------------------
     def verify(self) -> None:
@@ -479,6 +487,19 @@ class IdleWatchdog:
                 log.info("idle shutdown: request received; pod in use again, retry state reset")
             self._reset()
 
+    def begin(self) -> None:
+        """A long request (a /v1 stream) started: busy until end()."""
+        with self.lock:
+            self.in_flight += 1
+            self.last_request = self.clock()
+            self._reset()
+
+    def end(self) -> None:
+        """Idle time counts from the end of the request, like a finished job."""
+        with self.lock:
+            self.in_flight = max(0, self.in_flight - 1)
+            self.last_request = self.clock()
+
     def idle_for(self) -> float:
         last = self.last_request
         if self.manager.last_finished is not None:
@@ -490,7 +511,7 @@ class IdleWatchdog:
         if self.idle_s <= 0:
             return False
         with self.lock:
-            if self.manager.active() or self.idle_for() < self.idle_s:
+            if self.manager.active() or self.in_flight or self.idle_for() < self.idle_s:
                 if self.attempts or self.fired:
                     self._reset()  # a job started: the pod is in use again
                 return False
@@ -571,10 +592,12 @@ class Health:
                  comfy_version: Callable[[], str | None] = worker.comfyui_version,
                  code: Callable[[], dict | None] = code_info,
                  local_models: Callable[[], dict] | None = None,
-                 warmup: Callable[[], dict] | None = None):
+                 warmup: Callable[[], dict] | None = None,
+                 llm: Callable[[], dict] | None = None):
         self.manager = manager
         self._local_models = local_models
         self._warmup = warmup
+        self._llm = llm
         self.comfy_up = comfy_up or (lambda: worker.make_client().is_up())
         self._gpu_fn = gpu
         self._gpu: str | None = None
@@ -600,6 +623,8 @@ class Health:
             out["localModels"] = self._local_models()
         if self._warmup is not None:
             out["warmup"] = self._warmup()
+        if self._llm is not None:
+            out["llm"] = self._llm()
         if (cuda := cuda_info.status()) is not None: out["cudaKernels"] = cuda  # noqa: E701
         if (last := worker.last_timings()) is not None: out["lastJob"] = last  # noqa: E701
         return out
@@ -660,12 +685,17 @@ class WarmUp:
     Yields to real jobs: skipped if any generate job was submitted since boot
     (queued, running or done; a done job already loaded what the user wants),
     and a job submitted during the warm-up only waits for it to finish
-    (JobManager.run_idle). Not user activity: it never touches the watchdog."""
+    (JobManager.run_idle). Not user activity: it never touches the watchdog.
+
+    With the planner LLM on, it also waits while vLLM downloads or starts
+    (`llm_busy`): vLLM refuses to start unless the free GPU memory covers its
+    share, so ComfyUI must not load weights first."""
 
     def __init__(self, manager: JobManager, model_id: str, inp: dict,
                  local: local_models.LocalModels | None = None,
                  comfy_up: Callable[[], bool] | None = None,
                  run_job: Callable[[dict], Any] | None = None,
+                 llm_busy: Callable[[], bool] | None = None,
                  ready_timeout_s: float = 1800.0, poll_s: float = 5.0,
                  sleep: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.monotonic):
@@ -675,6 +705,7 @@ class WarmUp:
         self.local = local
         self.comfy_up = comfy_up or (lambda: worker.make_client().is_up())
         self.run_job = run_job or manager.run_job
+        self.llm_busy = llm_busy
         self.ready_timeout_s = ready_timeout_s
         self.poll_s = poll_s
         self.sleep = sleep
@@ -716,6 +747,15 @@ class WarmUp:
             if self.clock() >= deadline:
                 return self._skip("ComfyUI did not come up")
             self.sleep(self.poll_s)
+        if self.llm_busy is not None and self.llm_busy():
+            self.state = "waiting_llm"
+            log.info("warm-up of %s waits for the planner LLM: vLLM checks free GPU memory "
+                     "when it starts, so ComfyUI loads no weights until vLLM is up (or failed)",
+                     self.model_id)
+            while self.llm_busy():
+                if self.manager.generate_submitted:
+                    return self._skip("a real job arrived first")
+                self.sleep(self.poll_s)
         t0 = self.clock()
         result: dict = {}
 
@@ -747,8 +787,13 @@ def _json(data: Any, status: int = 200) -> web.Response:
     return web.json_response(data, status=status)
 
 
+LLM_HOP_HEADERS = ("Content-Type", "Accept")  # request headers passed to vLLM
+
+
 def build_app(token: str, manager: JobManager, health: Health,
-              watchdog: IdleWatchdog | None = None) -> web.Application:
+              watchdog: IdleWatchdog | None = None,
+              llm: Any = None) -> web.Application:
+    """`llm`: an llm.LLMSupervisor (status(), ready(), base_url) or None (off)."""
     if not token:
         raise ValueError("API_TOKEN is required")
     expected = f"Bearer {token}".encode()
@@ -794,12 +839,62 @@ def build_app(token: str, manager: JobManager, health: Health,
     async def ping(request: web.Request):
         return _json({"status": "ok"})
 
+    async def llm_proxy(request: web.Request):
+        """Streams /v1/{tail} to vLLM and its answer back chunk by chunk (SSE
+        for stream:true). No total timeout: a plan can stream for minutes."""
+        state = llm.status()["state"] if llm is not None else llm_mod.OFF
+        if state != llm_mod.READY:
+            return _json({"error": f"The planner model is {state}"}, 503)
+        url = f"{llm.base_url}/v1/{request.match_info['tail']}"
+        if request.query_string:
+            url += "?" + request.query_string
+        headers = {h: request.headers[h] for h in LLM_HOP_HEADERS if h in request.headers}
+        headers["Accept-Encoding"] = "identity"  # pass bytes through untouched
+        body = await request.read()
+        if watchdog is not None:
+            watchdog.begin()
+        resp: web.StreamResponse | None = None
+        try:
+            async with session["llm"].request(
+                    request.method, url, data=body or None, headers=headers) as up:
+                resp = web.StreamResponse(status=up.status)
+                if "Content-Type" in up.headers:
+                    resp.headers["Content-Type"] = up.headers["Content-Type"]
+                await resp.prepare(request)
+                async for chunk in up.content.iter_any():
+                    await resp.write(chunk)
+                await resp.write_eof()
+                return resp
+        except (ConnectionResetError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            # Before the answer started: vLLM is unreachable. After: the client
+            # or vLLM dropped the stream (leaving the `async with` closes the
+            # upstream request, which makes vLLM abort the generation).
+            if resp is None:
+                return _json({"error": f"The planner model is unreachable: "
+                                       f"{type(exc).__name__}"}, 502)
+            log.warning("planner LLM stream ended early: %s", type(exc).__name__)
+            return resp
+        finally:
+            if watchdog is not None:
+                watchdog.end()
+
+    session: dict[str, aiohttp.ClientSession] = {}  # one pooled client for the proxy
+
+    async def open_session(app: web.Application):
+        session["llm"] = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=None, sock_connect=10), auto_decompress=False)
+        yield
+        await session.pop("llm").close()
+
     app = web.Application(middlewares=[auth], client_max_size=MAX_BODY_BYTES)
+    app.cleanup_ctx.append(open_session)
     for prefix in ("", "/v2/{endpoint}"):
         app.router.add_post(prefix + "/run", run)
         app.router.add_get(prefix + "/status/{id}", status)
         app.router.add_post(prefix + "/cancel/{id}", cancel)
         app.router.add_get(prefix + "/health", health_route)
+        app.router.add_get(prefix + "/v1/{tail:.*}", llm_proxy)
+        app.router.add_post(prefix + "/v1/{tail:.*}", llm_proxy)
     app.router.add_get("/ping", ping)
     return app
 
@@ -814,7 +909,8 @@ def _background(manager: JobManager, watchdog: IdleWatchdog, interval_s: float =
             log.exception("background check failed")
 
 
-def start_prefetch(manager: JobManager, env: Mapping[str, str]
+def start_prefetch(manager: JobManager, env: Mapping[str, str],
+                   llm_busy: Callable[[], bool] | None = None
                    ) -> tuple[local_models.LocalModels | None, WarmUp | None]:
     """Creates the local-copy manager, queues PREFETCH_MODELS and starts the
     warm-up of the first one (WARMUP=0 turns the warm-up off). Never raises."""
@@ -831,11 +927,28 @@ def start_prefetch(manager: JobManager, env: Mapping[str, str]
         if ids and (env.get("WARMUP") or "1").strip() != "0":
             inp = warmup_input(registry, ids[0])
             if inp is not None:
-                warm = WarmUp(manager, ids[0], inp, local=local)
+                warm = WarmUp(manager, ids[0], inp, local=local, llm_busy=llm_busy)
                 threading.Thread(target=warm.run, name="warmup", daemon=True).start()
     except Exception:
         log.exception("prefetch / warm-up setup failed; continuing without it")
     return local, warm
+
+
+def start_llm(env: Mapping[str, str]) -> llm_mod.LLMSupervisor | None:
+    """Starts the planner LLM supervisor when LLM_MODEL is set. Never raises."""
+    try:
+        sup = llm_mod.LLMSupervisor.from_env(
+            env, gate=lambda: (cuda_info.status() or {}).get("reason") != "probing")
+    except Exception:
+        log.exception("planner LLM setup failed; continuing without it")
+        return None
+    if sup is None:
+        return None
+    log.info("planner LLM: %s as %r; the warm-up waits until vLLM is up (vLLM needs its "
+             "GPU share free when it starts), then ComfyUI may load weights", sup.repo,
+             sup.served_name)
+    sup.start()
+    return sup
 
 
 def main() -> None:
@@ -853,11 +966,16 @@ def main() -> None:
     terminator = Terminator()
     watchdog = IdleWatchdog(manager, idle_minutes * 60, terminator.terminate,
                             verify=terminator.verify)
-    local, warm = start_prefetch(manager, os.environ)
+    # cuda_info first: the LLM supervisor waits for its short-lived CUDA probe
+    # to finish before launching vLLM.
     cuda_info.start()  # boot log + /health cudaKernels (comfy-kitchen CUDA backend on/off)
+    llm = start_llm(os.environ)
+    local, warm = start_prefetch(manager, os.environ,
+                                 llm_busy=llm.busy if llm is not None else None)
     health = Health(manager, local_models=local.health if local is not None else None,
-                    warmup=warm.status if warm is not None else None)
-    app = build_app(token, manager, health, watchdog)
+                    warmup=warm.status if warm is not None else None,
+                    llm=llm.status if llm is not None else llm_mod.off_status)
+    app = build_app(token, manager, health, watchdog, llm)
     threading.Thread(target=watchdog.verify, name="watchdog-verify", daemon=True).start()
     threading.Thread(target=_background, args=(manager, watchdog), name="watchdog",
                      daemon=True).start()

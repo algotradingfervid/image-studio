@@ -45,6 +45,7 @@ Pinned versions:
 | torch / torchvision / torchaudio | 2.11.0 / 0.26.0 / 2.11.0 `+cu130` | `download.pytorch.org/whl/cu130` |
 | ComfyUI | v0.39.0, commit `b0b743566f65…` (checked at build) | codeload tag tarball |
 | Worker deps (`requirements-runtime.txt`) | runpod 1.12.0, requests 2.34.2, websocket-client 1.9.2, transformers <5, huggingface-hub <1.0 | PyPI |
+| vLLM (planner LLM, venv `/opt/vllm`) | 0.24.0, with transformers 5.x in the venv only; torch shared with the system | PyPI, installed with pip |
 | uv (build only, bind-mounted, not in the image) | 0.11.7 | `ghcr.io/astral-sh/uv` |
 | apt | `libtcmalloc-minimal4` only | Debian bookworm |
 
@@ -71,6 +72,7 @@ They need host driver ≥ 580 (CUDA 13.0).
 3. Installs torch in its own layer from the cu130 index. It asserts the version, that `torch.version.cuda` is 13.x and that sm_120 kernels are present.
 4. Installs ComfyUI's requirements and `requirements-runtime.txt`, with torch frozen by a constraints file. It then removes the six `comfyui-workflow-templates-media-*` packages, about 0.5 GB of example media for the web UI, which this worker never serves.
    Step 4b then checks, without a GPU, that comfy-kitchen's CUDA extension loads and finds `libcublasLt.so.13`.
+   Step 4c creates `/opt/vllm` (`python -m venv --system-site-packages`) and installs `vllm==0.24.0` into it with **pip**, constrained by the torch constraints file. pip counts the system `torch 2.11.0+cu130` as satisfying vLLM's `torch==2.11.0`, so torch is not installed a second time. transformers 5.x (and anything else vLLM needs newer) lands in the venv only. A no-GPU check then asserts vLLM 0.24.0, transformers 5.x and the system's exact torch file inside the venv, and that the system python still has transformers < 5.
 5. Runs the CPU smoke tests:
    - checks the ComfyUI version
    - runs `main.py --quick-test-for-ci --cpu`
@@ -182,6 +184,7 @@ The entrypoint (`boot.py`, or `/start.sh` on the legacy image) starts ComfyUI
 | `LOCAL_MODELS` | `0` turns the local copies off. |
 | `LOCAL_MODELS_ROOT`, `LOCAL_COPY_THREADS`, `LOCAL_COPY_CHUNK_MB`, `LOCAL_COPY_RESERVE_GB`, `LOCAL_COPY_WAIT_S` | Copier tuning: default `/models-local`, 16 threads, 64 MB ranges, 4 GB kept free, a job waits at most 1800 s for its copies. |
 | `WARMUP` | `0` turns the boot warm-up off. |
+| `LLM_MODEL`, `LLM_SERVED_NAME`, `LLM_GPU_GB`, `LLM_MAX_LEN` | Planner LLM, video pod only; unset means off (see [Planner LLM](#planner-llm-video-pod)). |
 
 Secrets are never logged. The startup line names only the key variables that are set.
 
@@ -194,8 +197,9 @@ Every route also answers under `/v2/<anything>/…`, so the serverless URL shape
 | `POST /run {input, policy?}` | `{id, status: "IN_QUEUE"}`. Ids look like `pod-<uuid>`. The body can be up to 32 MB. |
 | `GET /status/{id}` | `{id, status, delayTime, executionTime, output?, error?}` |
 | `POST /cancel/{id}` | `{id, status}` |
-| `GET /health` | `{jobs: {inQueue, inProgress, completed, failed}, workers: {idle, running}, ready, gpu, comfyui, watchdog: {armed, check, idleMinutes, idleForS, lastError}, code?: {source: "github"\|"baked", ref, commit, error?}}` (see [Idle watchdog](#idle-watchdog)). `code` is present only on the runtime image. |
+| `GET /health` | `{jobs: {inQueue, inProgress, completed, failed}, workers: {idle, running}, ready, gpu, comfyui, watchdog: {armed, check, idleMinutes, idleForS, lastError}, code?: {source: "github"\|"baked", ref, commit, error?}}` (see [Idle watchdog](#idle-watchdog)). `code` is present only on the runtime image. `llm` reports the [planner LLM](#planner-llm-video-pod). |
 | `GET /ping` | `{status: "ok"}`. No auth. |
+| `GET\|POST /v1/…` | Proxied to the planner LLM (vLLM's OpenAI API), streamed through. 503 `{"error": "The planner model is <state>"}` until it is ready. See [Planner LLM](#planner-llm-video-pod). |
 
 **Auth:** `Authorization: Bearer $API_TOKEN`, compared in constant time. A missing or wrong header gets 401 `{"error": "unauthorized"}`. An unknown or expired job id gets 404.
 
@@ -302,6 +306,68 @@ disk-backed path for files that fall back to the volume.
   The model state is one of `queued`, `copying`, `done`, `failed`, `skipped`,
   `missing` or `idle`.
 - `warmup: {model, state, detail?, elapsedMs?}`.
+
+### Planner LLM (video pod)
+
+The app's Stories planner can run on the video pod instead of a hosted API. The app
+sets these only on the video pod; when `LLM_MODEL` is unset or empty nothing below
+happens and `/health` reports `llm.state: "off"`.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LLM_MODEL` | (off) | HF repo id, e.g. `orcarouter/Qwen3.8-27B-Uncensored-FP8` (gated; `HF_TOKEN` must have access). |
+| `LLM_SERVED_NAME` | `qwen3.8-27b-uncensored` | The `model` name clients send. |
+| `LLM_GPU_GB` | 44 | GPU memory for vLLM in GiB. `--gpu-memory-utilization` = this ÷ the GPU's total memory (nvidia-smi), rounded down to 3 decimals and clamped to 0.1–0.9. |
+| `LLM_MAX_LEN` | 32768 | `--max-model-len`. |
+
+`src/llm.py` (`LLMSupervisor`) starts from `server.main()` on a background thread:
+
+1. **downloading**: `huggingface_hub.snapshot_download` (the system python's hub, with
+   `HF_TOKEN`) into `/models-local/llm/<repo name>`. `totalBytes` is the sum of the
+   Hub's file sizes, `downloadedBytes` the size of that directory on disk (in-flight
+   files sit under its `.cache/huggingface/download/`). It first checks free disk space
+   (2 GiB kept spare). A finished download writes `.image-studio-complete`; a later
+   start of the same container skips the download.
+2. **starting**: waits (at most 5 min) for the boot CUDA probe (`cuda_info`) to end,
+   because vLLM's memory profiling asserts that no other process frees GPU memory
+   while it runs, then runs, with `PYTHONPATH` removed so the worker's modules can't
+   shadow vLLM's:
+
+   ```
+   /opt/vllm/bin/vllm serve /models-local/llm/<repo name> \
+     --served-model-name $LLM_SERVED_NAME --host 127.0.0.1 --port 8001 \
+     --language-model-only --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+     --kv-cache-dtype fp8 --gpu-memory-utilization <computed> --max-model-len $LLM_MAX_LEN \
+     --max-num-seqs 4 --trust-remote-code --reasoning-parser qwen3 --disable-uvicorn-access-log
+   ```
+
+   These are the model card's verified flags for vLLM 0.24.0, with our own memory share,
+   length and sequence count. `--quantization` is not passed: the FP8 scheme comes from
+   `config.json`. vLLM's output goes to the pod log prefixed `vllm | `.
+3. **ready** once `GET http://127.0.0.1:8001/health` answers 200.
+4. **failed** on a download error, no GPU memory reading, the process exiting (before or
+   after ready) or no health within 30 min (the process is then killed). `error` holds a
+   short reason, ending with vLLM's last log lines.
+
+**GPU order.** vLLM refuses to start unless the GPU's *free* memory covers its share. So
+the boot warm-up waits (`warmup.state: "waiting_llm"`) while the LLM is downloading or
+starting, and only then lets ComfyUI load weights. A real job submitted meanwhile still
+runs at once (the warm-up is then skipped), and its weights can take the memory vLLM
+was going to use.
+
+`GET /health` adds
+`llm: {state: "off"|"downloading"|"starting"|"ready"|"failed", model, downloadedBytes, totalBytes, error}`
+(`model` is the served name, `null` when off).
+
+**Proxy.** `GET` and `POST /v1/{path}` (and `/v2/<anything>/v1/{path}`) go to
+`http://127.0.0.1:8001/v1/{path}` with the query string and body. `Content-Type` and
+`Accept` are forwarded; the pod's Bearer token is not. The status and `Content-Type`
+come back unchanged and the body is written through chunk by chunk, so a
+`stream: true` answer reaches the client as server-sent events while vLLM produces
+them. There is no total timeout (10 s to connect). If vLLM can't be reached the answer
+is 502; if the client drops a stream the upstream request is closed too, which aborts
+the generation. While a `/v1` request is in flight the idle watchdog counts the pod as
+busy, and idle time counts from the end of the request.
 
 ## Volume layout
 
@@ -551,6 +617,14 @@ uv run pytest -q
   - cancelling queued jobs, running generate (interrupt), running downloads, and the real handler's cooperative download cancel
   - `executionTimeout`, the failure shape, and 30-minute expiry
   - the idle watchdog and the terminate call, with mocked HTTP and `runpodctl`: retrying every `RETRY_S` without ever exiting, reset on requests and jobs, the startup arm check and its `/health` report, and keys never reaching the logs
+- **Planner LLM** (`tests/test_llm.py`): the supervisor with a fake Popen, downloader,
+  clock and health probe (download → starting → ready, a skipped finished download,
+  progress from disk, download / metadata / disk-space failures, vLLM exiting while
+  starting and after ready, the start timeout, the CUDA-probe gate, the exact vLLM
+  command line), the GPU-utilization arithmetic, the warm-up waiting for vLLM, and the
+  `/v1` proxy against a fake vLLM on a real aiohttp server: `/health` `llm`, 503 while not
+  ready, auth, query and status pass-through, 502, SSE arriving chunk by chunk, and the
+  watchdog staying busy during a stream and after a client disconnect is released.
 - **Boot** (`tests/test_boot.py`), covering:
   - extraction of only `worker/src` and `models.json` from a fake GitHub-style tarball
   - rejection of path traversal, links, a second top-level dir, missing files, syntax errors, bad JSON and garbage

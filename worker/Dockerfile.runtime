@@ -27,6 +27,11 @@
 # RTX 5090) as well as Ada (sm_89) and Ampere (sm_80/86); they need host
 # driver >= 580 (the app filters pods by CUDA version).
 #
+# The Stories planner LLM (worker/src/llm.py, only when the app sets LLM_MODEL
+# on the video pod) runs on vLLM from its own venv, /opt/vllm (step 4c):
+# vLLM 0.24 needs transformers 5.x, ComfyUI needs <5. The venv sees the
+# system site-packages, so it reuses this torch instead of a second copy.
+#
 # The legacy all-in-one image (worker/Dockerfile, ~14.8 GB compressed) is kept
 # as a fallback; see worker/README.md.
 
@@ -38,6 +43,7 @@ ARG TORCH_VERSION=2.11.0
 ARG TORCHVISION_VERSION=0.26.0
 ARG TORCHAUDIO_VERSION=2.11.0
 ARG TORCH_CUDA=cu130
+ARG VLLM_VERSION=0.24.0
 
 # NVIDIA_*: nvidia/cuda base images set these; without NVIDIA_VISIBLE_DEVICES
 # the NVIDIA container runtime exposes no GPU to a non-CUDA image.
@@ -139,6 +145,38 @@ if not b._EXT_AVAILABLE:
         sys.exit(f"comfy-kitchen CUDA extension failed to load: {b._EXT_ERROR}")
 elif not b._CUBLASLT_AVAILABLE:
     sys.exit("comfy-kitchen CUDA extension built without cuBLASLt")
+EOF
+
+# 4c. vLLM for the planner LLM, in a venv over the system site-packages,
+#     installed with pip (not uv): pip counts the system torch 2.11.0+cu130 as
+#     satisfying vLLM's torch==2.11.0 and leaves it alone, and the constraints
+#     file pins torch/torchvision/torchaudio to the exact cu130 builds so the
+#     resolver can never replace them. Whatever vLLM needs newer (transformers
+#     5.x, huggingface-hub 1.x, ...) lands in /opt/vllm only and shadows the
+#     system copy inside the venv; the system python (ComfyUI, the worker)
+#     keeps transformers <5. Checked without a GPU: versions, torch shared with
+#     the system, and the system transformers still 4.x.
+RUN python -m venv --system-site-packages /opt/vllm \
+    && /opt/vllm/bin/pip install -c /etc/torch-constraints.txt "vllm==${VLLM_VERSION}" \
+    && /opt/vllm/bin/python - <<'EOF'
+import os, subprocess
+import torch, transformers, vllm
+from importlib import metadata
+want_torch = os.environ["TORCH_VERSION"] + "+" + os.environ["TORCH_CUDA"]
+print("venv: vllm", metadata.version("vllm"), "transformers", transformers.__version__,
+      "torch", torch.__version__, torch.__file__)
+assert metadata.version("vllm") == os.environ["VLLM_VERSION"], metadata.version("vllm")
+assert vllm.__version__ == os.environ["VLLM_VERSION"], vllm.__version__
+assert int(transformers.__version__.split(".")[0]) == 5, transformers.__version__
+assert torch.__version__ == want_torch, torch.__version__
+assert os.path.isfile("/opt/vllm/bin/vllm"), "no vllm console script"
+system = subprocess.run(
+    ["/usr/local/bin/python", "-c",
+     "import torch, transformers; print(torch.__file__); print(transformers.__version__)"],
+    capture_output=True, text=True, check=True).stdout.split()
+print("system: torch", system[0], "transformers", system[1])
+assert system[0] == torch.__file__, f"venv torch {torch.__file__} is not the system's {system[0]}"
+assert int(system[1].split(".")[0]) < 5, f"system transformers became {system[1]}"
 EOF
 
 # 5. Smoke tests on CPU (no GPU at build time): the version is right, ComfyUI
