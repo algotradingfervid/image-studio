@@ -397,14 +397,15 @@ export function ModelPicker({
 
 // ---------------- Image / Video switch ----------------
 
-export type CreateMode = "image" | "video";
+export type CreateMode = "image" | "video" | "stories";
 
-const MODES: { id: CreateMode; label: string; icon: "image" | "video" }[] = [
+const MODES: { id: CreateMode; label: string; icon: "image" | "video" | "story" }[] = [
   { id: "image", label: "Image", icon: "image" },
   { id: "video", label: "Video", icon: "video" },
+  { id: "stories", label: "Stories", icon: "story" },
 ];
 
-/** Segmented Image | Video switch with radio semantics (arrow keys move the selection). */
+/** Segmented Image | Video | Stories switch with radio semantics (arrow keys move the selection). */
 export function ModeSwitch({ value, onChange }: { value: CreateMode; onChange: (m: CreateMode) => void }) {
   return (
     <div

@@ -41,6 +41,8 @@ const paths: Record<string, string> = {
   /** Clearly open padlock (shackle lifted off the body). */
   lockOpen: "M5.5 9.5h9v7.5h-9zM7.5 9.5V5a2.5 2.5 0 0 1 5 0v1.2",
   undo: "M7 5.5 3.5 9 7 12.5M3.5 9h8a4.5 4.5 0 0 1 0 9H9",
+  /** Film strip (Stories): a frame with sprocket rows on both sides. */
+  story: "M3.5 3.5h13v13h-13zM6.5 3.5v13M13.5 3.5v13M3.5 7h3M3.5 10h3M3.5 13h3M13.5 7h3M13.5 10h3M13.5 13h3",
 };
 
 export type IconName = keyof typeof paths;
