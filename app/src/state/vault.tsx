@@ -16,6 +16,9 @@ const TOUCH_EVERY_MS = 30_000;
 /** Warn this long before an idle auto-lock (UX-039). */
 const WARN_BEFORE_MS = 30_000;
 
+/** Spec §8: a lock dropped unsaved edits of an open vault story (keyed: shown once per lock). */
+export const LOCK_DISCARD_TOAST = { kind: "info", key: "story-lock-discard", title: "Vault locked — unsaved edits to this story were discarded" } as const;
+
 /** Why the vault last locked: "idle" = the auto-lock timer ran out. */
 export type VaultLockReason = "idle" | "manual" | null;
 

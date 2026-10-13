@@ -5,10 +5,9 @@ import { Dialog } from "../../../components/Dialog";
 import { Icon } from "../../../components/Icon";
 import { useGpu } from "../../../state/gpu";
 import { useToast } from "../../../state/toast";
-import { useVault } from "../../../state/vault";
+import { LOCK_DISCARD_TOAST, useVault } from "../../../state/vault";
 import type { JobView } from "../JobCard";
 import { ShotCard } from "./ShotCard";
-import { LOCK_DISCARD_TOAST } from "./StoriesPanel";
 import "./workspace.css";
 
 /** Same restriction VideoPanel restates for every H3 model in the paid confirmation (UI-054). */
@@ -616,7 +615,9 @@ function Workspace({
       const dest = await api.pickSavePath(`${(story?.title || "story").replace(/[\\/:]/g, "-")}.mp4`);
       if (!dest) return;
       await api.exportImage({ id: film.id, destPath: dest });
-      toast.success(film.vault ? "Film exported — not encrypted" : "Film exported", dest);
+      // A vault film's path holds the story title: not shown, so nothing of it outlives a lock on screen.
+      if (film.vault) toast.success("Film exported — not encrypted");
+      else toast.success("Film exported", dest);
     } catch (e) {
       toast.error("Couldn't export the film", e);
     }

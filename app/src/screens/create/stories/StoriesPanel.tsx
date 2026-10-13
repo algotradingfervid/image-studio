@@ -5,7 +5,7 @@ import { Dialog } from "../../../components/Dialog";
 import { Icon } from "../../../components/Icon";
 import { radioKeys } from "../../../components/radio";
 import { useToast } from "../../../state/toast";
-import { useVault } from "../../../state/vault";
+import { LOCK_DISCARD_TOAST, useVault } from "../../../state/vault";
 import { useMoreBelow } from "../Controls";
 import { CharacterForm } from "./CharacterForm";
 import "./stories.css";
@@ -20,8 +20,8 @@ const DEFAULTS = { brief: "", targetS: 60, aspect: "16:9" as Story["aspect"], st
 /** Shown when the planner can't be reached (same words as the core's hint, spec §4). */
 const LM_HINT = "Start LM Studio's server (Developer → Start server, or `lms server start`) and load a model.";
 const SAVE_TO: Destination[] = ["general", "vault"];
-/** Spec §8: shown once per lock, by the panel or the workspace, whichever had the edits. */
-export const LOCK_DISCARD_TOAST = { kind: "info", key: "story-lock-discard", title: "Vault locked — unsaved edits to this story were discarded" } as const;
+/** Toast key of "{vault character} saved": dismissed when the vault locks. */
+const VAULT_NAME_TOAST = "story-vault-character-saved";
 
 type Fields = typeof DEFAULTS;
 
@@ -177,6 +177,8 @@ export function StoriesPanel({
       upsert(v.story);
       onSavedRef.current?.();
     } catch (e) {
+      // The vault locked while the save ran: the edit is lost, say so as the workspace does (spec §8).
+      if (api.errorCode(e) === "VAULT_LOCKED" && s.vault) return toast.notify(LOCK_DISCARD_TOAST);
       toast.error("Couldn't save the story", e);
       // A story with takes keeps its aspect: show the saved one again and save the other fields.
       if (/aspect/i.test(api.errorMessage(e)) && fieldsRef.current.aspect !== s.aspect) {
@@ -205,6 +207,16 @@ export function StoriesPanel({
   /** The store of the story being edited (a new one: the Save-to choice). */
   const inVault = story ? story.vault : vault.exists && saveTo === "vault";
 
+  /** Back to General: a General story can't use vault characters, so they leave the cast now (not at Plan). */
+  const chooseSaveTo = (d: Destination) => {
+    setSaveTo(d);
+    if (d !== "general") return;
+    const keep = fieldsRef.current.cast.filter((cid) => !characters.find((c) => c.id === cid)?.vault);
+    if (keep.length === fieldsRef.current.cast.length) return;
+    setFields((f) => ({ ...f, cast: keep }));
+    toast.info("Vault characters left the cast", "Only a vault story can use a vault character.");
+  };
+
   const seenUnlocked = useRef(vault.unlocked);
   useEffect(() => {
     if (seenUnlocked.current === vault.unlocked) return;
@@ -215,6 +227,7 @@ export function StoriesPanel({
       setStories((ss) => ss.filter((s) => !s.vault));
       setCharacters((cs) => cs.filter((c) => !c.vault));
       setListUnlocked(false);
+      toast.dismissKey(VAULT_NAME_TOAST);
       const s = storyRef.current;
       if (s?.vault || (!s && saveToRef.current === "vault")) {
         // The panel form resets; a saved vault story's pending edits are dropped (they can't be saved locked).
@@ -621,7 +634,7 @@ export function StoriesPanel({
                   role="radiogroup"
                   aria-labelledby={`${id}-save-to`}
                   aria-describedby={saveTo === "vault" ? `${id}-save-to-note` : undefined}
-                  onKeyDown={radioKeys(vault.unlocked ? SAVE_TO : ["general"], saveTo, setSaveTo)}
+                  onKeyDown={radioKeys(vault.unlocked ? SAVE_TO : ["general"], saveTo, chooseSaveTo)}
                 >
                   {SAVE_TO.map((d) => {
                     const on = d === saveTo;
@@ -636,7 +649,7 @@ export function StoriesPanel({
                         disabled={disabled}
                         title={disabled ? "Unlock the vault to create a vault story" : undefined}
                         className={on ? "is-selected" : ""}
-                        onClick={() => setSaveTo(d)}
+                        onClick={() => chooseSaveTo(d)}
                       >
                         {d === "vault" && <Icon name="lock" size={13} />}
                         {d === "general" ? "General" : "Vault"}
@@ -770,11 +783,13 @@ export function StoriesPanel({
           setFormOpen(false);
           // The workspace reloads the cast: the next render compiles with the new references.
           onSavedRef.current?.();
-          if (edited) toast.success(`${c.name} saved`);
+          // A vault character's name is keyed so a lock can take the toast down with it.
+          const say = (title: string, message?: string) => toast.notify({ kind: "success", title, message, key: c.vault ? VAULT_NAME_TOAST : undefined });
+          if (edited) say(`${c.name} saved`);
           else if (fieldsRef.current.cast.length < MAX_CAST) {
             addToCast(c.id);
-            toast.success(`${c.name} saved and added to the cast`);
-          } else toast.success(`${c.name} saved`, "The cast is full — remove someone to add them.");
+            say(`${c.name} saved and added to the cast`);
+          } else say(`${c.name} saved`, "The cast is full — remove someone to add them.");
         }}
       />
 

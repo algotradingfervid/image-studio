@@ -161,7 +161,8 @@
   gap: 8px;
 }
 
-/* The export confirm floats above the whole row (over the player), as in the Lightbox. */
+/* The export confirm floats above the whole row (over the player), as in the Lightbox; overrides
+   the shared `.confirm-slot { display: grid }` (styles/viewer.css). */
 .story-film__actions.confirm-slot {
   display: flex;
 }

@@ -62,9 +62,10 @@ export function CharacterForm({
   const nameRef = useRef<HTMLInputElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
 
-  // A fresh form each time it opens, seeded from the character being edited.
+  // A fresh form each time it opens, seeded from the character being edited. Closed, it keeps no
+  // store choice: a stale "Keep in vault" must not close the next opening while the vault is locked.
   useEffect(() => {
-    if (!open) return;
+    if (!open) return setInVault(false);
     setName(character?.name ?? "");
     setDescription(character?.description ?? "");
     setRefs(character ? character.refIds.map((refId, i) => ({ refId, thumbPath: character.refPaths[i] || refId })) : []);
@@ -75,6 +76,20 @@ export function CharacterForm({
     setError(null);
   }, [open, character, defaultVault, vault.isUnlocked]);
   const dest = inVault ? "vault" : "general";
+
+  // Nothing of a vault character stays on screen once the vault locks: the form closes and forgets
+  // its unsaved state (an edited vault character, or a new one with "Keep in vault" ticked).
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const sealed = open && (!!character?.vault || inVault);
+  useEffect(() => {
+    if (!sealed || vault.unlocked) return;
+    setPickerOpen(false);
+    setName("");
+    setDescription("");
+    setRefs([]);
+    onCloseRef.current();
+  }, [sealed, vault.unlocked]);
 
   const refsRef = useRef(refs);
   refsRef.current = refs;
