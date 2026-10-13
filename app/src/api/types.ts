@@ -616,6 +616,8 @@ export interface StoryView {
   cast: Character[];
   shots: Shot[];
   takes: ImageRecord[];
+  /** The assembled film (`story.resultImageId`), if any. */
+  result: ImageRecord | null;
   issues: StoryIssue[];
 }
 

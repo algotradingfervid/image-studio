@@ -414,7 +414,7 @@ export function StoriesPanel({
             </div>
             {story && story.status !== "draft" && (
               <p className="hint section__note">
-                {story.status === "assembled" ? "Assembled — the finished video is in the gallery." : "Planned — review the shots on the right."} Changes here save automatically.
+                {story.status === "assembled" ? "Assembled — the final film is on the right." : "Planned — review the shots on the right."} Changes here save automatically.
               </p>
             )}
           </section>

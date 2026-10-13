@@ -837,7 +837,7 @@ fn move_to_vault_refuses_story_media() {
     for id in ["take", "result"] {
         assert_eq!(
             vault_migrate::move_to_vault(&h.core, id).unwrap_err(),
-            "Story videos stay in the general gallery for now"
+            "Story videos are managed from the Stories tab"
         );
         assert!(h.core.db.lock().unwrap().get_image(id).unwrap().is_some());
     }

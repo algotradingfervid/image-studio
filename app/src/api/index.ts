@@ -249,6 +249,8 @@ export const renderStory = (storyId: string) => call<RenderAllResult>("render_st
 export const approveTake = (shotId: string, takeId: string) =>
   call<ApproveResult>("approve_take", { shotId, takeId });
 export const assembleStory = (storyId: string) => call<StoryView>("assemble_story", { storyId });
+/** Shows a General record's file in Finder (vault films are exported instead). */
+export const revealImage = (id: string) => call<void>("reveal_image", { id });
 export const llmStatus = () => call<LlmStatus>("llm_status");
 export const saveLlmSettings = (baseUrl: string | null, model: string | null) =>
   call<LlmStatus>("save_llm_settings", { baseUrl, model });

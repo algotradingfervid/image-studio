@@ -131,6 +131,36 @@
   gap: 12px;
 }
 
+/* ---------- final film ---------- */
+
+.story-film {
+  display: grid;
+  gap: 8px;
+}
+
+.story-film__title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 14px;
+}
+
+.story-film__player {
+  display: block;
+  width: 100%;
+  max-height: 360px;
+  background: #000;
+  border-radius: var(--r);
+}
+
+.story-film__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
 /* ---------- shot card ---------- */
 
 .shot-card {

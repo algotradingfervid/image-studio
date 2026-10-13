@@ -836,7 +836,7 @@ const vaultStatus = (): VaultStatus => ({
   exists: vault.exists,
   unlocked: vault.unlocked,
   autoLockMinutes: vault.autoLockMinutes,
-  itemCount: vault.unlocked ? vault.items.length : null,
+  itemCount: vault.unlocked ? vault.items.filter((x) => !x.storyId).length : null,
   migrationPending: vault.migrating && !vault.unlocked,
   autoLockMs: vault.autoLockMinutes * VAULT_MINUTE_MS,
 });
@@ -1377,6 +1377,8 @@ const stories = new Map<string, Story>();
 const shots = new Map<string, Shot>();
 /** Story takes: video records with storyId + shotId, never in `images` (the gallery). */
 const takes: ImageRecord[] = [];
+/** Assembled story films: storyId set, shotId null; also never in `images`. */
+const films: ImageRecord[] = [];
 const llm = { baseUrl: LLM_DEFAULT_URL, model: LLM_DEFAULT_MODEL };
 const llmDown = params.get("llm") === "down";
 
@@ -1491,7 +1493,8 @@ function storyView(storyId: string): StoryView {
       issues.push({ shot: s.position, message: e instanceof Error ? e.message : String(e) });
     }
   }
-  return { story, cast, shots: list, takes: takes.filter((t) => t.storyId === storyId), issues };
+  const result = films.find((f) => f.id === story.resultImageId) ?? null;
+  return { story, cast, shots: list, takes: takes.filter((t) => t.storyId === storyId), result, issues };
 }
 
 /** Plan / render refuse a cast that breaks the adult or consent rule (the Rust command checks the same). */
@@ -1759,7 +1762,7 @@ const storyCommands: Record<string, Handler> = {
     refuseRendering(storyShots(id));
     for (const s of storyShots(id)) shots.delete(s.id);
     for (const t of takes.filter((t) => t.storyId === id)) removeRecord(takes, t.id);
-    if (story.resultImageId) removeRecord(images, story.resultImageId);
+    if (story.resultImageId) removeRecord(films, story.resultImageId);
     stories.delete(id);
   },
   get_story: (a) => storyView(String(a.id)),
@@ -1879,8 +1882,8 @@ const storyCommands: Record<string, Handler> = {
     });
     rec.storyId = storyId;
     rec.posterPath = first.posterPath ?? rec.posterPath;
-    if (view.story.resultImageId) removeRecord(images, view.story.resultImageId);
-    images.unshift(rec);
+    if (view.story.resultImageId) removeRecord(films, view.story.resultImageId);
+    films.unshift(rec);
     stories.set(storyId, { ...view.story, status: "assembled", resultImageId: rec.id, updatedAt: nowIso() });
     return storyView(storyId);
   },
@@ -1924,6 +1927,10 @@ const commands: Record<string, Handler> = {
   },
   log_ui: (a) => {
     console.info(`[mock log] ${a?.level}: ${a?.message}`);
+  },
+  reveal_image: (a) => {
+    if (vault.items.some((x) => x.id === a.id)) throw new Error("Vault films are exported, not shown in Finder");
+    console.info(`[mock] Would show ${String(a.id)} in Finder.`);
   },
   reveal_settings_file: () => {
     const path = "~/Library/Application Support/com.naren.imagestudio/settings.json";
@@ -2247,8 +2254,9 @@ const commands: Record<string, Handler> = {
     const id = String(a.id);
     const idx = images.findIndex((im) => im.id === id);
     if (idx >= 0) images.splice(idx, 1);
-    // Story takes live outside `images`; a story forgets a take or result it pointed at (Rust: delete_record).
+    // Story takes and films live outside `images`; a story forgets a take or result it pointed at (Rust: delete_record).
     removeRecord(takes, id);
+    removeRecord(films, id);
     for (const s of shots.values()) if (s.approvedTakeId === id) shots.set(s.id, { ...s, approvedTakeId: null });
     for (const s of stories.values()) if (s.resultImageId === id) stories.set(s.id, { ...s, resultImageId: null, status: "planned" });
   },
@@ -2318,7 +2326,7 @@ const commands: Record<string, Handler> = {
   list_vault_items: async () => {
     requireUnlocked();
     await sleep(200);
-    return vault.items;
+    return vault.items.filter((x) => !x.storyId);
   },
   delete_vault_item: async (a) => {
     requireUnlocked();
@@ -2361,7 +2369,7 @@ const commands: Record<string, Handler> = {
 
   export_image: async (a) => {
     if (vault.items.some((x) => x.id === a.id)) return commands.export_vault_item({ id: a.id, dest: a.destPath });
-    const im = images.find((x) => x.id === a.id);
+    const im = images.find((x) => x.id === a.id) ?? films.find((x) => x.id === a.id);
     if (!im) throw new Error("Image not found");
     downloadRecord(im, String(a.destPath));
   },

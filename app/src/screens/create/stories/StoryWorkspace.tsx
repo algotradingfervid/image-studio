@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type JSX, type MutableRefObject } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type JSX, type MutableRefObject } from "react";
 import * as api from "../../../api";
 import type { ImageRecord, Job, Shot, Story, StoryPatch, StoryView, Voice } from "../../../api";
 import { Dialog } from "../../../components/Dialog";
@@ -63,7 +63,6 @@ export interface WorkspaceHandle {
 interface WorkspaceProps {
   storyId: string | null;
   jobs: JobView[];
-  onOpenImage: (im: ImageRecord) => void;
   onChanged?: () => void;
   /** The story is being planned from the left panel: everything is read-only. */
   planning?: boolean;
@@ -93,7 +92,6 @@ export function StoryWorkspace(props: WorkspaceProps): JSX.Element {
 function Workspace({
   storyId,
   jobs,
-  onOpenImage,
   onChanged,
   planning = false,
   handle,
@@ -102,6 +100,7 @@ function Workspace({
 }: WorkspaceProps & { storyId: string }) {
   const toast = useToast();
   const gpu = useGpu();
+  const id = useId();
   const [view, setView] = useState<StoryView | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [shots, setShots] = useState<Shot[]>([]);
@@ -557,15 +556,17 @@ function Workspace({
     }
   };
 
-  const openResult = async (id: string | null) => {
-    if (!id) return;
+  const exportFilm = async () => {
+    const film = view?.result;
+    if (!film) return;
+    if (film.vault && !window.confirm("The exported copy is not encrypted — anyone with access to where you save it can open it. Export?")) return;
     try {
-      const page = await api.listImages({ limit: 60 });
-      const rec = page.items.find((r) => r.id === id);
-      if (rec) onOpenImage(rec);
-      else toast.info("Open it from the gallery", "Switch to the Image tab to find the story video.");
+      const dest = await api.pickSavePath(`${(story?.title || "story").replace(/[\\/:]/g, "-")}.mp4`);
+      if (!dest) return;
+      await api.exportImage({ id: film.id, destPath: dest });
+      toast.success(film.vault ? "Film exported — not encrypted" : "Film exported", dest);
     } catch (e) {
-      toast.error("Couldn't open the story video", e);
+      toast.error("Couldn't export the film", e);
     }
   };
 
@@ -577,12 +578,7 @@ function Workspace({
       const v = await api.assembleStory(storyId);
       if (isFresh(n)) adopt(v, timer.current === null);
       onChangedRef.current?.();
-      const id = v.story.resultImageId;
-      toast.notify({
-        kind: "success",
-        title: "Story saved to the gallery",
-        actions: id ? [{ label: "Open", onClick: () => void openResult(id) }] : undefined,
-      });
+      toast.notify({ kind: "success", title: "Film assembled" });
     } catch (e) {
       toast.error("Couldn't assemble the story", e);
     } finally {
@@ -782,13 +778,40 @@ function Workspace({
         </div>
       )}
 
-      {story.status === "assembled" && story.resultImageId && (
-        <p className="notice notice--inline story-ws__done">
-          <Icon name="check" /> Assembled — the story video is in the gallery.
-          <button type="button" className="link-btn" onClick={() => void openResult(story.resultImageId)}>
-            Open
-          </button>
-        </p>
+      {view.result && (
+        <section className="story-film" aria-labelledby={`${id}-film`}>
+          <h3 id={`${id}-film`} className="story-film__title">
+            <Icon name="layers" size={14} /> Final film
+          </h3>
+          <video
+            className="story-film__player"
+            controls
+            playsInline
+            preload="metadata"
+            src={api.fileSrc(view.result.path)}
+            poster={view.result.posterPath ? api.fileSrc(view.result.posterPath) : undefined}
+          />
+          <div className="story-film__actions">
+            {!view.result.vault && (
+              <button
+                type="button"
+                className="btn btn--sm"
+                onClick={() => void api.revealImage(view.result!.id).catch((e) => toast.error("Couldn't show the film", e))}
+              >
+                Show in Finder
+              </button>
+            )}
+            <button
+              type="button"
+              className="btn btn--sm"
+              onClick={() => void exportFilm()}
+              title={view.result.vault ? "Vault films are exported as an unencrypted copy" : undefined}
+            >
+              <Icon name="download" size={14} /> Export…
+            </button>
+            {view.result.vault && <span className="hint">Encrypted in the vault.</span>}
+          </div>
+        </section>
       )}
 
       {shots.length === 0 ? (

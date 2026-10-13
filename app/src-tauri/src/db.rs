@@ -347,7 +347,7 @@ impl Db {
         let limit = limit.clamp(1, 500);
         let mut stmt = self
             .conn
-            .prepare("SELECT * FROM images WHERE seq < ?1 AND shot_id IS NULL ORDER BY seq DESC LIMIT ?2")
+            .prepare("SELECT * FROM images WHERE seq < ?1 AND story_id IS NULL ORDER BY seq DESC LIMIT ?2")
             .map_err(e)?;
         let rows: Vec<(i64, ImageRecord)> = stmt
             .query_map(
@@ -847,22 +847,20 @@ mod tests {
     }
 
     #[test]
-    fn list_images_hides_story_takes() {
+    fn list_images_hides_takes_and_films() {
         let db = Db::open_in_memory().unwrap();
         let mut take = img("take", 1);
         take.story_id = Some("s1".into());
         take.shot_id = Some("sh1".into());
-        let mut result = img("result", 2);
-        result.story_id = Some("s1".into());
+        let mut film = img("film", 2);
+        film.story_id = Some("s1".into());
         db.insert_image(&img("plain", 3)).unwrap();
         db.insert_image(&take).unwrap();
-        db.insert_image(&result).unwrap();
+        db.insert_image(&film).unwrap();
         let (list, _) = db.list_images(100, None).unwrap();
-        let ids: Vec<_> = list.iter().map(|r| r.id.as_str()).collect();
-        assert_eq!(ids, vec!["result", "plain"]);
-        let takes = db.list_takes("s1").unwrap();
-        assert_eq!(takes.len(), 1);
-        assert_eq!(takes[0].shot_id.as_deref(), Some("sh1"));
+        assert_eq!(list.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["plain"]);
+        assert_eq!(db.list_takes("s1").unwrap().len(), 1, "takes still reachable");
+        assert_eq!(db.get_image("film").unwrap().unwrap().story_id.as_deref(), Some("s1"));
     }
 
     #[test]
