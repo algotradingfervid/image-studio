@@ -866,13 +866,27 @@ async fn video_job_r2v_sends_references_and_records_them() {
     let err = |r: VideoRequest| jobs::generate_video(&h.core, r).unwrap_err();
     assert!(err(r2v(vec![])).contains("Add at least one character reference"));
     assert!(err(r2v(vec![r1.ref_id.clone(), r2.ref_id.clone(), r1.ref_id.clone()])).contains("at most 2"));
-    assert!(err(VideoRequest { init_image_id: Some(r1.ref_id.clone()), ..r2v(vec![r1.ref_id.clone()]) })
-        .contains("does not take a start image"));
     assert!(err(r2v(vec!["missing".into()])).contains("reference image is missing"));
     assert!(err(r2v(vec!["vault://localhost/0b6f1c3e-2c55-4a8e-9d1e-6e2f4b9c1a00.png".into()])).contains("vault"));
     // Non-r2v models refuse references.
     assert!(err(VideoRequest { reference_ids: vec![r1.ref_id.clone()], ..video_req() })
         .contains("does not take character reference"));
+
+    // r2v with an optional start image (a story shot continuing the previous one):
+    // the start image is sent as `initImage` next to the references.
+    let start = app_lib::references::import_bytes(&dir, &png_bytes()).unwrap();
+    let job_id = jobs::generate_video(
+        &h.core,
+        VideoRequest { init_image_id: Some(start.ref_id.clone()), ..r2v(vec![r1.ref_id.clone()]) },
+    )
+    .unwrap();
+    let job = wait_job(&h).await;
+    assert_eq!((job.job_id.as_str(), job.status), (job_id.as_str(), JobState::Completed), "{:?}", job.error);
+    assert!(job.images[0].init_image.is_some());
+    let reqs = server.received_requests().await.unwrap();
+    let run: Value = reqs.iter().rev().find(|r| r.url.path() == "/proxy/vid1/run").unwrap().body_json().unwrap();
+    assert!(run["input"]["initImage"]["base64"].as_str().unwrap().len() > 10);
+    assert_eq!(run["input"]["references"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]

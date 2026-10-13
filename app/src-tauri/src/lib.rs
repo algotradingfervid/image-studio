@@ -332,6 +332,22 @@ pub fn run() {
             commands::export_vault_item,
             commands::delete_vault_item,
             commands::vault_touch,
+            commands::list_characters,
+            commands::save_character,
+            commands::delete_character,
+            commands::list_stories,
+            commands::create_story,
+            commands::update_story,
+            commands::delete_story,
+            commands::get_story,
+            commands::plan_story,
+            commands::save_shots,
+            commands::render_shot,
+            commands::render_story,
+            commands::approve_take,
+            commands::assemble_story,
+            commands::llm_status,
+            commands::save_llm_settings,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
