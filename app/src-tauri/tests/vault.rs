@@ -130,6 +130,8 @@ fn record(id: &str, kind: &str, path: &Path, created: &str) -> ImageRecord {
         poster_path: None,
         vault: false,
         thumb_path: None,
+        story_id: None,
+        shot_id: None,
     }
 }
 

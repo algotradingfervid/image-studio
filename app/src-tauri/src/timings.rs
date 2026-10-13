@@ -88,6 +88,8 @@ mod tests {
             poster_path: None,
             vault: true,
             thumb_path: None,
+            story_id: None,
+            shot_id: None,
         }
     }
 

@@ -64,6 +64,12 @@ pub struct ImageRecord {
     /// Small preview to show in grids (vault items only; `vault:` path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumb_path: Option<String>,
+    /// Stories: the story this video belongs to (takes and the assembled result).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub story_id: Option<String>,
+    /// Stories: set on shot takes only; such rows are hidden from the gallery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shot_id: Option<String>,
 }
 
 pub const KIND_IMAGE: &str = "image";
@@ -182,6 +188,29 @@ CREATE TABLE volume_status (
   checked_at TEXT NOT NULL
 );
 "#,
+    // 4: stories (characters, stories, shots); story/shot ids on images.
+    r#"
+ALTER TABLE images ADD COLUMN story_id TEXT;
+ALTER TABLE images ADD COLUMN shot_id TEXT;
+CREATE INDEX images_shot ON images(shot_id);
+CREATE TABLE characters (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE, description TEXT NOT NULL,
+  source TEXT NOT NULL, consent INTEGER NOT NULL, adult INTEGER NOT NULL, refs_json TEXT NOT NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE stories (
+  id TEXT PRIMARY KEY, title TEXT NOT NULL, logline TEXT NOT NULL, brief TEXT NOT NULL,
+  target_s INTEGER NOT NULL, aspect TEXT NOT NULL, style TEXT NOT NULL, cast_json TEXT NOT NULL,
+  status TEXT NOT NULL, result_image_id TEXT, sidecar_json TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE shots (
+  id TEXT PRIMARY KEY, story_id TEXT NOT NULL, position INTEGER NOT NULL, duration_s INTEGER NOT NULL,
+  characters_json TEXT NOT NULL, setting TEXT NOT NULL, camera TEXT NOT NULL, action TEXT NOT NULL,
+  dialogue_json TEXT NOT NULL, continuity TEXT NOT NULL, approved_take_id TEXT
+);
+CREATE INDEX shots_story ON shots(story_id, position);
+"#,
 ];
 
 /// `profile` key whose status lives in the original `model_status` table.
@@ -232,8 +261,8 @@ impl Db {
     pub fn insert_image(&self, r: &ImageRecord) -> Result<(), String> {
         self.conn
             .execute(
-                "INSERT INTO images (id, path, model, prompt, negative_prompt, aspect_ratio, width, height, seed, steps, cfg, references_json, loras_json, created_at, duration_ms, delay_ms, execution_ms, init_image, denoise, kind, duration_s, fps, has_audio, poster_path)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                "INSERT INTO images (id, path, model, prompt, negative_prompt, aspect_ratio, width, height, seed, steps, cfg, references_json, loras_json, created_at, duration_ms, delay_ms, execution_ms, init_image, denoise, kind, duration_s, fps, has_audio, poster_path, story_id, shot_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
                 params![
                     r.id,
                     r.path,
@@ -259,6 +288,8 @@ impl Db {
                     r.fps,
                     r.has_audio,
                     r.poster_path,
+                    r.story_id,
+                    r.shot_id,
                 ],
             )
             .map_err(e)?;
@@ -300,6 +331,8 @@ impl Db {
                 poster_path: row.get("poster_path")?,
                 vault: false,
                 thumb_path: None,
+                story_id: row.get("story_id")?,
+                shot_id: row.get("shot_id")?,
             },
         ))
     }
@@ -313,7 +346,7 @@ impl Db {
         let limit = limit.clamp(1, 500);
         let mut stmt = self
             .conn
-            .prepare("SELECT * FROM images WHERE seq < ?1 ORDER BY seq DESC LIMIT ?2")
+            .prepare("SELECT * FROM images WHERE seq < ?1 AND shot_id IS NULL ORDER BY seq DESC LIMIT ?2")
             .map_err(e)?;
         let rows: Vec<(i64, ImageRecord)> = stmt
             .query_map(
@@ -331,6 +364,20 @@ impl Db {
             None
         };
         Ok((rows.into_iter().map(|(_, r)| r).collect(), next))
+    }
+
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Story takes (rows with `shot_id`), newest first.
+    pub fn list_takes(&self, story_id: &str) -> Result<Vec<ImageRecord>, String> {
+        let mut st = self
+            .conn
+            .prepare("SELECT * FROM images WHERE story_id = ?1 AND shot_id IS NOT NULL ORDER BY seq DESC")
+            .map_err(e)?;
+        let rows = st.query_map([story_id], Self::row_to_image).map_err(e)?;
+        rows.map(|r| r.map(|(_, rec)| rec).map_err(e)).collect()
     }
 
     pub fn get_image(&self, id: &str) -> Result<Option<ImageRecord>, String> {
@@ -583,6 +630,8 @@ mod tests {
             poster_path: None,
             vault: false,
             thumb_path: None,
+            story_id: None,
+            shot_id: None,
         }
     }
 
@@ -739,7 +788,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, MIGRATIONS.len() as i64);
+        assert_eq!(version, 4);
         let old = db.get_image("old").unwrap().unwrap();
         assert_eq!(old.kind, "image");
         assert_eq!((old.duration_s, old.fps, old.has_audio, old.poster_path), (None, None, None, None));
@@ -793,5 +842,42 @@ mod tests {
         assert_eq!(db.load_status().unwrap(), Some((s, "t2".into())));
         db.set_setting("k", "v").unwrap();
         assert_eq!(db.get_setting("k").unwrap().as_deref(), Some("v"));
+    }
+
+    #[test]
+    fn list_images_hides_story_takes() {
+        let db = Db::open_in_memory().unwrap();
+        let mut take = img("take", 1);
+        take.story_id = Some("s1".into());
+        take.shot_id = Some("sh1".into());
+        let mut result = img("result", 2);
+        result.story_id = Some("s1".into());
+        db.insert_image(&img("plain", 3)).unwrap();
+        db.insert_image(&take).unwrap();
+        db.insert_image(&result).unwrap();
+        let (list, _) = db.list_images(100, None).unwrap();
+        let ids: Vec<_> = list.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["result", "plain"]);
+        let takes = db.list_takes("s1").unwrap();
+        assert_eq!(takes.len(), 1);
+        assert_eq!(takes[0].shot_id.as_deref(), Some("sh1"));
+    }
+
+    #[test]
+    fn migration_4_creates_story_tables() {
+        let db = Db::open_in_memory().unwrap();
+        let v: i64 = db.conn().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 4);
+        for t in ["characters", "stories", "shots"] {
+            let n: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [t],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{t}");
+        }
     }
 }

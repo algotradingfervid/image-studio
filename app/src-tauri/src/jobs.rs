@@ -613,6 +613,8 @@ fn build_video_plan(core: &Core, req: &VideoRequest) -> Result<Plan, String> {
         poster_path: None,
         vault: false,
         thumb_path: None,
+        story_id: None,
+        shot_id: None,
     };
     Ok(Plan {
         kind: JobKind::Video,
@@ -776,6 +778,8 @@ fn build_plan(core: &Core, req: &GenerateRequest) -> Result<Plan, String> {
         poster_path: None,
         vault: false,
         thumb_path: None,
+        story_id: None,
+        shot_id: None,
     };
     Ok(Plan {
         kind: JobKind::Image,

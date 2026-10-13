@@ -314,6 +314,8 @@ impl VaultItem {
                 .as_ref()
                 .or(self.poster.as_ref())
                 .map(BlobRef::path),
+            story_id: None,
+            shot_id: None,
         }
     }
 }
