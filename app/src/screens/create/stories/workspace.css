@@ -161,6 +161,11 @@
   gap: 8px;
 }
 
+/* The export confirm floats above the whole row (over the player), as in the Lightbox. */
+.story-film__actions.confirm-slot {
+  display: flex;
+}
+
 /* ---------- shot card ---------- */
 
 .shot-card {

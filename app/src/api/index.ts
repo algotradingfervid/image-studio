@@ -237,7 +237,7 @@ export const listCharacters = () => call<Character[]>("list_characters");
 export const saveCharacter = (character: Character) => call<Character>("save_character", { character });
 export const deleteCharacter = (id: string) => call<void>("delete_character", { id });
 export const listStories = () => call<Story[]>("list_stories");
-export const createStory = (input: { brief: string; targetS: number; aspect: string; style: string; cast: string[] }) =>
+export const createStory = (input: { brief: string; targetS: number; aspect: string; style: string; cast: string[]; destination?: Destination }) =>
   callObj<StoryView>("create_story", input);
 export const updateStory = (id: string, patch: StoryPatch) => call<StoryView>("update_story", { id, patch });
 export const deleteStory = (id: string) => call<void>("delete_story", { id });

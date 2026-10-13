@@ -77,6 +77,8 @@ interface Vault {
   lockReason: VaultLockReason;
   /** Ask for the password (Vault tab when it's on screen, else a small dialog). */
   requestUnlock(): void;
+  /** The live state, for code that runs after a lock already unmounted it (a cleanup). */
+  isUnlocked(): boolean;
   /** The General gallery changed because of vault work (an Undo moved an item back): reload it. */
   bumpGeneral(): void;
 }
@@ -177,12 +179,15 @@ export function VaultProvider({ children }: { children: ReactNode }) {
 
   // A vault job that finishes while the vault is locked leaves a lasting, non-revealing notice
   // with an Unlock action (UX-007): no prompt, thumbnail or vault count, only how many arrived.
+  // Story takes (jobs with a `label`, outputs with `storyId`) belong to their story, not the
+  // vault gallery: they are neither counted nor announced here.
   const sealedCount = useRef({ image: 0, video: 0 });
   const sealedSeen = useRef(new Set<string>());
   const requestUnlockRef = useRef<() => void>(() => {});
   useEffect(() => {
     const un = api.onEvent("job-update", (job: Job) => {
       if (job.destination !== "vault" || unlockedRef.current) return;
+      if (job.label || job.images.some((r) => r.storyId)) return;
       if (job.status !== "completed" && job.status !== "cancelled" && job.status !== "failed") return;
       if (sealedSeen.current.has(job.jobId) || job.completed <= 0) return;
       sealedSeen.current.add(job.jobId);
@@ -357,6 +362,7 @@ export function VaultProvider({ children }: { children: ReactNode }) {
     if (!showVaultTab()) setUnlockAsk(true);
   }, []);
   requestUnlockRef.current = requestUnlock;
+  const isUnlocked = useCallback(() => unlockedRef.current, []);
   // Opens on top of the unlock dialog when asked from there, so Cancel goes back to it.
   const requestErase = useCallback(() => setEraseAsk(true), []);
   const bumpGeneral = useCallback(() => setGeneralEpoch((n) => n + 1), []);
@@ -387,9 +393,10 @@ export function VaultProvider({ children }: { children: ReactNode }) {
       addLocal,
       lockReason,
       requestUnlock,
+      isUnlocked,
       bumpGeneral,
     }),
-    [status, unlocked, items, loading, migration, dismissMigration, lockEpoch, generalEpoch, create, unlock, lock, changePassword, setAutoLock, erase, requestErase, eraseEpoch, setupCount, registerSetup, reloadItems, removeLocal, addLocal, lockReason, requestUnlock, bumpGeneral],
+    [status, unlocked, items, loading, migration, dismissMigration, lockEpoch, generalEpoch, create, unlock, lock, changePassword, setAutoLock, erase, requestErase, eraseEpoch, setupCount, registerSetup, reloadItems, removeLocal, addLocal, lockReason, requestUnlock, isUnlocked, bumpGeneral],
   );
   return (
     <Ctx.Provider value={value}>

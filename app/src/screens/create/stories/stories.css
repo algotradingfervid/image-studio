@@ -102,6 +102,18 @@
   accent-color: var(--accent);
 }
 
+/* The lock mark of a vault story (next to "Story") and of a vault character (in the cast menu). */
+.story-vault-tag {
+  gap: 3px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+/* New-story Save to: General | Vault. */
+.story-save-to {
+  margin: 0 0 16px;
+}
+
 /* ---------- New character dialog ---------- */
 
 .character-dialog {
@@ -123,6 +135,10 @@
 
 .character-form__source > button {
   flex: 1;
+}
+
+.character-form__vault .hint {
+  margin: 4px 0 0 23px;
 }
 
 .character-form__ticks {

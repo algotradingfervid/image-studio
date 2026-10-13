@@ -559,6 +559,8 @@ export interface Character {
   refIds: string[];
   /** Display path next to each `refIds` entry ("" when the file is gone); filled when read, ignored when saved. */
   refPaths: string[];
+  /** Kept in the vault (sealed); set once when created — the store never changes. */
+  vault: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -604,6 +606,8 @@ export interface Story {
   voices: Voice[];
   status: "draft" | "planned" | "assembled";
   resultImageId: string | null;
+  /** Kept in the vault (sealed doc, sealed takes and film); fixed when created. */
+  vault: boolean;
   createdAt: string;
   updatedAt: string;
 }

@@ -5,14 +5,18 @@ import { Dialog } from "../../../components/Dialog";
 import { Icon } from "../../../components/Icon";
 import { useGpu } from "../../../state/gpu";
 import { useToast } from "../../../state/toast";
+import { useVault } from "../../../state/vault";
 import type { JobView } from "../JobCard";
 import { ShotCard } from "./ShotCard";
+import { LOCK_DISCARD_TOAST } from "./StoriesPanel";
 import "./workspace.css";
 
 /** Same restriction VideoPanel restates for every H3 model in the paid confirmation (UI-054). */
 const H3_LICENCE = "Runs in Canada — licence excludes EU/UK/KR/US";
 const SAVE_DEBOUNCE_MS = 600;
 const NEW_PREFIX = "new:";
+/** The inline export confirm ignores clicks this long after it opens (as the Lightbox's, UX-006). */
+const ARM_MS = 400;
 
 /**
  * Takes being rendered, per story → shot id → job id. Module-level so switching tabs (which
@@ -100,6 +104,7 @@ function Workspace({
 }: WorkspaceProps & { storyId: string }) {
   const toast = useToast();
   const gpu = useGpu();
+  const vault = useVault();
   const id = useId();
   const [view, setView] = useState<StoryView | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -109,6 +114,10 @@ function Workspace({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [confirm, setConfirm] = useState<null | { kind: "replan" } | { kind: "delete"; index: number; key: string }>(null);
   const [titleDraft, setTitleDraft] = useState<string | null>(null);
+  const titleDraftRef = useRef(titleDraft);
+  titleDraftRef.current = titleDraft;
+  const saveStateRef = useRef(saveState);
+  saveStateRef.current = saveState;
   /** Unsaved voice phrases (character id → phrase); null = show the saved ones. */
   const [voiceDraft, setVoiceDraft] = useState<Record<string, string> | null>(null);
   const voiceDraftRef = useRef(voiceDraft);
@@ -205,6 +214,14 @@ function Workspace({
     void refetch();
   }, [refetch]);
 
+  // Opened while the vault was locked (the lock screen): unlocking loads the story.
+  const lockedOut = !!loadError?.startsWith("VAULT_LOCKED");
+  useEffect(() => {
+    if (!vault.unlocked || !lockedOut) return;
+    setLoadError(null);
+    void refetch();
+  }, [vault.unlocked, lockedOut, refetch]);
+
   // The panel saved the story (brief, length, aspect, style, cast): show its cast, target and issues.
   const firstRefresh = useRef(refreshKey);
   useEffect(() => {
@@ -240,7 +257,8 @@ function Workspace({
       setSaveState(timer.current !== null ? "pending" : "idle");
     } catch (e) {
       // The toast provider lives at the app root: report the failure even after this workspace is gone.
-      toast.error("Could not save your shot edits", e);
+      if (api.errorCode(e) === "VAULT_LOCKED" && storyRef.current?.vault) toast.notify(LOCK_DISCARD_TOAST);
+      else toast.error("Could not save your shot edits", e);
       if (alive.current) setSaveState("error");
     }
   }, [storyId, adopt, toast, nextSeq, isFresh]);
@@ -344,6 +362,24 @@ function Workspace({
       timer.current = window.setTimeout(() => void runSave(), SAVE_DEBOUNCE_MS);
     },
     [runSave],
+  );
+
+  // The vault locked under a vault story (the workspace remounts on lockEpoch): its pending edits
+  // can't be saved, so they are dropped — before the cleanups below would try to send them.
+  useEffect(
+    () => () => {
+      if (!storyRef.current?.vault || vault.isUnlocked()) return;
+      const pending =
+        timer.current !== null ||
+        voiceTimer.current !== null ||
+        voiceDraftRef.current !== null ||
+        titleDraftRef.current !== null ||
+        saveStateRef.current !== "idle";
+      discard();
+      if (pending) toastRef.current.notify(LOCK_DISCARD_TOAST);
+    },
+    // Unmount only (discard and isUnlocked are stable; discard is declared further down).
+    [storyId],
   );
 
   // Leaving the story: send what's pending (unless a plan replaced it).
@@ -556,10 +592,26 @@ function Workspace({
     }
   };
 
+  // A vault film's Export opens the Lightbox's inline confirm first (the copy is not encrypted).
+  const [confirmExport, setConfirmExport] = useState(false);
+  const exportArmedAt = useRef(0);
+  const exportBtnRef = useRef<HTMLButtonElement>(null);
+  const openExportConfirm = () => {
+    exportArmedAt.current = Date.now() + ARM_MS;
+    setConfirmExport(true);
+  };
+  const closeExportConfirm = () => {
+    setConfirmExport(false);
+    requestAnimationFrame(() => exportBtnRef.current?.focus());
+  };
+
   const exportFilm = async () => {
     const film = view?.result;
     if (!film) return;
-    if (film.vault && !window.confirm("The exported copy is not encrypted — anyone with access to where you save it can open it. Export?")) return;
+    if (film.vault) {
+      if (Date.now() < exportArmedAt.current) return;
+      setConfirmExport(false);
+    }
     try {
       const dest = await api.pickSavePath(`${(story?.title || "story").replace(/[\\/:]/g, "-")}.mp4`);
       if (!dest) return;
@@ -650,7 +702,21 @@ function Workspace({
   };
 
   // ---- render ----
-  if (loadError && !view) {
+  if ((view?.story.vault || lockedOut) && !vault.unlocked) {
+    return (
+      <div className="empty story-ws__empty story-ws__locked">
+        <div className="empty__art">
+          <Icon name="lock" size={26} />
+        </div>
+        <h3>This story is in the vault.</h3>
+        <p>Unlock to continue.</p>
+        <button type="button" className="btn btn--primary btn--sm" onClick={() => vault.requestUnlock()}>
+          <Icon name="unlock" size={14} /> Unlock
+        </button>
+      </div>
+    );
+  }
+  if (loadError && !view && !lockedOut) {
     return (
       <div className="story-ws">
         <p className="notice notice--error" role="alert">
@@ -791,7 +857,15 @@ function Workspace({
             src={api.fileSrc(view.result.path)}
             poster={view.result.posterPath ? api.fileSrc(view.result.posterPath) : undefined}
           />
-          <div className="story-film__actions">
+          <div
+            className="story-film__actions confirm-slot"
+            onKeyDown={(e) => {
+              if (e.key === "Escape" && confirmExport) {
+                e.stopPropagation();
+                closeExportConfirm();
+              }
+            }}
+          >
             {!view.result.vault && (
               <button
                 type="button"
@@ -801,15 +875,34 @@ function Workspace({
                 Show in Finder
               </button>
             )}
-            <button
-              type="button"
-              className="btn btn--sm"
-              onClick={() => void exportFilm()}
-              title={view.result.vault ? "Vault films are exported as an unencrypted copy" : undefined}
-            >
-              <Icon name="download" size={14} /> Export…
-            </button>
+            {view.result.vault && confirmExport ? (
+              <button type="button" className="btn btn--sm" onClick={closeExportConfirm} aria-describedby={`${id}-export`} autoFocus>
+                <Icon name="x" size={14} /> Cancel
+              </button>
+            ) : (
+              <button
+                ref={exportBtnRef}
+                type="button"
+                className="btn btn--sm"
+                onClick={() => (view.result?.vault ? openExportConfirm() : void exportFilm())}
+                title={view.result.vault ? "Vault films are exported as an unencrypted copy" : undefined}
+              >
+                <Icon name="download" size={14} /> Export…
+              </button>
+            )}
             {view.result.vault && <span className="hint">Encrypted in the vault.</span>}
+            {view.result.vault && confirmExport && (
+              <div className="confirm confirm-pop confirm--note" role="group" aria-label="Export from the vault">
+                <span id={`${id}-export`}>
+                  <Icon name="alert" size={13} /> The exported copy is <strong>not encrypted</strong> — anyone with access to where you save it can open it.
+                </span>
+                <div className="btn-row confirm-pop__row">
+                  <button type="button" className="btn btn--warn-outline btn--sm" onClick={() => void exportFilm()}>
+                    <Icon name="download" size={13} /> Choose where to save…
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </section>
       )}

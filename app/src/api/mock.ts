@@ -29,8 +29,9 @@
 // characters (Mara, Ivo) with placeholder reference images; ?llm=down makes the local LLM
 // (LM Studio) unreachable, so plan_story and llm_status show the "start LM Studio" hint. plan_story
 // returns a canned plan after 1.5 s (a brief containing "invalid" gets a 3 s first shot, to see
-// validation errors). Shot renders run as normal h3ref video jobs; their takes stay out of the
-// gallery, and the assembled story video goes into it.
+// validation errors). Shot renders run as normal h3ref video jobs; their takes and the assembled
+// film stay out of the gallery. Vault characters and stories (with ?vault) vanish from the lists
+// while the mock vault is locked; opening or changing one then answers VAULT_LOCKED.
 //
 // Quit flow: a browser tab can't intercept closing with an in-app dialog, so call
 // `window.mockQuit()` from the console to simulate ⌘Q (`quit-requested` when a pod
@@ -1342,9 +1343,11 @@ async function runVideoJob(jobId: string, input: GenerateVideoInput, take?: { st
   if (take) {
     rec.storyId = take.storyId;
     rec.shotId = take.shotId;
+    // A vault story's take is sealed (works locked); its job-update is redacted while locked.
+    if (destination === "vault") Object.assign(rec, asVaultItem(rec));
     takes.unshift(rec);
   } else saveOutput(rec, destination);
-  job.images = [rec];
+  job.images = destination === "vault" && !vault.unlocked ? [] : [rec];
   job.completed = 1;
   emit("job-update", job);
   if (destination === "vault") emitVault();
@@ -1468,10 +1471,22 @@ function compileShot(story: Story, shot: Shot, cast: Character[]): { prompt: str
   return { prompt, refIds };
 }
 
+/** Vault characters and stories are visible (and usable) only while the mock vault is unlocked. */
+const vaultVisible = () => vault.unlocked;
+const visible = (x: { vault: boolean }) => !x.vault || vaultVisible();
+const lockedError = (what: string) => new Error(`VAULT_LOCKED: Unlock the vault to ${what}`);
+
+/** Mirror of repo::get_story: a vault story while locked answers VAULT_LOCKED. */
 function getStoryOr(id: string): Story {
   const st = stories.get(id);
   if (!st) throw new Error("That story no longer exists");
+  if (!visible(st)) throw lockedError("open this story");
   return st;
+}
+/** Mirror of repo::require_unlocked_story: the spec §8 copy for approve / assemble / plan. */
+function requireStoryUnlocked(storyId: string, what: string) {
+  const st = stories.get(storyId);
+  if (st && !visible(st)) throw lockedError(what);
 }
 const storyShots = (storyId: string) => [...shots.values()].filter((s) => s.storyId === storyId).sort((a, b) => a.position - b.position);
 const castOf = (story: Story): Character[] =>
@@ -1497,9 +1512,18 @@ function storyView(storyId: string): StoryView {
   return { story, cast, shots: list, takes: takes.filter((t) => t.storyId === storyId), result, issues };
 }
 
+/** Mirror of repo::check_cast: a General story never casts a vault character; cast names differ. */
+function checkStoreRules(story: Story) {
+  const cast = castOf(story);
+  if (!story.vault && cast.some((c) => c.vault)) throw new Error("A General story can't use a vault character. Create the story as a vault story.");
+  const dup = cast.find((c, i) => cast.findIndex((x) => x.name.toLowerCase() === c.name.toLowerCase()) !== i);
+  if (dup) throw new Error(`Two cast members are both named ${dup.name}. Rename one.`);
+}
+
 /** Plan / render refuse a cast that breaks the adult or consent rule (the Rust command checks the same). */
 function checkCast(story: Story) {
   if (!story.cast.length) throw new Error("Add at least one character to the cast first");
+  checkStoreRules(story);
   for (const c of castOf(story)) {
     if (!c.adult) throw new Error(`${c.name} is not confirmed as an adult (18+)`);
     if (c.source === "real_person" && !c.consent) throw new Error(`${c.name} is a real person without a consent tick`);
@@ -1542,8 +1566,9 @@ function refuseRendering(list: Shot[]) {
   if (s) throw new Error(`Wait for shot ${s.position} to finish rendering`);
 }
 
-/** Mirror of render.rs job_label. */
+/** Mirror of render.rs job_label (a vault story's names nothing of it). */
 function storyJobLabel(story: Story, position: number): string {
+  if (story.vault) return `Vault story · shot ${position}`;
   let name = story.title.trim();
   if (!name) {
     const brief = story.brief.trim();
@@ -1645,7 +1670,7 @@ function renderShotInternal(shotId: string): string {
     fps: STORY_FPS,
     resolution: STORY_RESOLUTION[view.story.aspect],
     audio: true,
-    destination: "general",
+    destination: view.story.vault ? "vault" : "general",
   };
   const jobId = uid("job");
   // runVideoJob registers the job in activeJobs before its first await.
@@ -1679,7 +1704,7 @@ if (params.has("storyDemo")) {
       return id;
     });
     const id = uid("char");
-    characters.set(id, { id, name, description, source: "generated", consent: false, adult: true, refIds, refPaths: [], createdAt: nowIso(), updatedAt: nowIso() });
+    characters.set(id, { id, name, description, source: "generated", consent: false, adult: true, refIds, refPaths: [], vault: false, createdAt: nowIso(), updatedAt: nowIso() });
   }
 }
 
@@ -1687,16 +1712,22 @@ if (params.has("storyDemo")) {
 const withRefPaths = (c: Character): Character => ({ ...c, refPaths: c.refIds.map((id) => refs.get(id) ?? "") });
 
 const storyCommands: Record<string, Handler> = {
-  list_characters: () => [...characters.values()].sort((a, b) => a.name.localeCompare(b.name)).map(withRefPaths),
+  list_characters: () => [...characters.values()].filter(visible).sort((a, b) => a.name.localeCompare(b.name)).map(withRefPaths),
   save_character: (a) => {
     const c = a.character as Character;
-    checkCharacter(c);
-    const name = c.name.trim();
-    const clash = [...characters.values()].find((x) => x.id !== c.id && x.name.toLowerCase() === name.toLowerCase());
-    if (clash) throw new Error(`A character named ${name} already exists`);
     const old = c.id ? characters.get(c.id) : undefined;
+    // Mirror of repo::save_character: the store is fixed (an existing character keeps its own).
+    const inVault = old ? old.vault : !!c.vault;
+    if (inVault && !vault.exists) throw new Error("NO_VAULT: Create the vault first (Gallery → Vault)");
+    if (inVault && !vaultVisible()) throw lockedError(old ? "open this character" : "create a vault character");
+    checkCharacter(c);
+    if (!c.refIds.every((r) => r.startsWith("vault:") === inVault)) throw new Error("Reference images must be in the same place as the character");
+    const name = c.name.trim();
+    const clash = [...characters.values()].find((x) => x.id !== c.id && x.vault === inVault && x.name.toLowerCase() === name.toLowerCase());
+    if (clash) throw new Error(`A character named ${name} already exists`);
     const saved: Character = {
       ...c,
+      vault: inVault,
       id: old?.id ?? uid("char"),
       name,
       description: c.description.trim(),
@@ -1711,13 +1742,18 @@ const storyCommands: Record<string, Handler> = {
     const id = String(a.id);
     const c = characters.get(id);
     if (!c) return;
-    const user = [...stories.values()].find((s) => s.cast.includes(id));
+    if (c.vault && !vaultVisible()) throw lockedError("open this character");
+    if (!c.vault && vault.exists && !vaultVisible()) throw new Error("Unlock the vault first: a vault story may use this character");
+    const user = [...stories.values()].filter(visible).find((s) => s.cast.includes(id));
     if (user) throw new Error(`${c.name} is used by story "${user.title || user.brief.slice(0, 40)}"`);
     characters.delete(id);
   },
-  list_stories: () => [...stories.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
+  list_stories: () => [...stories.values()].filter(visible).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
   create_story: (a) => {
     const f = { brief: String(a.brief ?? ""), targetS: Number(a.targetS), aspect: String(a.aspect ?? ""), style: String(a.style ?? ""), cast: (a.cast as string[]) ?? [] };
+    const inVault = a.destination === "vault";
+    if (inVault && !vault.exists) throw new Error("NO_VAULT: Create the vault first (Gallery → Vault)");
+    if (inVault && !vaultVisible()) throw lockedError("create a vault story");
     checkStoryFields(f);
     const story: Story = {
       id: uid("story"),
@@ -1728,9 +1764,11 @@ const storyCommands: Record<string, Handler> = {
       voices: [],
       status: "draft",
       resultImageId: null,
+      vault: inVault,
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };
+    checkStoreRules(story);
     stories.set(story.id, story);
     return storyView(story.id);
   },
@@ -1755,6 +1793,7 @@ const storyCommands: Record<string, Handler> = {
     if (!next.brief) throw new Error("Write a brief first");
     if (!next.cast.length) throw new Error("Add at least one character to the cast first");
     checkStoryFields(next);
+    checkStoreRules(next);
     stories.set(id, { ...next, updatedAt: nowIso() });
     return storyView(id);
   },
@@ -1762,6 +1801,7 @@ const storyCommands: Record<string, Handler> = {
     const id = String(a.id);
     const story = stories.get(id);
     if (!story) return;
+    if (!visible(story)) throw lockedError("open this story");
     refuseRendering(storyShots(id));
     for (const s of storyShots(id)) shots.delete(s.id);
     for (const t of takes.filter((t) => t.storyId === id)) removeRecord(takes, t.id);
@@ -1770,6 +1810,7 @@ const storyCommands: Record<string, Handler> = {
   },
   get_story: (a) => storyView(String(a.id)),
   plan_story: async (a) => {
+    requireStoryUnlocked(String(a.id), "plan the story");
     const story = getStoryOr(String(a.id));
     checkCast(story);
     if (!story.brief.trim()) throw new Error("Write a brief first");
@@ -1778,6 +1819,8 @@ const storyCommands: Record<string, Handler> = {
     await sleep(Number(params.get("planMs")) || 1500);
     if (llmDown) throw new Error(LM_STUDIO_HINT);
     refuseRendering(storyShots(story.id));
+    // The plan was only in memory: a vault that locked meanwhile loses it.
+    if (!visible(story)) throw new Error("VAULT_LOCKED: The vault locked while planning; unlock and plan again");
     // Built on the story as stored now, not as it was when planning began.
     const latest = getStoryOr(story.id);
     const plan = cannedPlan(latest);
@@ -1845,6 +1888,8 @@ const storyCommands: Record<string, Handler> = {
   approve_take: (a): ApproveResult => {
     const shotId = String(a.shotId);
     const takeId = String(a.takeId);
+    const owner = shots.get(shotId);
+    if (owner) requireStoryUnlocked(owner.storyId, "approve takes");
     const take = takes.find((t) => t.id === takeId);
     if (!take) throw new Error("That take no longer exists");
     if (take.shotId !== shotId) throw new Error("That take belongs to another shot");
@@ -1858,6 +1903,7 @@ const storyCommands: Record<string, Handler> = {
   },
   assemble_story: async (a) => {
     const storyId = String(a.storyId);
+    requireStoryUnlocked(storyId, "assemble the story");
     const view = storyView(storyId);
     if (!view.shots.length) throw new Error("The story has no shots");
     const approved = view.shots.map((s) => {
@@ -1885,6 +1931,7 @@ const storyCommands: Record<string, Handler> = {
     });
     rec.storyId = storyId;
     rec.posterPath = first.posterPath ?? rec.posterPath;
+    if (view.story.vault) Object.assign(rec, asVaultItem(rec));
     if (view.story.resultImageId) removeRecord(films, view.story.resultImageId);
     films.unshift(rec);
     stories.set(storyId, { ...view.story, status: "assembled", resultImageId: rec.id, updatedAt: nowIso() });
@@ -1932,7 +1979,7 @@ const commands: Record<string, Handler> = {
     console.info(`[mock log] ${a?.level}: ${a?.message}`);
   },
   reveal_image: (a) => {
-    if (vault.items.some((x) => x.id === a.id)) throw new Error("Vault films are exported, not shown in Finder");
+    if (vault.items.some((x) => x.id === a.id) || films.some((x) => x.id === a.id && x.vault)) throw new Error("Vault films are exported, not shown in Finder");
     console.info(`[mock] Would show ${String(a.id)} in Finder.`);
   },
   reveal_settings_file: () => {
@@ -2374,6 +2421,7 @@ const commands: Record<string, Handler> = {
     if (vault.items.some((x) => x.id === a.id)) return commands.export_vault_item({ id: a.id, dest: a.destPath });
     const im = images.find((x) => x.id === a.id) ?? films.find((x) => x.id === a.id);
     if (!im) throw new Error("Image not found");
+    if (im.vault) requireUnlocked();
     downloadRecord(im, String(a.destPath));
   },
   ...storyCommands,

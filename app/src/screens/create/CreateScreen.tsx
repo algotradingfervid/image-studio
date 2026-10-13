@@ -1498,7 +1498,7 @@ export function CreateScreen({ active, onNavigate }: { active: boolean; onNaviga
         />
         {mode === "stories" ? (
           <StoryWorkspace
-            key={`${storyId ?? "new"}:${planEpoch}`}
+            key={`${storyId ?? "new"}:${planEpoch}:${vault.lockEpoch}`}
             storyId={storyId}
             jobs={jobs}
             planning={storyPlanning}

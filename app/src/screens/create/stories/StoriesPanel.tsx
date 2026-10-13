@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import * as api from "../../../api";
-import type { Character, LlmStatus, Story } from "../../../api";
+import type { Character, Destination, LlmStatus, Story } from "../../../api";
 import { Dialog } from "../../../components/Dialog";
 import { Icon } from "../../../components/Icon";
 import { radioKeys } from "../../../components/radio";
 import { useToast } from "../../../state/toast";
+import { useVault } from "../../../state/vault";
 import { useMoreBelow } from "../Controls";
 import { CharacterForm } from "./CharacterForm";
 import "./stories.css";
@@ -18,6 +19,9 @@ const ASPECTS: Story["aspect"][] = ["16:9", "9:16", "1:1"];
 const DEFAULTS = { brief: "", targetS: 60, aspect: "16:9" as Story["aspect"], style: "", cast: [] as string[] };
 /** Shown when the planner can't be reached (same words as the core's hint, spec §4). */
 const LM_HINT = "Start LM Studio's server (Developer → Start server, or `lms server start`) and load a model.";
+const SAVE_TO: Destination[] = ["general", "vault"];
+/** Spec §8: shown once per lock, by the panel or the workspace, whichever had the edits. */
+export const LOCK_DISCARD_TOAST = { kind: "info", key: "story-lock-discard", title: "Vault locked — unsaved edits to this story were discarded" } as const;
 
 type Fields = typeof DEFAULTS;
 
@@ -34,6 +38,9 @@ function storyLabel(s: Story): string {
   const d = new Date(s.updatedAt || s.createdAt);
   return isNaN(d.getTime()) ? name : `${name} · ${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })}`;
 }
+
+/** Picker entry (an <option> holds text only, so the vault mark is a word). */
+const optionLabel = (s: Story) => (s.vault ? `Vault · ${storyLabel(s)}` : storyLabel(s));
 
 const fieldsOf = (s: Story): Fields => ({ brief: s.brief, targetS: s.targetS, aspect: s.aspect, style: s.style, cast: s.cast });
 
@@ -73,6 +80,7 @@ export function StoriesPanel({
 }) {
   const id = useId();
   const toast = useToast();
+  const vault = useVault();
   const scrollRef = useRef<HTMLDivElement>(null);
   const briefRef = useRef<HTMLTextAreaElement>(null);
   useMoreBelow(scrollRef);
@@ -82,18 +90,22 @@ export function StoriesPanel({
   const [characters, setCharacters] = useState<Character[]>([]);
   const [loaded, setLoaded] = useState(false);
   const loadedOnce = useRef(false);
+  /** The lists on screen were read with the vault unlocked (so they hold its stories). */
+  const [listUnlocked, setListUnlocked] = useState(false);
 
   const load = useCallback(async () => {
+    const unlockedNow = vault.isUnlocked();
     try {
       const [ss, cs] = await Promise.all([api.listStories(), api.listCharacters()]);
       setStories(ss);
       setCharacters(cs);
+      setListUnlocked(unlockedNow);
     } catch (e) {
       toast.error("Couldn't load your stories", e);
     } finally {
       setLoaded(true);
     }
-  }, [toast]);
+  }, [toast, vault.isUnlocked]);
 
   useEffect(() => {
     if (!active || loadedOnce.current) return;
@@ -129,11 +141,20 @@ export function StoriesPanel({
   const dirty = useRef(false);
   const timer = useRef<number | undefined>(undefined);
 
+  /** Vault story ids seen while unlocked: such a selection is kept through a lock (the workspace shows the lock screen). */
+  const lockedIds = useRef(new Set<string>());
+  useEffect(() => {
+    if (vault.unlocked) for (const s of stories) if (s.vault) lockedIds.current.add(s.id);
+  }, [stories, vault.unlocked]);
+  /** The selected story is a vault story out of reach: locked, or its list is still reloading after the unlock. */
+  const lockedSel = !!selectedStoryId && !story && lockedIds.current.has(selectedStoryId) && !(vault.unlocked && listUnlocked);
+
   // Load the selected story's fields when the selection changes (or the list first arrives).
   const shownFor = useRef<string | null | undefined>(undefined);
   useEffect(() => {
     if (!loaded) return;
     if (selectedStoryId && !story) {
+      if (lockedSel) return;
       // Deleted elsewhere, or a stale remembered id.
       onSelectStory(null);
       return;
@@ -142,7 +163,7 @@ export function StoriesPanel({
     shownFor.current = selectedStoryId;
     dirty.current = false;
     if (story) setFields(fieldsOf(story));
-  }, [loaded, selectedStoryId, story, onSelectStory]);
+  }, [loaded, selectedStoryId, story, onSelectStory, lockedSel]);
 
   const saveNow = useCallback(async () => {
     window.clearTimeout(timer.current);
@@ -176,6 +197,37 @@ export function StoriesPanel({
     timer.current = window.setTimeout(() => void saveNow(), SAVE_DELAY_MS);
     return () => window.clearTimeout(timer.current);
   }, [fields, story, saveNow]);
+
+  // ---------- where a new story is saved, and the vault locking / unlocking ----------
+  const [saveTo, setSaveTo] = useState<Destination>("general");
+  const saveToRef = useRef(saveTo);
+  saveToRef.current = saveTo;
+  /** The store of the story being edited (a new one: the Save-to choice). */
+  const inVault = story ? story.vault : vault.exists && saveTo === "vault";
+
+  const seenUnlocked = useRef(vault.unlocked);
+  useEffect(() => {
+    if (seenUnlocked.current === vault.unlocked) return;
+    seenUnlocked.current = vault.unlocked;
+    if (!vault.unlocked) {
+      // Nothing of the vault stays on screen: its stories and characters go now, the reload confirms.
+      const gone = new Set(characters.filter((c) => c.vault).map((c) => c.id));
+      setStories((ss) => ss.filter((s) => !s.vault));
+      setCharacters((cs) => cs.filter((c) => !c.vault));
+      setListUnlocked(false);
+      const s = storyRef.current;
+      if (s?.vault || (!s && saveToRef.current === "vault")) {
+        // The panel form resets; a saved vault story's pending edits are dropped (they can't be saved locked).
+        window.clearTimeout(timer.current);
+        if (s && dirty.current) toast.notify(LOCK_DISCARD_TOAST);
+        dirty.current = false;
+        shownFor.current = undefined;
+        setFields(DEFAULTS);
+      } else if (gone.size) setFields((f) => ({ ...f, cast: f.cast.filter((c) => !gone.has(c)) }));
+      setSaveTo("general");
+    }
+    if (loadedOnce.current) void load();
+  }, [vault.unlocked, characters, load, toast]);
 
   const selectStory = async (next: string | null) => {
     await saveNow();
@@ -289,6 +341,7 @@ export function StoriesPanel({
   const [planning, setPlanning] = useState(false);
   const [confirmReplan, setConfirmReplan] = useState(false);
   const blockers = [
+    lockedSel ? "Unlock the vault to continue" : "",
     fields.cast.length === 0 ? "Add a character to the cast" : "",
     !fields.brief.trim() ? "Write a brief" : "",
   ].filter(Boolean);
@@ -303,7 +356,8 @@ export function StoriesPanel({
       let sid = storyRef.current?.id;
       if (!sid) {
         const f = fieldsRef.current;
-        const v = await api.createStory({ brief: f.brief.trim(), targetS: f.targetS, aspect: f.aspect, style: f.style.trim(), cast: f.cast });
+        const destination: Destination = vault.exists && saveToRef.current === "vault" ? "vault" : "general";
+        const v = await api.createStory({ brief: f.brief.trim(), targetS: f.targetS, aspect: f.aspect, style: f.style.trim(), cast: f.cast, destination });
         sid = v.story.id;
         upsert(v.story);
         shownFor.current = sid;
@@ -317,10 +371,13 @@ export function StoriesPanel({
       upsert(planned.story);
       onPlanned?.();
     } catch (e) {
-      const msg = api.errorMessage(e);
+      // VAULT_LOCKED (locked before or while planning): the sentence without its code, and Unlock.
+      const locked = api.errorCode(e) === "VAULT_LOCKED";
+      const msg = api.errorMessage(e).replace(/^VAULT_LOCKED: /, "");
       toast.notify({
         kind: "error",
         title: "Couldn't plan the story",
+        actions: locked ? [{ label: "Unlock", onClick: () => vault.requestUnlock() }] : undefined,
         // The LM Studio hint only for connection failures, not for validation errors.
         message: !/LM Studio/i.test(msg) && /connect|reach|refused|timed? ?out|network/i.test(msg) ? `${msg} — the planner runs on your Mac: ${LM_HINT}` : msg,
         durationMs: 12000,
@@ -386,6 +443,11 @@ export function StoriesPanel({
             <div className="section__head">
               <label className="section__title" htmlFor={`${id}-story`}>
                 Story
+                {story?.vault && (
+                  <span className="tag story-vault-tag">
+                    <Icon name="lock" size={11} /> Vault
+                  </span>
+                )}
               </label>
               {story && (
                 <button
@@ -408,9 +470,10 @@ export function StoriesPanel({
                 onChange={(e) => void selectStory(e.target.value || null)}
               >
                 <option value="">{loaded ? "New story (not saved yet)" : "Loading…"}</option>
+                {lockedSel && <option value={selectedStoryId ?? ""}>Vault story (locked)</option>}
                 {stories.map((s) => (
                   <option key={s.id} value={s.id}>
-                    {storyLabel(s)}
+                    {optionLabel(s)}
                   </option>
                 ))}
               </select>
@@ -490,12 +553,21 @@ export function StoriesPanel({
                         type="button"
                         role="menuitem"
                         className="menu__item lora-menu__item"
+                        disabled={c.vault && !inVault}
+                        title={c.vault && !inVault ? "Only a vault story can use a vault character" : undefined}
                         onClick={() => {
                           addToCast(c.id);
                           closeMenu();
                         }}
                       >
-                        <span className="lora-menu__name">{c.name}</span>
+                        <span className="lora-menu__name">
+                          {c.name}
+                          {c.vault && (
+                            <span className="tag story-vault-tag">
+                              <Icon name="lock" size={11} /> Vault
+                            </span>
+                          )}
+                        </span>
                         <span className="hint lora-menu__sub">{clip(c.description, 60)}</span>
                       </button>
                       <button
@@ -537,6 +609,49 @@ export function StoriesPanel({
               )}
             </div>
           </section>
+
+          {!story && !lockedSel && vault.exists && (
+            <div className="save-to story-save-to">
+              <div className="save-to__row">
+                <span className="section__title" id={`${id}-save-to`}>
+                  Save to
+                </span>
+                <div
+                  className="segmented save-to__seg"
+                  role="radiogroup"
+                  aria-labelledby={`${id}-save-to`}
+                  aria-describedby={saveTo === "vault" ? `${id}-save-to-note` : undefined}
+                  onKeyDown={radioKeys(vault.unlocked ? SAVE_TO : ["general"], saveTo, setSaveTo)}
+                >
+                  {SAVE_TO.map((d) => {
+                    const on = d === saveTo;
+                    const disabled = d === "vault" && !vault.unlocked;
+                    return (
+                      <button
+                        key={d}
+                        type="button"
+                        role="radio"
+                        aria-checked={on}
+                        tabIndex={on ? 0 : -1}
+                        disabled={disabled}
+                        title={disabled ? "Unlock the vault to create a vault story" : undefined}
+                        className={on ? "is-selected" : ""}
+                        onClick={() => setSaveTo(d)}
+                      >
+                        {d === "vault" && <Icon name="lock" size={13} />}
+                        {d === "general" ? "General" : "Vault"}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+              {saveTo === "vault" && (
+                <p id={`${id}-save-to-note`} className="hint save-to__note">
+                  Encrypted in the vault. The GPU pod and LM Studio still see what they need to render and plan.
+                </p>
+              )}
+            </div>
+          )}
 
           <section className="section">
             <div className="section__head">
@@ -642,6 +757,7 @@ export function StoriesPanel({
       <CharacterForm
         open={formOpen}
         character={editing}
+        defaultVault={inVault}
         onClose={() => {
           setEditing(null);
           setFormOpen(false);

@@ -6,6 +6,7 @@ import { Icon } from "../../../components/Icon";
 import { radioKeys } from "../../../components/radio";
 import { useLibrary } from "../../../state/library";
 import { useToast } from "../../../state/toast";
+import { useVault } from "../../../state/vault";
 import { References, realImageFiles, type RefItem } from "../Controls";
 import { GalleryPicker } from "../GalleryPicker";
 
@@ -22,22 +23,27 @@ const SOURCES: { id: Source; label: string }[] = [
 
 /**
  * New character for the Stories cast (spec §3 step 1): name, one-line locked description, 1–3
- * reference images (general gallery only in v1), source, consent for a real person, adult tick.
+ * reference images, source, consent for a real person, adult tick, and — with a vault — "Keep in
+ * vault" (new characters only; its references are then sealed in the vault).
  * Given a `character`, it edits that one instead (same id; the next render uses the new references).
  */
 export function CharacterForm({
   open,
   character,
+  defaultVault = false,
   onClose,
   onSaved,
 }: {
   open: boolean;
   character?: Character | null;
+  /** A new character starts with "Keep in vault" ticked (opened from a vault story). */
+  defaultVault?: boolean;
   onClose: () => void;
   onSaved: (c: Character) => void;
 }) {
   const id = useId();
   const toast = useToast();
+  const vault = useVault();
   const lib = useLibrary();
   const modelNames = useMemo(() => Object.fromEntries(lib.models.map((m) => [m.id, m.name])), [lib.models]);
   const [name, setName] = useState("");
@@ -46,6 +52,8 @@ export function CharacterForm({
   const [source, setSource] = useState<Source>("generated");
   const [consent, setConsent] = useState(false);
   const [adult, setAdult] = useState(false);
+  /** Where the character (and so its reference images) lives; fixed once saved. */
+  const [inVault, setInVault] = useState(false);
   const [busy, setBusy] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -63,8 +71,10 @@ export function CharacterForm({
     setSource(character?.source ?? "generated");
     setConsent(character?.consent ?? false);
     setAdult(character?.adult ?? false);
+    setInVault(character ? character.vault : defaultVault && vault.isUnlocked());
     setError(null);
-  }, [open, character]);
+  }, [open, character, defaultVault, vault.isUnlocked]);
+  const dest = inVault ? "vault" : "general";
 
   const refsRef = useRef(refs);
   refsRef.current = refs;
@@ -90,13 +100,13 @@ export function CharacterForm({
   const addFiles = async (picked: File[]) => {
     const files = await realImageFiles(picked);
     if (!files.length) return toast.info("That file isn't an image", "Use a PNG, JPG or WebP.");
-    await addWith(files.map((f) => async () => api.importReferenceBytes(await api.blobToBase64(f), f.type || "image/png", "general")));
+    await addWith(files.map((f) => async () => api.importReferenceBytes(await api.blobToBase64(f), f.type || "image/png", dest)));
   };
 
   const addPaths = async (paths: string[]) => {
     const imgs = paths.filter((p) => IMAGE_EXT.test(p));
     if (!imgs.length) return toast.info("That file isn't an image", "Use a PNG, JPG or WebP.");
-    await addWith(imgs.map((p) => () => api.importReference(p, "general")));
+    await addWith(imgs.map((p) => () => api.importReference(p, dest)));
   };
 
   const pick = async () => {
@@ -111,9 +121,9 @@ export function CharacterForm({
 
   const fromGallery = (rec: ImageRecord) => {
     setPickerOpen(false);
-    // v1 stories live in the general gallery only (spec §3): vault images can't be character references.
-    if (rec.vault) return toast.info("Vault images can't be character references yet", "Choose an image from the General gallery.");
-    void addWith([() => api.importReference(rec.path, "general")]);
+    if (rec.vault && !inVault) return toast.info("Vault images can only be used by vault characters");
+    // A vault path is re-sealed for the character; a General image is sealed when it goes in the vault.
+    void addWith([() => api.importReference(rec.path, dest)]);
   };
 
   // Paste and native file drops go to this form while it is open (the Create panel's own listeners are off on this tab).
@@ -171,12 +181,13 @@ export function CharacterForm({
         adult,
         refIds: refs.map((r) => r.refId),
         refPaths: [],
+        vault: inVault,
         createdAt: character?.createdAt ?? "",
         updatedAt: "",
       });
       onSaved(saved);
     } catch (err) {
-      setError(api.errorMessage(err));
+      setError(api.errorMessage(err).replace(/^(VAULT_LOCKED|NO_VAULT): /, ""));
     } finally {
       setSaving(false);
     }
@@ -303,6 +314,28 @@ export function CharacterForm({
           </div>
         </div>
 
+        {!character && vault.exists && (
+          <div className="field character-form__vault">
+            <label className="story-check">
+              <input
+                type="checkbox"
+                checked={inVault}
+                // The references are imported into the chosen store: switching would leave them behind.
+                disabled={(!vault.unlocked && !inVault) || refs.length > 0}
+                title={refs.length > 0 ? "Remove the reference images to change where this character is kept" : undefined}
+                aria-describedby={`${id}-vault-hint`}
+                onChange={(e) => setInVault(e.target.checked)}
+              />
+              <span>
+                <Icon name="lock" size={12} /> Keep in vault
+              </span>
+            </label>
+            <p id={`${id}-vault-hint`} className="hint">
+              {!vault.unlocked ? "Unlock the vault to create a vault character" : "Encrypted in the vault. The GPU pod and LM Studio still see what they need to render and plan."}
+            </p>
+          </div>
+        )}
+
         <div className="character-form__ticks">
           {source === "real_person" && (
             <label className="story-check">
@@ -329,6 +362,7 @@ export function CharacterForm({
         purpose="reference"
         modelNames={modelNames}
         returnFocusRef={nameRef}
+        preferVault={inVault}
         onClose={() => setPickerOpen(false)}
         onPick={fromGallery}
       />
