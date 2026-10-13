@@ -12,7 +12,7 @@ the same characters in every shot and spoken dialogue taken from the story.
 
 v1 is done when, in the real app:
 1. With 2 AI-generated characters, a 1-minute brief produces a validated shot list (4–10 shots)
-   with no manual fixing in at least 4 of 5 tries (Gemma 4 26B via LM Studio).
+   with no manual fixing in at least 4 of 5 tries (Qwen 3.8 27B uncensored via LM Studio).
 2. All shots render as H3 Character jobs, each reviewable with Approve / Reroll / Edit.
 3. Assemble produces one MP4 in the gallery (or vault) with every approved shot in order,
    dialogue audible, loudness normalized.
@@ -69,8 +69,11 @@ The steps:
 ## 4. Planner (local LLM)
 
 - Endpoint: OpenAI-compatible chat completions. Settings → Stories: base URL (default
-  `http://localhost:1234/v1`, LM Studio) and model id (default: the first model the server
-  lists; Gemma 4 26B is installed today). If unreachable: inline message "Start LM Studio's
+  `http://localhost:1234/v1`, LM Studio) and model id (default
+  `qwen3.8-27b-uncensored-optiq-4bit` = `mlx-community/Qwen3.8-27B-Uncensored-OptiQ-4bit`,
+  19.8 GB, owner's choice 2026-10-13; if that id is not listed, the first model the server
+  lists). Qwen 3 thinking: the request sends `chat_template_kwargs: {"enable_thinking": false}`
+  and the client strips any `<think>…</think>` block before parsing. If unreachable: inline message "Start LM Studio's
   server (Developer → Start server, or `lms server start`) and load a model".
 - One request per plan (simplicity over the PDF's three passes), temperature 0.6, with
   `response_format: {type: "json_schema", ...}` (structured output). If the server rejects
