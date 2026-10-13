@@ -355,8 +355,8 @@ def test_vllm_exits_while_starting(tmp_path):
     sup.run()
     st = sup.status()
     assert st["state"] == "failed"
-    assert st["error"].startswith("vLLM exited with code 1 while starting: INFO start | "
-                                  "ValueError: Free memory")
+    # The root-cause line, not the last lines of output.
+    assert st["error"].startswith("vLLM exited with code 1 while starting: ValueError: Free memory")
 
 
 def test_vllm_start_timeout_kills_it(tmp_path):
@@ -645,3 +645,16 @@ def test_start_llm_off_and_on(monkeypatch):
     assert sup.gate() is False                     # probe still running
     wait_for(sup.gate)
     server.cuda_info._reset_for_tests()
+
+
+def test_root_cause_finds_the_real_error_line():
+    from llm import root_cause
+    line = ("(EngineCore pid=1796) ERROR 10-13 17:17:29 [core.py:1231] torch._inductor.exc.InductorError: "
+            "RuntimeError: Failed to find C compiler. Please specify via CC environment variable")
+    assert root_cause(line).startswith("torch._inductor.exc.InductorError: RuntimeError: Failed to find C compiler")
+    assert root_cause("(EngineCore pid=1796) torch._inductor.exc.InductorError: RuntimeError: x") == \
+        "torch._inductor.exc.InductorError: RuntimeError: x"
+    assert root_cause("(APIServer pid=971) RuntimeError: Engine core initialization failed. See root cause above.") is None
+    assert root_cause("(EngineCore pid=1) WARNING 10-13 17:16:47 [import_utils.py:408] AssertionError") is None
+    assert root_cause("(EngineCore pid=1) INFO 10-13 17:17:07 [gpu_model_runner.py:5255] Model loading took 28 GiB") is None
+    assert root_cause("(EngineCore pid=1) ERROR 10-13 [core.py:1] Traceback (most recent call last):") is None

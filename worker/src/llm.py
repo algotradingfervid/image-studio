@@ -48,6 +48,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -78,6 +79,20 @@ START_TIMEOUT_S = 1800.0      # weights load + torch.compile + CUDA graphs, firs
 GATE_TIMEOUT_S = 300.0
 POLL_S = 2.0
 LOG_TAIL = 20                 # vLLM lines kept for the failure reason
+_PREFIX = re.compile(r"^\((?:APIServer|EngineCore)[^)]*\)\s*(?:(?:ERROR|WARNING|INFO)\s+\S+\s+\S+\s+\[[^\]]*\]\s*)?")
+_ERROR = re.compile(r"^[\w.]*(?:Error|Exception)(?::|$)")
+
+
+def root_cause(line: str) -> str | None:
+    """The error line in one vLLM log line ("torch._inductor.exc.InductorError: ..."),
+    without the "(EngineCore pid=N) ERROR <date> <time> [file:line]" prefix; None for
+    other lines, warnings, and vLLM's generic wrapper error."""
+    if "WARNING" in line[:60]:
+        return None
+    text = _PREFIX.sub("", line.strip())
+    if not _ERROR.match(text) or "Engine core initialization failed" in text:
+        return None
+    return text[:400]
 # The model card's verified serve flags (vLLM 0.24.0), minus the ones we size
 # ourselves (utilization, max length, sequences). No --quantization: the FP8
 # scheme is read from config.json.
@@ -201,6 +216,7 @@ class LLMSupervisor:
         self._progress: Callable[[], int] = lambda: self.disk_bytes(self.dir)
         self.proc: Any = None
         self.tail: collections.deque[str] = collections.deque(maxlen=LOG_TAIL)
+        self.cause: str | None = None
         self._stopped = False
 
     @classmethod
@@ -454,11 +470,18 @@ class LLMSupervisor:
                 line = line.rstrip()
                 if line:
                     self.tail.append(line)
+                    cause = root_cause(line)
+                    if cause:
+                        self.cause = cause
                     print(f"vllm | {line}", flush=True)
         except (OSError, ValueError):
             pass
 
     def _tail_text(self, n: int = 5) -> str:
+        # The real error is usually far above vLLM's last lines ("Engine core
+        # initialization failed. See root cause above").
+        if self.cause:
+            return self.cause
         lines = list(self.tail)[-n:]
         return " | ".join(lines) if lines else "no output"
 

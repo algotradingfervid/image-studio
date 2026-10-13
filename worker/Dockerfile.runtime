@@ -59,11 +59,14 @@ ENV PYTHONUNBUFFERED=1 \
     LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64 \
     PATH=/usr/local/nvidia/bin:${PATH}
 
-# 1. tcmalloc (preloaded by boot.py, like upstream start.sh). Nothing else from
-#    apt: no git (ComfyUI comes as a tarball), no compilers, no ffmpeg (PyAV
-#    wheels bundle their own), no libGL (only ComfyUI nodes we don't use need it).
+# 1. tcmalloc (preloaded by boot.py, like upstream start.sh), and a C compiler:
+#    vLLM (step 4c) builds Triton kernels at startup, and Triton compiles its
+#    launcher with cc (without it: "InductorError: Failed to find C compiler",
+#    first pod boot 2026-10-13). Nothing else from apt: no git (ComfyUI comes as
+#    a tarball), no ffmpeg (PyAV wheels bundle their own), no libGL (only
+#    ComfyUI nodes we don't use need it).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libtcmalloc-minimal4 \
+    && apt-get install -y --no-install-recommends libtcmalloc-minimal4 gcc libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. ComfyUI source at the tag, verified against the expected commit (GitHub
@@ -177,6 +180,12 @@ system = subprocess.run(
 print("system: torch", system[0], "transformers", system[1])
 assert system[0] == torch.__file__, f"venv torch {torch.__file__} is not the system's {system[0]}"
 assert int(system[1].split(".")[0]) < 5, f"system transformers became {system[1]}"
+# Triton's launcher build needs a C compiler and Python's headers at runtime.
+import shutil, sysconfig
+assert shutil.which("cc") or shutil.which("gcc"), "no C compiler (Triton needs one)"
+inc = sysconfig.get_paths()["include"]
+assert os.path.isfile(os.path.join(inc, "Python.h")), f"no Python.h in {inc}"
+print("cc", shutil.which("cc") or shutil.which("gcc"), "Python.h in", inc)
 EOF
 
 # 5. Smoke tests on CPU (no GPU at build time): the version is right, ComfyUI
