@@ -512,7 +512,8 @@ pub async fn plan_story(core: &Arc<Core>, story_id: &str) -> Result<StoryView, S
     }
     let base = core.settings.llm_base_url();
     let model = resolve_llm_model(&base, &core.settings.llm_model()).await?;
-    let out = planner::plan(&base, &model, &view.story, &view.cast).await?;
+    let out = planner::plan_with_progress(&base, &model, &view.story, &view.cast,
+        &|p| core.sink.story_plan_progress(story_id, p)).await?;
     // A vault story whose vault locked meanwhile can't take the plan (it was only in memory).
     let mid_plan = |e: String| {
         if e.starts_with(ERR_LOCKED) {

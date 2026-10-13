@@ -50,6 +50,9 @@ impl state::EventSink for TauriSink {
     fn vault_migration(&self, p: &vault_migrate::MigrationProgress) {
         let _ = self.0.emit(state::EVENT_VAULT_MIGRATION, p);
     }
+    fn story_plan_progress(&self, story_id: &str, p: &stories::planner::PlanProgress) {
+        let _ = self.0.emit(state::EVENT_STORY_PLAN, serde_json::json!({"storyId": story_id, "progress": p}));
+    }
 }
 
 /// `vault://<uuid>.<ext>`: decrypted bytes from memory, with Range support,

@@ -532,6 +532,21 @@ export interface EventMap {
   "vault-update": VaultStatus;
   /** Migration of the pre-v6 content into the vault (on create, or resumed on unlock). */
   "vault-migration": MigrationProgress;
+  /** The LLM is writing a story plan (streamed; several per second). */
+  "story-plan-progress": { storyId: string; progress: PlanProgress };
+}
+
+/** Where a story plan stands while the LLM writes it. */
+export interface PlanProgress {
+  attempt: number;
+  maxAttempts: number;
+  /** Streamed so far in this attempt (≈ tokens). */
+  tokens: number;
+  /** A typical full plan for the target length. */
+  expectedTokens: number;
+  elapsedS: number;
+  /** "waiting" while the prompt is processed, then "writing". */
+  phase: "waiting" | "writing";
 }
 
 export const isTaskActive = (t: Task | null | undefined): t is Task =>

@@ -23,6 +23,7 @@ pub const EVENT_STATUS: &str = "status-update";
 pub const EVENT_GPU: &str = "gpu-update";
 pub const EVENT_VAULT: &str = "vault-update";
 pub const EVENT_VAULT_MIGRATION: &str = "vault-migration";
+pub const EVENT_STORY_PLAN: &str = "story-plan-progress";
 
 pub trait EventSink: Send + Sync {
     fn job_update(&self, job: &Job);
@@ -31,6 +32,8 @@ pub trait EventSink: Send + Sync {
     fn gpu_update(&self, _gpu: &GpuState) {}
     fn vault_update(&self, _status: &VaultStatus) {}
     fn vault_migration(&self, _progress: &MigrationProgress) {}
+    /// The local LLM is writing a story plan (streamed).
+    fn story_plan_progress(&self, _story_id: &str, _progress: &crate::stories::planner::PlanProgress) {}
 }
 
 /// Injectable wall clock (tests drive the idle auto-stop with it).

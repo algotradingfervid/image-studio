@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import * as api from "../../../api";
-import type { Character, Destination, LlmStatus, Story } from "../../../api";
+import type { Character, Destination, LlmStatus, PlanProgress, Story } from "../../../api";
 import { Dialog } from "../../../components/Dialog";
 import { Icon } from "../../../components/Icon";
 import { radioKeys } from "../../../components/radio";
@@ -41,6 +41,18 @@ function storyLabel(s: Story): string {
 
 /** Picker entry (an <option> holds text only, so the vault mark is a word). */
 const optionLabel = (s: Story) => (s.vault ? `Vault · ${storyLabel(s)}` : storyLabel(s));
+
+const clock = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+
+/** "Attempt 1 of 3 · writing 1,840 of ~4,600 tokens · 1:42" */
+function progressLine(p: PlanProgress | null, elapsedS: number): string {
+  const attempt = p && p.maxAttempts > 1 && p.attempt > 1 ? `Attempt ${p.attempt} of ${p.maxAttempts} · ` : "";
+  const what =
+    !p || p.phase === "waiting"
+      ? "reading the brief"
+      : `writing ${p.tokens.toLocaleString()} of ~${p.expectedTokens.toLocaleString()} tokens`;
+  return `${attempt}${what} · ${clock(elapsedS)}`;
+}
 
 const fieldsOf = (s: Story): Fields => ({ brief: s.brief, targetS: s.targetS, aspect: s.aspect, style: s.style, cast: s.cast });
 
@@ -352,6 +364,23 @@ export function StoriesPanel({
 
   // ---------- plan ----------
   const [planning, setPlanning] = useState(false);
+  const [progress, setProgress] = useState<PlanProgress | null>(null);
+  const [planStarted, setPlanStarted] = useState(0);
+  const [now, setNow] = useState(0);
+  /** The last plan's failure, kept on screen until the next plan or dismissed (a toast is easy to miss). */
+  const [planError, setPlanError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!planning) return;
+    let unlisten: (() => void) | undefined;
+    let gone = false;
+    void api.onEvent("story-plan-progress", (e) => setProgress(e.progress)).then((u) => (gone ? u() : (unlisten = u)));
+    const tick = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => {
+      gone = true;
+      unlisten?.();
+      window.clearInterval(tick);
+    };
+  }, [planning]);
   const [confirmReplan, setConfirmReplan] = useState(false);
   const blockers = [
     lockedSel ? "Unlock the vault to continue" : "",
@@ -362,6 +391,10 @@ export function StoriesPanel({
 
   const runPlan = async () => {
     setConfirmReplan(false);
+    setPlanError(null);
+    setProgress(null);
+    setPlanStarted(Date.now());
+    setNow(Date.now());
     setPlanning(true);
     // The workspace goes read-only first, so no edit starts after its flush below.
     onPlanningChange?.(true);
@@ -387,6 +420,7 @@ export function StoriesPanel({
       // VAULT_LOCKED (locked before or while planning): the sentence without its code, and Unlock.
       const locked = api.errorCode(e) === "VAULT_LOCKED";
       const msg = api.errorMessage(e).replace(/^VAULT_LOCKED: /, "");
+      if (!locked) setPlanError(msg);
       toast.notify({
         kind: "error",
         title: "Couldn't plan the story",
@@ -398,6 +432,7 @@ export function StoriesPanel({
       void checkLlm();
     } finally {
       setPlanning(false);
+      setProgress(null);
       onPlanningChange?.(false);
     }
   };
@@ -758,6 +793,26 @@ export function StoriesPanel({
               <kbd>↵</kbd>
             </span>
           </button>
+          {planning && (
+            <div className="story-plan-progress" role="status">
+              <span>{progressLine(progress, Math.max(0, Math.round((now - planStarted) / 1000)))}</span>
+              <progress
+                max={progress?.expectedTokens || 1}
+                value={progress?.phase === "writing" ? Math.min(progress.tokens, progress.expectedTokens) : undefined}
+                aria-label="Plan progress"
+              />
+            </div>
+          )}
+          {!planning && planError && (
+            <div className="notice notice--inline story-plan-error" role="alert">
+              <span>
+                <strong>Last plan failed:</strong> {planError}
+              </span>
+              <button type="button" className="link-btn" onClick={() => setPlanError(null)}>
+                Dismiss
+              </button>
+            </div>
+          )}
           <p id={`${id}-plan-hint`} className={`hint panel__hint ${blocked || plannerDown ? "panel__hint--block" : ""}`} aria-live="polite">
             {blocked ? `${blockers.join(" · ")}.` : null}
             {blocked ? " " : null}

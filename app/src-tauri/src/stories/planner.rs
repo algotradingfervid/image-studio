@@ -5,10 +5,40 @@ use std::time::Duration;
 pub const LM_STUDIO_HINT: &str = "Could not reach the local LLM. Start LM Studio's server (Developer → Start server, or `lms server start`) and load a model.";
 const MAX_ATTEMPTS: u32 = 3;
 const TEMPERATURE: f64 = 0.6;
-const MAX_TOKENS: u32 = 6000; // a runaway think block fails in seconds, not minutes
+/// A written plan runs about 40 tokens per second of film (50–120 word actions, dialogue,
+/// setting, camera, sound, JSON). The cap leaves ~1.6x headroom over that.
+const TOKENS_PER_FILM_S: u32 = 40;
+const CAP_PER_FILM_S: u32 = 65;
+const MIN_CAP: u32 = 4000;
+const MAX_CAP: u32 = 14000;
 /// Qwen3-style templates in LM Studio ignore `enable_thinking=false`; an empty think block as an assistant prefill really turns thinking off.
 const THINK_PREFILL: &str = "<think>\n\n</think>\n\n";
-const TIMEOUT: Duration = Duration::from_secs(600); // a 27B model can take minutes
+/// Longest silence tolerated: before the first token (prompt processing) and between tokens.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Progress events are throttled to this interval.
+const PROGRESS_EVERY: Duration = Duration::from_millis(400);
+
+/// `max_tokens` for a story of `target_s` seconds.
+pub fn max_tokens_for(target_s: u32) -> u32 {
+    target_s.saturating_mul(CAP_PER_FILM_S).clamp(MIN_CAP, MAX_CAP)
+}
+
+/// Where a plan stands, emitted while the LLM writes it.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanProgress {
+    pub attempt: u32,
+    pub max_attempts: u32,
+    /// Streamed chunks so far in this attempt (≈ tokens).
+    pub tokens: u32,
+    /// A typical full plan for the target length, for a progress bar.
+    pub expected_tokens: u32,
+    pub elapsed_s: u32,
+    /// "waiting" (prompt processing) or "writing".
+    pub phase: &'static str,
+}
+
+struct Reply { content: String, truncated: bool, tokens: u32 }
 
 #[derive(Debug, Clone)]
 pub struct PlanOutcome { pub title: String, pub logline: String, pub voices: Vec<Voice>, pub shots: Vec<Shot>, pub issues: Vec<Issue>, pub attempts: u32 }
@@ -196,24 +226,77 @@ fn to_voices(v: &Value, cast: &[Character], issues: &mut Vec<Issue>) -> Vec<Voic
     out
 }
 
-async fn chat(http: &reqwest::Client, base_url: &str, body: &Value) -> Result<Result<String, String>, String> {
-    // Outer Err = transport failure (LM Studio not reachable); inner Err = HTTP error body.
-    let resp = http.post(format!("{base_url}/chat/completions")).json(body).send().await
+/// One chat completion, streamed. Outer Err = transport failure (LLM not reachable or silent);
+/// inner Err = HTTP error body. A server that ignores `stream` and answers with plain JSON works too.
+async fn chat(http: &reqwest::Client, base_url: &str, body: &Value, started: std::time::Instant,
+              progress: &mut (dyn FnMut(u32, &'static str) + Send)) -> Result<Result<Reply, String>, String> {
+    let send = http.post(format!("{base_url}/chat/completions")).json(body).send();
+    let mut resp = tokio::time::timeout(IDLE_TIMEOUT, send).await
+        .map_err(|_| "The local LLM did not start answering in time".to_string())?
         .map_err(|_| LM_STUDIO_HINT.to_string())?;
     let status = resp.status().as_u16();
-    let v: Value = resp.json().await.unwrap_or(Value::Null);
-    if status >= 400 {
-        return Ok(Err(v.to_string()));
+    let sse = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|t| t.contains("text/event-stream"));
+    if status >= 400 || !sse {
+        let v: Value = resp.json().await.unwrap_or(Value::Null);
+        if status >= 400 {
+            return Ok(Err(v.to_string()));
+        }
+        // Some servers put the whole answer in `reasoning_content` and leave `content` empty.
+        let field = |k: &str| v.pointer(&format!("/choices/0/message/{k}")).and_then(Value::as_str).filter(|s| !s.trim().is_empty());
+        let content = field("content").or_else(|| field("reasoning_content")).map(String::from)
+            .or_else(|| v.pointer("/choices/0/message/content").and_then(Value::as_str).map(String::from))
+            .ok_or_else(|| "The planner returned no message".to_string())?;
+        let truncated = v.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("length");
+        let tokens = v.pointer("/usage/completion_tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
+        return Ok(Ok(Reply { content, truncated, tokens }));
     }
-    // Some servers put the whole answer in `reasoning_content` and leave `content` empty.
-    let field = |k: &str| v.pointer(&format!("/choices/0/message/{k}")).and_then(Value::as_str).filter(|s| !s.trim().is_empty());
-    Ok(field("content").or_else(|| field("reasoning_content")).map(String::from)
-        .or_else(|| v.pointer("/choices/0/message/content").and_then(Value::as_str).map(String::from))
-        .ok_or_else(|| "The planner returned no message".to_string()))
+    let (mut buf, mut content, mut reasoning) = (Vec::<u8>::new(), String::new(), String::new());
+    let (mut finish, mut tokens, mut last_emit) = (None::<String>, 0u32, started);
+    'stream: loop {
+        let chunk = tokio::time::timeout(IDLE_TIMEOUT, resp.chunk()).await
+            .map_err(|_| "The local LLM stopped answering".to_string())?
+            .map_err(|e| format!("The connection to the local LLM dropped: {e}"))?;
+        let Some(chunk) = chunk else { break };
+        buf.extend_from_slice(&chunk);
+        while let Some(i) = buf.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&buf[..i]).trim().to_string();
+            buf.drain(..=i);
+            let Some(data) = line.strip_prefix("data:").map(str::trim) else { continue };
+            if data == "[DONE]" { break 'stream; }
+            let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
+            if let Some(e) = v.get("error") { return Ok(Err(e.to_string())); }
+            if let Some(f) = v.pointer("/choices/0/finish_reason").and_then(Value::as_str) { finish = Some(f.to_string()); }
+            if let Some(t) = v.pointer("/choices/0/delta/content").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+                content.push_str(t);
+                tokens += 1;
+            } else if let Some(t) = v.pointer("/choices/0/delta/reasoning_content").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+                reasoning.push_str(t);
+                tokens += 1;
+            }
+            if let Some(u) = v.pointer("/usage/completion_tokens").and_then(Value::as_u64) { tokens = tokens.max(u as u32); }
+            if last_emit.elapsed() >= PROGRESS_EVERY {
+                last_emit = std::time::Instant::now();
+                progress(tokens, "writing");
+            }
+        }
+    }
+    progress(tokens, "writing");
+    let content = if content.trim().is_empty() { reasoning } else { content };
+    if content.trim().is_empty() { return Err("The planner returned no message".into()); }
+    Ok(Ok(Reply { content, truncated: finish.as_deref() == Some("length"), tokens }))
 }
 
 pub async fn plan(base_url: &str, model: &str, story: &Story, cast: &[Character]) -> Result<PlanOutcome, String> {
-    let http = reqwest::Client::builder().timeout(TIMEOUT).build().map_err(|e| e.to_string())?;
+    plan_with_progress(base_url, model, story, cast, &|_| {}).await
+}
+
+/// Plans the story, reporting `PlanProgress` as the reply streams in.
+pub async fn plan_with_progress(base_url: &str, model: &str, story: &Story, cast: &[Character],
+                                on_progress: &(dyn Fn(&PlanProgress) + Send + Sync)) -> Result<PlanOutcome, String> {
+    let http = reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).build().map_err(|e| e.to_string())?;
+    let max_tokens = max_tokens_for(story.target_s);
+    let expected_tokens = story.target_s.saturating_mul(TOKENS_PER_FILM_S).min(max_tokens);
+    let started = std::time::Instant::now();
     let mut messages = vec![json!({"role": "system", "content": system_prompt(story, cast)}),
                             json!({"role": "user", "content": user_prompt(story)})];
     let mut structured = true;
@@ -224,16 +307,28 @@ pub async fn plan(base_url: &str, model: &str, story: &Story, cast: &[Character]
         attempt += 1;
         let mut sent = messages.clone();
         sent.push(json!({"role": "assistant", "content": THINK_PREFILL}));
-        let mut body = json!({"model": model, "messages": sent, "temperature": TEMPERATURE, "max_tokens": MAX_TOKENS,
+        let mut body = json!({"model": model, "messages": sent, "temperature": TEMPERATURE, "max_tokens": max_tokens, "stream": true,
             "chat_template_kwargs": {"enable_thinking": false}});
         if structured {
             body["response_format"] = json!({"type": "json_schema", "json_schema": {"name": "story_plan", "strict": true, "schema": schema()}});
         }
-        let content = match chat(&http, base_url, &body).await? {
-            Ok(c) => c,
+        let report = |tokens: u32, phase: &'static str| on_progress(&PlanProgress {
+            attempt, max_attempts: MAX_ATTEMPTS, tokens, expected_tokens, elapsed_s: started.elapsed().as_secs() as u32, phase });
+        report(0, "waiting");
+        let mut report = report;
+        let reply = match chat(&http, base_url, &body, started, &mut report).await? {
+            Ok(r) => r,
             Err(err) if structured && err.contains("response_format") => { structured = false; attempt -= 1; continue; }
             Err(err) => return Err(format!("The local LLM returned an error: {err}")),
         };
+        if reply.truncated {
+            // A cut-off plan is not valid JSON, and retrying only replays the same long reply: keep an earlier
+            // attempt if there is one, otherwise say why it failed.
+            if best.is_some() { break; }
+            return Err(format!("The plan was cut off after {} tokens (limit {max_tokens}) — the story is too long for one reply. \
+                Shorten the target length or split the brief into two stories.", reply.tokens));
+        }
+        let content = reply.content;
         let mut issues = Vec::new();
         let (title, logline, voices, shots) = match parse_reply(&content) {
             Ok(v) => {

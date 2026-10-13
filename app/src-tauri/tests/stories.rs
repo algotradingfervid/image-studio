@@ -922,7 +922,8 @@ async fn every_request_ends_with_empty_think_prefill_and_sets_max_tokens() {
         let last = b["messages"].as_array().unwrap().last().unwrap().clone();
         assert_eq!(last["role"], "assistant");
         assert_eq!(last["content"], PREFILL);
-        assert_eq!(b["max_tokens"], 6000);
+        assert_eq!(b["max_tokens"], 4000);
+        assert_eq!(b["stream"], true);
         assert_eq!(b["chat_template_kwargs"]["enable_thinking"], false);
     }
     // The repair follow-up keeps the user's fix request before the prefill.
@@ -1316,4 +1317,41 @@ mod repo_tests {
         let st = repo::get_story(&core, &story.id).unwrap().unwrap();
         assert_eq!((st.status.as_str(), st.title.as_str()), ("draft", "Light Packing"));
     }
+}
+
+#[test]
+fn max_tokens_scales_with_target_length() {
+    assert_eq!(planner::max_tokens_for(30), 4000);
+    assert_eq!(planner::max_tokens_for(180), 11700);
+    assert_eq!(planner::max_tokens_for(600), 14000);
+}
+
+#[tokio::test]
+async fn a_cut_off_plan_is_not_retried_and_says_why() {
+    let s = MockServer::start().await;
+    let t = ResponseTemplate::new(200).set_body_json(json!({"choices": [{"message": {"role": "assistant", "content": "{\"title\": \"x\", \"shots\": [{"},
+        "finish_reason": "length"}], "usage": {"completion_tokens": 4000}}));
+    Mock::given(method("POST")).and(path("/v1/chat/completions")).respond_with(t).mount(&s).await;
+    let err = planner::plan(&format!("{}/v1", s.uri()), "m", &st(10), &[mara()]).await.unwrap_err();
+    assert!(err.contains("cut off after 4000 tokens") && err.contains("Shorten the target"), "{err}");
+    assert_eq!(s.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_streamed_reply_is_assembled_and_reports_progress() {
+    let s = MockServer::start().await;
+    let plan = good_plan(10);
+    let (a, b) = plan.split_at(plan.len() / 2);
+    let sse = format!("data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"choices": [{"delta": {"content": a}}]}), json!({"choices": [{"delta": {"content": b}}]}),
+        json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}));
+    let t = ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream");
+    Mock::given(method("POST")).and(path("/v1/chat/completions")).respond_with(t).mount(&s).await;
+    let seen = std::sync::Mutex::new(Vec::new());
+    let out = planner::plan_with_progress(&format!("{}/v1", s.uri()), "m", &st(10), &[mara()],
+        &|p| seen.lock().unwrap().push((p.attempt, p.tokens, p.phase))).await.unwrap();
+    assert!(out.issues.is_empty(), "{:?}", out.issues);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.first(), Some(&(1, 0, "waiting")));
+    assert_eq!(seen.last(), Some(&(1, 2, "writing")));
 }

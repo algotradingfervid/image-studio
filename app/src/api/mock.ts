@@ -1816,7 +1816,13 @@ const storyCommands: Record<string, Handler> = {
     if (!story.brief.trim()) throw new Error("Write a brief first");
     refuseRendering(storyShots(story.id));
     // ?planMs= stretches the fake LLM call (to exercise edits made while planning).
-    await sleep(Number(params.get("planMs")) || 1500);
+    const planMs = Number(params.get("planMs")) || 1500;
+    const expectedTokens = story.targetS * 40;
+    for (let i = 0; i <= 10; i++) {
+      const phase = i === 0 ? "waiting" : "writing";
+      emit("story-plan-progress", { storyId: story.id, progress: { attempt: 1, maxAttempts: 3, tokens: Math.round((expectedTokens * i) / 10), expectedTokens, elapsedS: Math.round((planMs * i) / 10000), phase } });
+      await sleep(planMs / 11);
+    }
     if (llmDown) throw new Error(LM_STUDIO_HINT);
     refuseRendering(storyShots(story.id));
     // The plan was only in memory: a vault that locked meanwhile loses it.
