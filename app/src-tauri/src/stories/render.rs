@@ -9,8 +9,8 @@ use crate::db::{ImageRecord, KIND_VIDEO};
 use crate::jobs::{self, Destination, VideoRequest};
 use crate::state::Core;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 const VIDEO_MODEL: &str = "h3ref";
 const FPS: f64 = 24.0;
@@ -47,19 +47,11 @@ pub fn story_view(core: &Core, story_id: &str) -> Result<StoryView, String> {
     Ok(StoryView { story, cast, shots, takes, issues })
 }
 
-fn take_path(core: &Core, take_id: &str) -> Result<PathBuf, String> {
-    let rec = core
-        .db
-        .lock()
-        .unwrap()
-        .get_image(take_id)?
-        .ok_or("The approved take's video is missing")?;
-    let p = PathBuf::from(&rec.path);
-    if p.is_file() {
-        Ok(p)
-    } else {
-        Err("The approved take's video file is missing".into())
-    }
+/// The approved take's video bytes (General: the file; vault: Task 7).
+fn take_bytes(core: &Core, take_id: &str) -> Result<(ImageRecord, Zeroizing<Vec<u8>>), String> {
+    let rec = core.db.lock().unwrap().get_image(take_id)?.ok_or("The approved take's video is missing")?;
+    let bytes = std::fs::read(&rec.path).map_err(|_| "The approved take's video file is missing".to_string())?;
+    Ok((rec, Zeroizing::new(bytes)))
 }
 
 /// Whether a story render of `shot_id` is still running. Entries whose job has
@@ -142,13 +134,10 @@ pub fn render_shot(core: &Arc<Core>, shot_id: &str) -> Result<String, String> {
             .as_deref()
             .ok_or_else(|| format!("Approve shot {} first", prev.position))?;
         let ff = ffmpeg::find_ffmpeg()?;
-        let dir = core.cfg.data_dir.join("stories-tmp");
-        std::fs::create_dir_all(&dir).map_err(|e| format!("Could not create a temporary folder: {e}"))?;
-        let png = dir.join(format!("{}.png", uuid::Uuid::new_v4()));
-        let frame = ffmpeg::last_frame_png(&ff, &take_path(core, take)?, &png)
-            .and_then(|_| std::fs::read(&png).map_err(|e| format!("Could not read the last frame: {e}")));
-        let _ = std::fs::remove_file(&png);
-        init_image_id = Some(crate::references::import_bytes(&core.cfg.references_dir(), &frame?)?.ref_id);
+        let (prev_rec, bytes) = take_bytes(core, take)?;
+        let frame = ffmpeg::last_frame_png(&ff, &bytes, prev_rec.width, prev_rec.height)
+            .map_err(|e| format!("Could not read the last frame of shot {}: {e}", prev.position))?;
+        init_image_id = Some(crate::references::import_bytes(&core.cfg.references_dir(), &frame)?.ref_id);
     }
     // A continuing shot's first frame is also the last reference (`<Picture M>` in the prompt)
     // and stays the worker's frame-0 guide (`initImage`).
@@ -250,24 +239,28 @@ pub fn assemble_story(core: &Core, story_id: &str) -> Result<ImageRecord, String
     if view.shots.is_empty() {
         return Err("The story has no shots".into());
     }
-    let mut inputs = Vec::new();
+    let mut inputs: Vec<Zeroizing<Vec<u8>>> = Vec::new();
     for s in &view.shots {
         let take = s
             .approved_take_id
             .as_deref()
             .ok_or_else(|| format!("Approve a take for shot {} first", s.position))?;
-        inputs.push(take_path(core, take)?);
+        inputs.push(take_bytes(core, take)?.1);
     }
     let ff = ffmpeg::find_ffmpeg()?;
+    let film = Zeroizing::new(ffmpeg::assemble(&ff, &inputs.iter().map(|b| b.as_slice()).collect::<Vec<_>>())?);
+    drop(inputs);
+    let poster_jpg = Zeroizing::new(ffmpeg::first_frame_jpg(&ff, &film)?);
+    // General store: the film and its poster are files under `videos/`.
     let dir = core.cfg.videos_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("Could not create the videos folder: {e}"))?;
     let id = uuid::Uuid::new_v4().to_string();
     let out = dir.join(format!("{id}.mp4"));
-    ffmpeg::assemble(&ff, &inputs, &out)?;
     let poster = dir.join(format!("{id}.jpg"));
-    if let Err(e) = ffmpeg::first_frame_jpg(&ff, &out, &poster) {
+    std::fs::write(&out, &*film).map_err(|e| format!("Could not save the story video: {e}"))?;
+    if let Err(e) = std::fs::write(&poster, &*poster_jpg) {
         let _ = std::fs::remove_file(&out);
-        return Err(e);
+        return Err(format!("Could not save the story poster: {e}"));
     }
     let first_take = view.shots[0].approved_take_id.as_deref().unwrap_or_default();
     let first = view

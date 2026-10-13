@@ -122,6 +122,8 @@ impl Core {
             std::fs::create_dir_all(&d)
                 .map_err(|e| format!("Could not create {}: {e}", d.display()))?;
         }
+        // Story frames once went through here; ffmpeg is fed over pipes now (`stories::ffmpeg`).
+        let _ = std::fs::remove_dir_all(cfg.data_dir.join("stories-tmp"));
         let gpu = Gpu::new(settings.idle_minutes(), (cfg.clock)());
         let vault = Vault::new(cfg.vault_dir(), settings.vault_auto_lock_minutes());
         Ok(Arc::new(Core {

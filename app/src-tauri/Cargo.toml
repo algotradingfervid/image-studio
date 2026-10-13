@@ -43,6 +43,8 @@ hkdf = "=0.12.4"
 sha2 = "=0.10.9"
 rand_core = { version = "=0.6.4", features = ["getrandom"] }
 zeroize = { version = "=1.9.1", features = ["zeroize_derive"] }
+# stories/ffmpeg.rs: anonymous pipes (pipe/fcntl/dup2/close) so ffmpeg never sees a plaintext file.
+libc = "0.2"
 
 # macOS sleep / screen-lock / session hooks that lock the vault (spec v6).
 # Same versions Tauri already pulls in (see Cargo.lock).

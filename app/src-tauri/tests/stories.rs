@@ -373,7 +373,8 @@ mod render_harness {
             .respond_with(ok(json!({"ready": true, "jobs": {}, "workers": {"idle": 1, "running": 0}})))
             .mount(&server).await;
         let b64 = base64::engine::general_purpose::STANDARD.encode(clip_bytes());
-        mount_pod_job(&server, "vid1", json!({"video": {"base64": b64, "mime": "video/mp4"}})).await;
+        // Like the worker, the pod reports the clip's real size (`clip_bytes` is 320x180).
+        mount_pod_job(&server, "vid1", json!({"video": {"base64": b64, "mime": "video/mp4", "width": 320, "height": 180}})).await;
 
         let dir = tempfile::tempdir().unwrap();
         let secrets = Arc::new(MemoryStore::default());
