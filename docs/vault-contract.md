@@ -86,3 +86,32 @@ thumbnails of jobs whose destination is `"vault"` (shows "Saved to vault").
   `destination: "vault"` in the first place avoids that copy entirely.
 - `vault-migration` always ends with a final event: `phase: "done"`, or `phase: "error"` with
   `error` set (interruption or failure). A `vault-update` follows in both cases.
+
+## Stories
+
+Design: `docs/superpowers/specs/2026-10-13-stories-vault-design.md` (§3.9 store rules, §8 copy).
+All additive; a missing `vault` reads as `false`.
+
+- **Types.** `Character.vault: boolean` (store chosen at creation, fixed after);
+  `Character.refPaths: string[]` (read-only display paths: `references/<id>.<ext>` for General,
+  `vault://localhost/…` for vault); `Story.vault: boolean`; `StoryView.result: ImageRecord | null`
+  (the assembled film: a General record, or a vault item with `vault: true`).
+- **`create_story`** `{ …, destination?: Destination }` (default `"general"`) fixes the story's
+  store. `"vault"`: `NO_VAULT` without a vault, `VAULT_LOCKED: Unlock the vault to create a vault
+  story` while locked. `save_character` uses `character.vault` the same way (new characters only;
+  `… to create a vault character`).
+- **`reveal_image { id }`** shows a General record in Finder; any other id fails with "Vault films
+  are exported, not shown in Finder". Vault films go through `export_image` (falls through to
+  `export_vault_item`, needs the unlocked vault).
+- **Locked vault.** `list_stories` / `list_characters` leave vault entries out. On a vault story or
+  character the commands fail with `VAULT_LOCKED: Unlock the vault to {what}` and change nothing:
+  `open this story` (`get_story`, edits, `save_shots`, `render_shot`, `render_story`,
+  `delete_story`), `open this character` (edit/delete), `plan the story`, `approve takes`,
+  `assemble the story`. A plan whose vault locks mid-call fails with `VAULT_LOCKED: The vault locked
+  while planning; unlock and plan again`. Deleting a General character while a vault exists and is
+  locked fails with "Unlock the vault first: a vault story may use this character". Renders already
+  running finish and are sealed as for any vault job (above).
+- **Story items stay out of the gallery.** Vault items carrying a `storyId` (takes and films) are
+  never in `list_vault_items` and never counted in `VaultStatus.itemCount`; General story rows are
+  likewise out of `list_images`. They are reached only through the story (`get_story`).
+- **Job label** of a vault story render is `Vault story · shot N` (never the title).

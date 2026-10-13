@@ -14,7 +14,7 @@ v1 is done when, in the real app:
 1. With 2 AI-generated characters, a 1-minute brief produces a validated shot list (4–10 shots)
    with no manual fixing in at least 4 of 5 tries (Qwen 3.8 27B uncensored via LM Studio).
 2. All shots render as H3 Character jobs, each reviewable with Approve / Reroll / Edit.
-3. Assemble produces one MP4 in the gallery with every approved shot in order,
+3. Assemble produces one MP4 (shown in the story's workspace) with every approved shot in order,
    dialogue audible, loudness normalized.
 4. The whole flow also runs in the browser mock (no GPU, no LLM) for UI work and review.
 
@@ -39,9 +39,9 @@ Same layout as the other two tabs:
 - **Right area**: the job list stays on top as today; below it, in place of the gallery while
   the Stories tab is active, the selected story's workspace — Plan (shot list) and Render &
   review (shot cards) — plus **Assemble**. Switching back to Image or Video shows the gallery
-  again. Assembled videos appear in the normal gallery.
-- v1 stories save to the general gallery only (Save-to is hidden on the Stories tab; vault
-  stories come later — takes and character images would otherwise need vault metadata).
+  again. Assembled videos stay in the story's workspace (not the gallery).
+- ~~v1 stories save to the general gallery only.~~ Superseded by
+  `2026-10-13-stories-vault-design.md` (vault stories and characters, Save-to on new stories).
   Character reference images come from import or the general gallery.
 
 The steps:
@@ -242,8 +242,8 @@ compiled prompt, reference list and seed are stored with each take.
   only after its previous shot has an approved take.
 - **First task of the build is a GPU spike (~$1):** does ref2va honour the frame-0 guide?
   If not, "Continues previous" is hidden and every shot is a cut; nothing else changes.
-- Takes are stored as video records with `story_id`/`shot_id` set and are hidden from the
-  normal gallery (shown only inside the story).
+- Takes are stored as video records with `story_id`/`shot_id` set and appear only in the
+  story's workspace (never in the Image/Video galleries or the Vault tab).
 
 ## 8. Assembly (Mac, ffmpeg)
 
@@ -253,8 +253,9 @@ compiled prompt, reference list and seed are stored with each take.
   (crf 18) + AAC 48 kHz stereo, `loudnorm=I=-14:TP=-1.5:LRA=11`, and `comment=AI-generated`
   metadata. (The installed Homebrew ffmpeg 8.1 has no `drawtext`, so a burned-in label is
   deferred.)
-- Result saved as a normal gallery video (kind video, `story_id` set, poster = first frame),
-  visible in the gallery; re-assembling replaces the story's previous result.
+- Result saved as a video record (kind video, `story_id` set, poster = first frame; a vault
+  story's is a sealed vault item), shown only in the story's workspace (Show in Finder for General,
+  Export…); re-assembling replaces the story's previous result.
 - A sidecar JSON (shots, prompts, seeds, character ids) is stored with the story record.
 
 ## 9. Data (SQLite, `db.rs` migrations)
@@ -268,7 +269,7 @@ compiled prompt, reference list and seed are stored with each take.
   dialogue_json, continuity, approved_take_id, sound)` (`dialogue_json` =
   `[{speaker, line, delivery}]`)
 - `images` gains nullable `story_id`, `shot_id` (takes and results); gallery queries exclude
-  rows with `shot_id` set.
+  rows with `story_id` set.
 - Character reference images use the existing references store (`refs_json` =
   reference ids, same as image jobs).
 
@@ -297,7 +298,7 @@ compiled prompt, reference list and seed are stored with each take.
 
 ## 12. Out of scope (later, in this order of likely value)
 
-Vault stories, burned-in AI label, voice references (`<Audio N>` per character: the
+Burned-in AI label (vault stories: see `2026-10-13-stories-vault-design.md`), voice references (`<Audio N>` per character: the
 strongest cross-shot voice consistency in MiniMax's guide; needs per-character audio upload
 and a worker audio input), draft/final tiers (turbo LoRA), face-similarity QC, full consent
 registry (releases, ID, revocation), H3 edit path, colour grading/LUT, music bed, multi-pass
