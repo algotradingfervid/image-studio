@@ -14,7 +14,7 @@ v1 is done when, in the real app:
 1. With 2 AI-generated characters, a 1-minute brief produces a validated shot list (4–10 shots)
    with no manual fixing in at least 4 of 5 tries (Qwen 3.8 27B uncensored via LM Studio).
 2. All shots render as H3 Character jobs, each reviewable with Approve / Reroll / Edit.
-3. Assemble produces one MP4 in the gallery (or vault) with every approved shot in order,
+3. Assemble produces one MP4 in the gallery with every approved shot in order,
    dialogue audible, loudness normalized.
 4. The whole flow also runs in the browser mock (no GPU, no LLM) for UI work and review.
 
@@ -24,7 +24,7 @@ v1 is done when, in the real app:
   Character descriptions, `<Picture N>` numbering, style and limits are filled in by code, so
   they cannot drift between shots (from the PDF).
 - **Reuse the app.** Stories is a Create tab beside Image and Video. Rendering goes through the existing job queue, H3 Character model
-  (`h3ref`), GPU start/stop/retry, paid-GPU confirmation, Save-to (gallery/vault) and gallery.
+  (`h3ref`), GPU start/stop/retry, paid-GPU confirmation and gallery.
 - **Adults only, always.** Hard rule in the planner prompt, the validator and the character form.
 - **Simple consent gate.** A character is `generated` (AI-made images) or `real_person`;
   a real person requires the owner to tick "I have this person's consent to use their likeness".
@@ -47,7 +47,7 @@ Same layout as the other two tabs:
 The steps:
 
 1. **Cast** — pick 1–2 characters for this story from the character library, or create one:
-   - name (unique), 1–3 reference images (import file / gallery / vault — same pickers as
+   - name (unique), 1–3 reference images (import file / general gallery — same pickers as
      Create references), locked description (one line, ≤ 200 chars, e.g. "woman in her 30s,
      short black hair, green bomber jacket"),
    - source: AI-generated / Real person (+ consent tick), and a required "This character is an
@@ -167,14 +167,14 @@ prompt, reference list and seed are stored with each take.
 ## 9. Data (SQLite, `db.rs` migrations)
 
 - `characters(id, name, description, source[generated|real_person], consent INTEGER,
-  adult INTEGER, refs_json, created_at, updated_at, vault INTEGER)`
-- `stories(id, title, logline, brief, target_s, aspect, style, cast_json, destination,
-  status, result_image_id, sidecar_json, created_at, updated_at)`
+  adult INTEGER, refs_json, created_at, updated_at)`
+- `stories(id, title, logline, brief, target_s, aspect, style, cast_json,
+  status, result_image_id, sidecar_json, created_at, updated_at)` (no destination column in v1)
 - `shots(id, story_id, position, duration_s, characters_json, setting, camera, action,
   dialogue_json, continuity, approved_take_id)`
 - `images` gains nullable `story_id`, `shot_id` (takes and results); gallery queries exclude
   rows with `shot_id` set.
-- Character reference images use the existing references store / vault blobs (`refs_json` =
+- Character reference images use the existing references store (`refs_json` =
   reference ids, same as image jobs).
 
 ## 10. Code layout
