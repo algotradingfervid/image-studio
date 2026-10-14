@@ -8,20 +8,19 @@ Bearer auth.
 
 LLMSupervisor, one background thread:
   1. downloading: the weights end up in /models-local/llm/<repo name> on the
-     container disk (vLLM loads with small reads, slow on the network volume).
-     The network volume keeps one copy in /runpod-volume/models/llm/<repo name>
-     so a new pod copies it (local_models.copy_file, parallel reads) instead
-     of downloading ~31 GB again:
+     container disk (vLLM loads with small reads, slow on the network volume):
        - local completion marker present -> nothing to do;
-       - volume copy complete -> copy it to the local disk;
        - otherwise huggingface_hub.snapshot_download of LLM_MODEL (HF_TOKEN)
-         onto the volume, then the copy.
-     No volume mounted, or too little room on it -> download straight to the
-     local disk as before. Too little local room, or the copy fails -> vLLM
-     serves from the volume copy. totalBytes comes from the Hub's file
-     metadata; downloadedBytes from the size of the directory being downloaded
-     into (in-flight files live under its .cache/huggingface/download/), or
-     the bytes copied so far.
+         straight to the local disk (31 GB in 27 s on the first pod boot);
+       - the Hub fails and the network volume has a complete copy in
+         /runpod-volume/models/llm/<repo name> -> copy that instead
+         (local_models.copy_file; 1362 s for the same 31 GB, the volume's
+         throughput being shared with the H3 copy); too little local room ->
+         vLLM serves from that volume copy.
+     Nothing new is written to the volume. totalBytes comes from the Hub's
+     file metadata; downloadedBytes from the size of the directory being
+     downloaded into (in-flight files live under its
+     .cache/huggingface/download/), or the bytes copied so far.
   2. starting: `/opt/vllm/bin/vllm serve <dir> ...` (vllm.entrypoints.cli.main,
      the console script of vLLM 0.24), its output prefixed "vllm | " in the pod
      log; GET http://127.0.0.1:8001/health is polled until it answers 200.
@@ -300,25 +299,31 @@ class LLMSupervisor:
                 self.total = self.downloaded = total
             log.info("planner LLM: %s already on local disk (%s)", self.repo, self.dir)
             return True
-        if self.store is None:
-            return self._fetch(self.dir)
-        total = self._complete(self.store)
-        if total is not None:
+        # Straight from the Hub to the local disk first: on the first pod boot
+        # (2026-10-13) the 31 GB download took 27 s, while copying the volume copy
+        # to the local disk took 1362 s (the network volume, shared with the H3
+        # copy, is the bottleneck). The volume copy is only the fallback.
+        vol_total = self._complete(self.store) if self.store is not None else None
+        fetched = self._fetch(self.dir, fall_back=vol_total is not None)
+        if fetched:
+            return True
+        if vol_total is None:
+            return False
+        self._set(DOWNLOADING)
+        if fetched is None:  # no room on the local disk
+            log.warning("planner LLM: serving %s from the volume copy (%s)", self.repo, self.store)
+            self.serve_dir = self.store
             with self.lock:
-                self.total = total
-            log.info("planner LLM: %s found on the volume (%s)", self.repo, self.store)
-        else:
-            fetched = self._fetch(self.store, fall_back=True)
-            if fetched is None:  # no room on the volume
-                return self._fetch(self.dir)
-            if not fetched:
-                return False
+                self.total = self.downloaded = vol_total
+            return True
+        log.warning("planner LLM: Hub download failed; copying the volume copy instead")
         self._copy_local()
         return True
 
     def _fetch(self, dest: Path, fall_back: bool = False) -> bool | None:
         """Downloads the repo into `dest` and marks it complete. False after a
-        failure; None (nothing failed) when `fall_back` and `dest` lacks room."""
+        failure (only logged when `fall_back`: the caller has another source);
+        None (nothing failed) when `fall_back` and `dest` lacks room."""
         t0 = self.clock()
         try:
             total = int(self.total_bytes(self.repo, self.token))
@@ -331,8 +336,7 @@ class LLMSupervisor:
                 msg = (f"not enough disk space for {self.repo}: {need / 1e9:.1f} GB "
                        f"needed, {free / 1e9:.1f} GB free")
                 if fall_back:
-                    log.warning("planner LLM: %s on the volume; downloading to the local "
-                                "disk instead", msg)
+                    log.warning("planner LLM: %s on the local disk", msg)
                     return None
                 self._fail(msg)
                 return False
@@ -342,8 +346,11 @@ class LLMSupervisor:
             self.download(self.repo, dest, self.token)
         except Exception as exc:
             msg = str(exc).strip().splitlines()[0][:300] if str(exc).strip() else ""
-            self._fail(f"download of {self.repo} failed: {type(exc).__name__}"
-                       + (f": {msg}" if msg else ""))
+            err = f"download of {self.repo} failed: {type(exc).__name__}" + (f": {msg}" if msg else "")
+            if fall_back:
+                log.warning("planner LLM: %s", err)
+            else:
+                self._fail(err)
             return False
         with self.lock:
             self.downloaded = self.total

@@ -327,7 +327,12 @@ happens and `/health` reports `llm.state: "off"`.
    Hub's file sizes, `downloadedBytes` the size of that directory on disk (in-flight
    files sit under its `.cache/huggingface/download/`). It first checks free disk space
    (2 GiB kept spare). A finished download writes `.image-studio-complete`; a later
-   start of the same container skips the download.
+   start of the same container skips the download. Each new pod downloads again: the
+   Hub is far faster than the network volume (31 GB in 27 s on the first boot, against
+   1362 s to copy the same files off the volume while H3 was copying too). Only when
+   the Hub fails, and `/runpod-volume/models/llm/<repo name>` holds a complete copy,
+   is that copied instead (or served directly when the local disk lacks room).
+   Nothing new is written to the volume.
 2. **starting**: waits (at most 5 min) for the boot CUDA probe (`cuda_info`) to end,
    because vLLM's memory profiling asserts that no other process frees GPU memory
    while it runs, then runs, with `PYTHONPATH` removed so the worker's modules can't

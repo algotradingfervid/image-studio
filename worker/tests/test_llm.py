@@ -167,38 +167,57 @@ def vllm_dir(rec):
     return Path(cmd[2])
 
 
-def test_volume_store_download_then_copy(tmp_path):
-    sup, rec, proc, clock = make_sup(tmp_path, store=tmp_path / "vol")
-    threading.Thread(target=sup.run, daemon=True).start()
-    wait_for(lambda: sup.ready())
-    assert rec["download"] == 1
-    # downloaded onto the volume (HF cache not copied), copied to the local disk
-    assert (sup.store / "model.safetensors").read_bytes() == b"x" * 1000
-    assert (sup.dir / "model.safetensors").read_bytes() == b"x" * 1000
-    for d in (sup.store, sup.dir):
-        assert json.loads((d / llm.COMPLETE_MARKER).read_text())["repo"] == sup.repo
-    assert vllm_dir(rec) == sup.dir
-    assert sup.status()["downloadedBytes"] == 1000 == sup.status()["totalBytes"]
-    sup.stop()
-
-
-def test_volume_store_reused_without_download(tmp_path):
+def volume_copy(tmp_path, size=600):
+    """A complete volume copy of the repo (with HF cache junk that must not be copied)."""
     vol = tmp_path / "vol" / "Qwen3.8-27B-Uncensored-FP8"
     (vol / "sub").mkdir(parents=True)
-    (vol / "model.safetensors").write_bytes(b"y" * 600)
+    (vol / "model.safetensors").write_bytes(b"y" * size)
     (vol / "sub" / "tokenizer.json").write_bytes(b"t" * 40)
     (vol / ".cache" / "huggingface").mkdir(parents=True)
     (vol / ".cache" / "huggingface" / "junk").write_bytes(b"j" * 99)
     (vol / llm.COMPLETE_MARKER).write_text(json.dumps(
-        {"repo": "orcarouter/Qwen3.8-27B-Uncensored-FP8", "totalBytes": 640}))
+        {"repo": "orcarouter/Qwen3.8-27B-Uncensored-FP8", "totalBytes": size + 40}))
+    return vol
+
+
+def hub_down(repo, dest, token):
+    raise ConnectionError("hub unreachable")
+
+
+def test_hub_first_even_with_a_volume_copy(tmp_path):
+    # 27 s from the Hub vs 1362 s from the volume on the first real boot.
+    vol = volume_copy(tmp_path)
     sup, rec, proc, clock = make_sup(tmp_path, store=tmp_path / "vol")
     threading.Thread(target=sup.run, daemon=True).start()
     wait_for(lambda: sup.ready())
-    assert rec["download"] == 0
+    assert rec["download"] == 1
+    assert (sup.dir / "model.safetensors").read_bytes() == b"x" * 1000
+    assert json.loads((sup.dir / llm.COMPLETE_MARKER).read_text())["repo"] == sup.repo
+    assert (vol / "model.safetensors").read_bytes() == b"y" * 600, "the volume copy is left alone"
+    assert vllm_dir(rec) == sup.dir
+    sup.stop()
+
+
+def test_nothing_is_written_to_the_volume(tmp_path):
+    sup, rec, proc, clock = make_sup(tmp_path, store=tmp_path / "vol")
+    threading.Thread(target=sup.run, daemon=True).start()
+    wait_for(lambda: sup.ready())
+    assert rec["download"] == 1 and vllm_dir(rec) == sup.dir
+    assert not (sup.store / "model.safetensors").exists()
+    sup.stop()
+
+
+def test_hub_failure_copies_the_volume_copy(tmp_path):
+    volume_copy(tmp_path)
+    sup, rec, proc, clock = make_sup(tmp_path, store=tmp_path / "vol", download=hub_down)
+    threading.Thread(target=sup.run, daemon=True).start()
+    wait_for(lambda: sup.ready())
+    assert rec["download"] == 1
     assert (sup.dir / "sub" / "tokenizer.json").read_bytes() == b"t" * 40
     assert not (sup.dir / ".cache").exists()
     assert vllm_dir(rec) == sup.dir
-    assert sup.status()["downloadedBytes"] == 640 == sup.status()["totalBytes"]
+    st = sup.status()
+    assert st["error"] is None and st["downloadedBytes"] == 640 == st["totalBytes"]
     sup.stop()
 
 
@@ -217,7 +236,9 @@ def test_volume_full_downloads_to_local_disk(tmp_path):
     sup.stop()
 
 
-def test_local_disk_full_serves_from_volume(tmp_path):
+def test_local_disk_full_serves_from_the_volume_copy(tmp_path):
+    volume_copy(tmp_path)
+
     def usage(p):
         return Usage(10 if (tmp_path / "vol") not in Path(p).parents else 10**15)
 
@@ -225,16 +246,18 @@ def test_local_disk_full_serves_from_volume(tmp_path):
     sup.disk_usage = usage
     threading.Thread(target=sup.run, daemon=True).start()
     wait_for(lambda: sup.ready())
+    assert rec["download"] == 0
     assert vllm_dir(rec) == sup.store
     assert not (sup.dir / llm.COMPLETE_MARKER).exists()
     sup.stop()
 
 
-def test_copy_failure_serves_from_volume(tmp_path):
+def test_hub_and_copy_failure_serve_from_the_volume_copy(tmp_path):
     def broken(src, dst, **kw):
         raise OSError("disk went away")
 
-    sup, rec, proc, clock = make_sup(tmp_path, store=tmp_path / "vol", copy=broken)
+    volume_copy(tmp_path)
+    sup, rec, proc, clock = make_sup(tmp_path, store=tmp_path / "vol", download=hub_down, copy=broken)
     threading.Thread(target=sup.run, daemon=True).start()
     wait_for(lambda: sup.ready())
     assert vllm_dir(rec) == sup.store and sup.status()["error"] is None
