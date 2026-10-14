@@ -95,7 +95,9 @@ def root_cause(line: str) -> str | None:
 # The model card's verified serve flags (vLLM 0.24.0), minus the ones we size
 # ourselves (utilization, max length, sequences). No --quantization: the FP8
 # scheme is read from config.json.
-SPECULATIVE_CONFIG = '{"method":"mtp","num_speculative_tokens":3}'
+# The MTP drafter picks its own attention backend (--attention-backend covers
+# only the target model): FlashInfer on Blackwell, which JIT-compiles with nvcc.
+SPECULATIVE_CONFIG = '{"method":"mtp","num_speculative_tokens":3,"attention_backend":"TRITON_ATTN"}'
 
 
 def off_status() -> dict:

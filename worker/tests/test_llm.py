@@ -285,7 +285,7 @@ def test_download_then_starting_then_ready(tmp_path):
         "--served-model-name", "qwen3.8-27b-uncensored",
         "--host", "127.0.0.1", "--port", "8001",
         "--language-model-only",
-        "--speculative-config", '{"method":"mtp","num_speculative_tokens":3}',
+        "--speculative-config", '{"method":"mtp","num_speculative_tokens":3,"attention_backend":"TRITON_ATTN"}',
         "--kv-cache-dtype", "fp8",
         "--gpu-memory-utilization", "0.46",
         "--max-model-len", "32768",
