@@ -293,6 +293,7 @@ def test_download_then_starting_then_ready(tmp_path):
         "--trust-remote-code",
         "--reasoning-parser", "qwen3",
         "--gdn-prefill-backend", "triton",
+        "--attention-backend", "TRITON_ATTN",
         "--disable-uvicorn-access-log"]
     assert "--quantization" not in cmd
     assert "PYTHONPATH" not in pkw["env"] and pkw["env"]["HF_TOKEN"] == "hf_secret"

@@ -413,6 +413,9 @@ class LLMSupervisor:
                 # FlashInfer's GDN prefill kernel is JIT-compiled with nvcc,
                 # which the runtime image does not ship: Triton needs only cc.
                 "--gdn-prefill-backend", "triton",
+                # vLLM picks FlashInfer attention on Blackwell (fp8 KV cache), JIT-compiled
+                # with nvcc as well: Triton attention runs fp8 KV on every SM89+ GPU.
+                "--attention-backend", "TRITON_ATTN",
                 "--disable-uvicorn-access-log"]
 
     def _child_env(self) -> dict[str, str]:
