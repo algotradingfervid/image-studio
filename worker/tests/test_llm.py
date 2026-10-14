@@ -292,9 +292,11 @@ def test_download_then_starting_then_ready(tmp_path):
         "--max-num-seqs", "4",
         "--trust-remote-code",
         "--reasoning-parser", "qwen3",
+        "--gdn-prefill-backend", "triton",
         "--disable-uvicorn-access-log"]
     assert "--quantization" not in cmd
     assert "PYTHONPATH" not in pkw["env"] and pkw["env"]["HF_TOKEN"] == "hf_secret"
+    assert pkw["env"]["VLLM_USE_FLASHINFER_SAMPLER"] == "0"
     # marker written: a later boot skips the download
     marker = json.loads((sup.dir / llm.COMPLETE_MARKER).read_text())
     assert marker == {"repo": "orcarouter/Qwen3.8-27B-Uncensored-FP8", "totalBytes": 1000}

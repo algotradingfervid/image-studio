@@ -410,6 +410,9 @@ class LLMSupervisor:
                 "--max-num-seqs", str(MAX_NUM_SEQS),
                 "--trust-remote-code",
                 "--reasoning-parser", "qwen3",
+                # FlashInfer's GDN prefill kernel is JIT-compiled with nvcc,
+                # which the runtime image does not ship: Triton needs only cc.
+                "--gdn-prefill-backend", "triton",
                 "--disable-uvicorn-access-log"]
 
     def _child_env(self) -> dict[str, str]:
@@ -419,6 +422,8 @@ class LLMSupervisor:
         env.pop("PYTHONPATH", None)
         env.setdefault("VLLM_NO_USAGE_STATS", "1")
         env.setdefault("DO_NOT_TRACK", "1")
+        # FlashInfer's top-k/top-p sampler is JIT-compiled with nvcc as well.
+        env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
         return env
 
     def _launch(self) -> None:
